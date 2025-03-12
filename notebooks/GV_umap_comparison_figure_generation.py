@@ -712,6 +712,6 @@ def plot_similarity_summary(results_df, save_dir):
 
 if __name__ == "__main__":
     # test on two birds
-    npz_files = ["/Users/mirandahulsey-vincent/Documents/allPythonCode/syntax_analysis/data_inputs/Area_X_lesions_balanced_training_data/balanced_dataset_npz_files/USA5283.npz"]
-    save_dir = "/Users/mirandahulsey-vincent/Documents/allPythonCode/syntax_analysis/data_inputs/Area_X_lesions_balanced_training_data/balanced_dataset_npz_files/USA5283_graphs/"
+    npz_files = ["/Volumes/ROSE2-SSD/RHV_song_counts/RC7_USA5499_tweetybert_outputs/USA5499.npz"]
+    save_dir = "/Volumes/ROSE2-SSD/RHV_song_counts/RC7_USA5499_tweetybert_outputs/graph_outputs"
     results_df = analyze_multiple_birds(npz_files, save_dir)
