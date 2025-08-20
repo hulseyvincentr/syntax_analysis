@@ -103,8 +103,9 @@ def plot_am_pm_syllable_heatmap(
     animal_id: Optional[str] = None,
     treatment_date: Optional[Union[str, pd.Timestamp]] = None,
     *,
+    period: Optional[str] = None,       # NEW: "AM", "PM", or None (combined)
     figsize: Tuple[int, int] = (18, 6),
-    cmap: str = "Greys_r",              # reversed -> low=white, high=black
+    cmap: str = "Greys",                # default white→black (low→high)
     value_label: str = "Proportion per Period",
     log_scale: bool = False,
     pseudocount: float = 1e-6,          # used only if log_scale
@@ -117,6 +118,7 @@ def plot_am_pm_syllable_heatmap(
     if table is None or table.empty:
         raise ValueError("Input table is empty.")
 
+    # Sort columns by date and AM(0)/PM(1)
     def _key(col: str) -> tuple[pd.Timestamp, int]:
         parts = col.split()
         dt = pd.to_datetime(parts[0])
@@ -126,34 +128,61 @@ def plot_am_pm_syllable_heatmap(
     cols_sorted = sorted(table.columns, key=_key)
     table = table.reindex(columns=cols_sorted)
 
+    # Optional AM/PM filter
+    if period is not None:
+        period = period.upper()
+        if period not in ("AM", "PM"):
+            raise ValueError("period must be 'AM', 'PM', or None.")
+        keep = [c for c in table.columns if c.endswith(f" {period}")]
+        table = table.loc[:, keep]
+        if table.empty:
+            raise ValueError(f"No columns found for period='{period}'.")
+
     plot_data = table.copy()
     cbar_label = value_label
     if log_scale:
         plot_data = np.log10(plot_data + float(pseudocount))
         cbar_label = f"log10({value_label} + {pseudocount:g})"
 
+    # Mask NaN/inf so true missing data shows as white
+    finite_vals = plot_data.values[np.isfinite(plot_data.values)]
+    mask = ~np.isfinite(plot_data.values)
+
+    # Determine color limits
     if vmin is None or vmax is None:
         if log_scale:
-            vmin = float(np.nanpercentile(plot_data.values, 1)) if vmin is None else vmin
-            vmax = float(np.nanpercentile(plot_data.values, 99)) if vmax is None else vmax
+            if finite_vals.size:
+                vmin = float(np.nanpercentile(finite_vals, 1)) if vmin is None else vmin
+                vmax = float(np.nanpercentile(finite_vals, 99)) if vmax is None else vmax
+            else:
+                vmin = vmin if vmin is not None else -6.0
+                vmax = vmax if vmax is not None else 0.0
         else:
             vmin = 0.0 if vmin is None else vmin
             vmax = 1.0 if vmax is None else vmax
 
     fig, ax = plt.subplots(figsize=figsize)
     sns.heatmap(
-        plot_data, cmap=cmap, vmin=vmin, vmax=vmax,
+        plot_data, cmap=cmap, vmin=vmin, vmax=vmax, mask=mask,
         cbar_kws={"label": cbar_label}, ax=ax,
     )
 
     ax.set_xticks(np.arange(len(plot_data.columns)) + 0.5)
     ax.set_xticklabels(plot_data.columns, rotation=45, ha="right")
-    ax.set_xlabel("Date (AM / PM)")
+    if period is None:
+        ax.set_xlabel("Date (AM / PM)")
+    else:
+        ax.set_xlabel(f"Date ({period} only)")
     ax.set_ylabel("Syllable Label")
 
+    title_scale = "Log" if log_scale else "Normalized"
     if animal_id:
-        ax.set_title(f"{animal_id} AM vs PM Syllable Occurrence ({'Log' if log_scale else 'Normalized'} Scale)")
+        if period is None:
+            ax.set_title(f"{animal_id} AM vs PM Syllable Occurrence ({title_scale} Scale)")
+        else:
+            ax.set_title(f"{animal_id} {period} Syllable Occurrence ({title_scale} Scale)")
 
+    # Treatment line (if the date exists among filtered columns)
     if treatment_date:
         try:
             td = pd.to_datetime(treatment_date).strftime("%Y-%m-%d")
@@ -185,7 +214,7 @@ def run_am_pm_syllable_heatmap(
     log_scale: bool = False,
     save_path: Optional[Union[str, Path]] = None,
     show: bool = True,
-    cmap: str = "Greys_r",
+    cmap: str = "Greys",
     verbose: bool = True,
 ) -> Dict[str, Any]:
     try:
@@ -205,6 +234,7 @@ def run_am_pm_syllable_heatmap(
     out = build_organized_dataset(decoded, meta, verbose=verbose)
     organized_df = out.organized_df
 
+    # Try to read treatment date from metadata JSON
     treatment_date = None
     try:
         with meta.open("r") as f:
@@ -212,6 +242,7 @@ def run_am_pm_syllable_heatmap(
     except Exception:
         pass
 
+    # Build AM/PM table
     table = build_am_pm_count_table(
         organized_df,
         label_column="syllable_onsets_offsets_ms_dict",
@@ -220,13 +251,26 @@ def run_am_pm_syllable_heatmap(
         normalize=normalize,
     )
 
+    # Single animal id (if exactly one)
     animal_id = None
     if "Animal ID" in organized_df.columns:
         ids = [x for x in organized_df["Animal ID"].dropna().unique().tolist() if isinstance(x, str)]
         if len(ids) == 1:
             animal_id = ids[0]
 
-    fig, ax = plot_am_pm_syllable_heatmap(
+    # Resolve save paths
+    save_combined = save_am = save_pm = None
+    if save_path:
+        save_path = Path(save_path)
+        parent = save_path.parent
+        stem = save_path.stem
+        ext = save_path.suffix or ".png"
+        save_combined = parent / f"{stem}_combined{ext}"
+        save_am = parent / f"{stem}_AM{ext}"
+        save_pm = parent / f"{stem}_PM{ext}"
+
+    # Plot combined
+    fig_all, ax_all = plot_am_pm_syllable_heatmap(
         table,
         animal_id=animal_id,
         treatment_date=treatment_date,
@@ -234,15 +278,58 @@ def run_am_pm_syllable_heatmap(
         value_label=("Avg Count per Song" if normalize == "per_song" else "Proportion per Period"),
         log_scale=log_scale,
         show=show,
-        save_path=save_path,
+        save_path=save_combined,
         line_position="boundary",
+        period=None,
     )
+
+    # Plot AM-only (skip gracefully if no AM columns)
+    fig_am = ax_am = None
+    try:
+        fig_am, ax_am = plot_am_pm_syllable_heatmap(
+            table,
+            animal_id=animal_id,
+            treatment_date=treatment_date,
+            cmap=cmap,
+            value_label=("Avg Count per Song" if normalize == "per_song" else "Proportion per Period"),
+            log_scale=log_scale,
+            show=show,
+            save_path=save_am,
+            line_position="boundary",
+            period="AM",
+        )
+    except ValueError as e:
+        if verbose:
+            print(f"[WARN] AM-only plot skipped: {e}")
+
+    # Plot PM-only (skip gracefully if no PM columns)
+    fig_pm = ax_pm = None
+    try:
+        fig_pm, ax_pm = plot_am_pm_syllable_heatmap(
+            table,
+            animal_id=animal_id,
+            treatment_date=treatment_date,
+            cmap=cmap,
+            value_label=("Avg Count per Song" if normalize == "per_song" else "Proportion per Period"),
+            log_scale=log_scale,
+            show=show,
+            save_path=save_pm,
+            line_position="boundary",
+            period="PM",
+        )
+    except ValueError as e:
+        if verbose:
+            print(f"[WARN] PM-only plot skipped: {e}")
 
     return {
         "organized_df": organized_df,
         "table": table,
-        "fig": fig,
-        "ax": ax,
+        "fig_combined": fig_all,
+        "ax_combined": ax_all,
+        "fig_am": fig_am,
+        "ax_am": ax_am,
+        "fig_pm": fig_pm,
+        "ax_pm": ax_pm,
         "animal_id": animal_id,
         "treatment_date": treatment_date,
     }
@@ -263,6 +350,7 @@ if __name__ == "__main__":
         normalize=a.normalize, log_scale=a.log_scale,
         save_path=(a.save or None), show=not a.no_show,
     )
+
 
 
 """
