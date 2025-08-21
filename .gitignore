@@ -1,3 +1,6 @@
-*csv
+*.csv
+*.png
+*.txt
+*.json
 /outputs
 /data_inputs
