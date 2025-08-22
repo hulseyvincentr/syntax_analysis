@@ -2,5 +2,6 @@
 *.png
 *.txt
 *.json
+*.gif
 /outputs
 /data_inputs
