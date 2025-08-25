@@ -14,6 +14,23 @@ __all__ = ["plot_log_scaled_syllable_counts", "build_daily_avg_count_table"]
 
 
 # ───────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ───────────────────────────────────────────────────────────────────────────────
+def _numeric_aware_key(x):
+    """
+    Sort key that prefers numeric ordering when possible.
+    Treats '01', '1', and 1 as the same numeric value for order,
+    falling back to case-insensitive string order. Tie-break by
+    original string to keep ordering stable if both '01' and '1' exist.
+    """
+    s = str(x)
+    try:
+        return (0, int(s), s)
+    except Exception:
+        return (1, s.lower(), s)
+
+
+# ───────────────────────────────────────────────────────────────────────────────
 # Heatmap (log10-scaled) of daily average syllable counts per song
 # ───────────────────────────────────────────────────────────────────────────────
 def plot_log_scaled_syllable_counts(
@@ -25,7 +42,7 @@ def plot_log_scaled_syllable_counts(
     pseudocount: float = 1e-3,
     figsize: Tuple[int, int] = (16, 6),
     cmap: str = "Greys_r",                  # reversed so low/zero ≈ white
-    cbar_label: str = "Log10 Avg Count per Song",
+    cbar_label: str = str = r"$\log_{10}$ Avg Count per Song",
     sort_dates: bool = True,                # ensure chronological columns
     date_format: str = "%Y-%m-%d",
     show: bool = True,                      # show the figure
@@ -36,54 +53,19 @@ def plot_log_scaled_syllable_counts(
     max_days_off: int = 1,                  # tolerance for nearest match (days)
     line_position: str = "center",          # "center" or "boundary"
     line_kwargs: Optional[dict] = None,     # e.g., {"color": "red", "linestyle": "--", "linewidth": 2}
+    # Row ordering safety
+    sort_rows_numerically: bool = True,     # ensure 0,1,2,... order even if labels are strings
 ):
     """
     Plot a log10-scaled heatmap of per-syllable average counts per day.
-
-    Parameters
-    ----------
-    count_table
-        DataFrame: rows = syllable labels, columns = dates, values = avg count per song.
-    animal_id
-        Optional; used in the plot title.
-    treatment_date
-        Optional; pd.Timestamp or parseable string.
-    pseudocount
-        Value added before log10 to avoid log(0); default 1e-3 -> zeros map to -3.
-    figsize
-        Figure size (width, height).
-    cmap
-        Matplotlib colormap. Default 'Greys_r' makes low values light/white.
-    cbar_label
-        Label for the colorbar.
-    sort_dates
-        Sort columns chronologically by their datetime interpretation.
-    date_format
-        Format used for x-axis tick labels.
-    show
-        If True, calls plt.show(). Set False in larger pipelines.
-    save_path
-        If provided, saves the figure to this path.
-    mark_treatment
-        If True and treatment_date is provided, draw a vertical dashed line.
-    nearest_match
-        If True, mark the nearest date column within 'max_days_off' days;
-        if False, only mark if exact column match exists.
-    max_days_off
-        Integer day tolerance for nearest-match behavior.
-    line_position
-        'center' draws through the center of the matched column;
-        'boundary' draws on the left boundary of that column.
-    line_kwargs
-        Dict of kwargs passed to ax.axvline (color, linestyle, linewidth, etc.).
-
-    Returns
-    -------
-    (fig, ax)
-        Matplotlib Figure and Axes.
     """
     if count_table is None or count_table.empty:
         raise ValueError("count_table is empty or None.")
+
+    # Optionally enforce numeric row order
+    if sort_rows_numerically:
+        new_row_order = sorted([str(x) for x in count_table.index], key=_numeric_aware_key)
+        count_table = count_table.reindex(index=new_row_order)
 
     # Optionally sort columns chronologically
     columns = count_table.columns
@@ -103,7 +85,7 @@ def plot_log_scaled_syllable_counts(
     sns.heatmap(
         log_scaled_table,
         cmap=cmap,
-        cbar_kws={"label": cbar_label},
+        cbar_kws={"label": r"$\log_{10}$ Avg Count per Song"},
         ax=ax,
     )
 
@@ -111,13 +93,13 @@ def plot_log_scaled_syllable_counts(
     date_idx = pd.to_datetime(log_scaled_table.columns)
     xticks = np.arange(len(date_idx)) + 0.5
     ax.set_xticks(xticks)
-    ax.set_xticklabels([d.strftime(date_format) for d in date_idx], rotation=45, ha="right")
+    ax.set_xticklabels([d.strftime(date_format) for d in date_idx], rotation=90, ha="right")
 
     ax.set_xlabel("Date")
     ax.set_ylabel("Syllable Label")
 
     if animal_id:
-        ax.set_title(f"{animal_id} Daily Avg Occurrence of Each Syllable (Log₁₀ Scale)")
+        ax.set_title(f"{animal_id} Daily Avg Occurrence of Each Syllable ($\\log_{{10}}$ Scale)")
 
     # Treatment date marker
     if mark_treatment and treatment_date is not None:
@@ -165,26 +147,16 @@ def build_daily_avg_count_table(
     label_column: str = "syllable_onsets_offsets_ms_dict",
     date_column: str = "Date",
     syllable_labels: Optional[List[str]] = None,
+    sort_labels_numerically: bool = True,   # ensure row order is 0,1,2,... by default
 ) -> pd.DataFrame:
     """
     Construct a table where each cell is the **average count per song** of a syllable on a day.
 
-    Parameters
-    ----------
-    organized_df
-        DataFrame produced by build_organized_dataset(); must contain a dict column of
-        {label -> list of [onset_ms, offset_ms] ...} and a datetime 'Date' column.
-    label_column
-        Column holding the dict mapping syllable labels to intervals.
-    date_column
-        Column with pandas datetime per row (will be normalized to midnight).
-    syllable_labels
-        Optional explicit label list; defaults to union of labels in the dataset (sorted).
-
     Returns
     -------
     pd.DataFrame
-        Index = syllable labels (sorted), Columns = unique dates (Timestamp), Values = mean counts per song.
+        Index = syllable labels (sorted), Columns = unique dates (Timestamp),
+        Values = mean counts per song.
     """
     if label_column not in organized_df.columns or date_column not in organized_df.columns:
         raise KeyError(f"organized_df must contain '{label_column}' and '{date_column}' columns.")
@@ -199,8 +171,16 @@ def build_daily_avg_count_table(
         labels_set: set[str] = set()
         for v in df[label_column]:
             if isinstance(v, dict) and v:
-                labels_set.update(v.keys())
-        syllable_labels = sorted(labels_set)
+                # cast keys to str to be robust to mixed types and zero-padding
+                labels_set.update(map(str, v.keys()))
+        syllable_labels = list(labels_set)
+    else:
+        # normalize provided labels to strings for indexing
+        syllable_labels = list(map(str, syllable_labels))
+
+    # Sort labels numerically when possible
+    if sort_labels_numerically:
+        syllable_labels = sorted(syllable_labels, key=_numeric_aware_key)
 
     # Prepare empty result table
     unique_days = sorted(df[date_column].dropna().unique())
@@ -264,6 +244,7 @@ if __name__ == "__main__":
         label_column="syllable_onsets_offsets_ms_dict",
         date_column="Date",
         syllable_labels=out.unique_syllable_labels,  # ensure stable label order
+        sort_labels_numerically=True,
     )
 
     # 3) Pull animal_id (if consistent across files)
@@ -294,6 +275,7 @@ if __name__ == "__main__":
         nearest_match=args.nearest_line,
         max_days_off=1,
         cmap="Greys",
+        sort_rows_numerically=True,
     )
 
 """

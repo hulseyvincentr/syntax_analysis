@@ -269,8 +269,8 @@ def plot_am_pm_total_transition_entropy(results_df: pd.DataFrame, surgery_date: 
 # ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     # Update these to your paths
-    decoded = "/Users/mirandahulsey-vincent/Documents/allPythonCode/syntax_analysis/data_inputs/Area_X_lesions_balanced_training_data/USA5288_decoded_database.json"
-    meta    = "/Users/mirandahulsey-vincent/Documents/allPythonCode/syntax_analysis/data_inputs/Area_X_lesions_balanced_training_data/USA5288_creation_data.json"
+    decoded = "/Users/mirandahulsey-vincent/Desktop/SfN_data/USA5272/TweetyBERT_Pretrain_LLB_AreaX_FallSong_USA5272_decoded_database.json"
+    meta    = "/Users/mirandahulsey-vincent/Desktop/SfN_data/USA5272/USA5272_metadata.json"
 
     # Optionally override the surgery date (else we'll use metadata's treatment_date if present)
     surgery_override_iso = None  # e.g., "2024-06-28"

@@ -1,6 +1,3 @@
-# -*- coding: utf-8 -*-
-
-
 # graph_AM_vs_PM_phrase_duration_over_days.py
 from __future__ import annotations
 
@@ -55,7 +52,6 @@ def _plot_one_syllable_am_pm(
     # Prepare long-form with AM/PM classification
     df = exploded.copy()
     df["DateDay"] = pd.to_datetime(df["Date"], errors="coerce").dt.normalize()
-    # ensure Hour is numeric to determine AM/PM
     df["Hour"] = pd.to_numeric(df["Hour"], errors="coerce")
     df[col] = pd.to_numeric(df[col], errors="coerce")
 
@@ -256,6 +252,8 @@ if __name__ == "__main__":
         show_plots=args.show,
         syllables_subset=args.syllables,
     )
+
+
 """
 from graph_AM_vs_PM_phrase_duration_over_days import graph_AM_vs_PM_phrase_duration_over_days
 

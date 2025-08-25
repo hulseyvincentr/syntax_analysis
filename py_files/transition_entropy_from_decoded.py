@@ -139,20 +139,27 @@ def calculate_total_transition_entropy(
         tot += probs[i] * transition_entropies.get(lab, 0.0)
     return float(tot)
 
-def plot_total_transition_entropy(entropies_per_day: List[Tuple[date, float]], surgery_date: Optional[date]):
+def plot_total_transition_entropy(
+    entropies_per_day: List[Tuple[date, float]], 
+    surgery_date: Optional[date],
+    save_path: Optional[Path] = None
+):
     days, entropies = zip(*sorted(entropies_per_day, key=lambda t: t[0])) if entropies_per_day else ([], [])
     if not days:
         print("No daily entropy values to plot.")
         return
 
     plt.figure(figsize=(20, 6))
-    plt.scatter(days, entropies, s=100, edgecolor="black")  # default color
+    plt.scatter(days, entropies, s=100, edgecolor="black")
 
     if surgery_date is not None:
         plt.axvline(x=surgery_date, color="r", linestyle="--", label="Surgery Date")
 
-    # Tick label formatting
-    plt.xticks(ticks=days, labels=[pd.to_datetime(d).strftime("%Y-%m-%d") for d in days], rotation=90)
+    plt.xticks(
+        ticks=days, 
+        labels=[pd.to_datetime(d).strftime("%Y-%m-%d") for d in days], 
+        rotation=90
+    )
 
     plt.title("Total Transition Entropy Across Days", fontsize=16)
     plt.xlabel("Day", fontsize=14)
@@ -162,7 +169,15 @@ def plot_total_transition_entropy(entropies_per_day: List[Tuple[date, float]], s
     if surgery_date is not None:
         plt.legend()
     plt.tight_layout()
+
+    if save_path:
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        print(f"[transition_entropy] Saved plot → {save_path}")
+
     plt.show()
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 4) Main analysis (build → per-file transitions → per-day entropies)
@@ -173,8 +188,9 @@ def analyze_transitions_for_each_day_from_decoded(
     creation_metadata_json: str | Path,
     *,
     only_song_present: bool = False,
-    compute_durations: bool = False,   # durations not needed for entropy; you can turn off
-    surgery_date_override: Optional[str] = None,  # "YYYY-MM-DD" or None → use metadata's treatment_date
+    compute_durations: bool = False,
+    surgery_date_override: Optional[str] = None,
+    save_dir: Optional[Path] = None,
 ):
     """
     High-level driver that:
@@ -196,6 +212,12 @@ def analyze_transitions_for_each_day_from_decoded(
 
     organized = od.organized_df
 
+        # Try to get animal_id from DataFrame or fallback
+    try:
+        animal_id = str(organized["Animal ID"].dropna().iloc[0])
+    except Exception:
+        animal_id = "unknown_animal"
+        
     # Resolve surgery/treatment date
     # Prefer explicit override; else use od.treatment_date ("YYYY.MM.DD") if available
     if surgery_date_override:
@@ -251,7 +273,13 @@ def analyze_transitions_for_each_day_from_decoded(
         entropies_per_day.append((d, total_te))
 
     # 5) Plot
-    plot_total_transition_entropy(entropies_per_day, surgery_dt)
+    save_path = None
+    if save_dir is not None:
+        save_dir = Path(save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        save_path = save_dir / f"{animal_id}_transition_entropy_daily.png"
+
+    plot_total_transition_entropy(entropies_per_day, surgery_dt, save_path=save_path)
 
     return organized, per_file_df, entropies_per_day, syllable_types
 

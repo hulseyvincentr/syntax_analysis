@@ -137,12 +137,12 @@ from syllable_heatmap_wrapper import run_daily_syllable_heatmap
 
 from pathlib import Path
 
-decoded = "/Users/mirandahulsey-vincent/Documents/allPythonCode/syntax_analysis/data_inputs/Area_X_lesions_balanced_training_data/USA5288_decoded_database.json"
-created = "/Users/mirandahulsey-vincent/Documents/allPythonCode/syntax_analysis/data_inputs/Area_X_lesions_balanced_training_data/USA5288_creation_data.json"
+decoded = "/Users/mirandahulsey-vincent/Desktop/SfN_data/USA5323/TweetyBERT_Pretrain_LLB_AreaX_FallSong_USA5323_decoded_database.json"
+created = "/Users/mirandahulsey-vincent/Desktop/SfN_data/USA5323/USA5323_metadata.json"
 
 # Pick a filename (not just a folder)
-out_dir = "/Users/mirandahulsey-vincent/Documents/allPythonCode/syntax_analysis/data_inputs/Area_X_lesions_balanced_training_data"
-save_path = str(Path(out_dir) / "USA5288_syllable_heatmap.png")
+out_dir = "/Users/mirandahulsey-vincent//Desktop/SfN_data/USA5323/figures"
+save_path = str(Path(out_dir) / "USA5323_syllable_heatmap.png")
 
 res = run_daily_syllable_heatmap(
     decoded_database_json=decoded,

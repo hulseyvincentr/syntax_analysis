@@ -17,6 +17,23 @@ __all__ = [
 ]
 
 # ───────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ───────────────────────────────────────────────────────────────────────────────
+def _numeric_aware_key(x):
+    """
+    Sort key that prefers numeric ordering when possible.
+    Treats '01', '1', and 1 as the same numeric value for order,
+    falling back to case-insensitive string order. Tie-break by
+    original string to keep ordering stable if both '01' and '1' exist.
+    """
+    s = str(x)
+    try:
+        return (0, int(s), s)
+    except Exception:
+        return (1, s.lower(), s)
+
+
+# ───────────────────────────────────────────────────────────────────────────────
 # Build AM/PM table (rows=labels, columns=YYYY-MM-DD AM/PM)
 # ───────────────────────────────────────────────────────────────────────────────
 def build_am_pm_count_table(
@@ -31,6 +48,7 @@ def build_am_pm_count_table(
     afternoon_end: str = "23:19:59",   # noon → 11:19:59 PM
     syllable_labels: Optional[List[str]] = None,
     normalize: str = "proportion",      # "proportion" (column sums to 1) or "per_song"
+    sort_labels_numerically: bool = True,  # enforce 0,1,2,... row order
 ) -> pd.DataFrame:
     need = {label_column, date_column, hour_col, minute_col, second_col}
     missing = [c for c in need if c not in organized_df.columns]
@@ -58,12 +76,18 @@ def build_am_pm_count_table(
     )
     df = df[df["Period"].notna()].copy()
 
+    # Collect / normalize labels
     if syllable_labels is None:
         labels_set: set[str] = set()
         for v in df[label_column]:
             if isinstance(v, dict) and v:
-                labels_set.update(v.keys())
-        syllable_labels = sorted(labels_set)
+                labels_set.update(map(str, v.keys()))
+        syllable_labels = list(labels_set)
+    else:
+        syllable_labels = list(map(str, syllable_labels))
+
+    if sort_labels_numerically:
+        syllable_labels = sorted(syllable_labels, key=_numeric_aware_key)
 
     unique_days = sorted(df[date_column].unique())
     columns: List[str] = []
@@ -103,7 +127,7 @@ def plot_am_pm_syllable_heatmap(
     animal_id: Optional[str] = None,
     treatment_date: Optional[Union[str, pd.Timestamp]] = None,
     *,
-    period: Optional[str] = None,       # NEW: "AM", "PM", or None (combined)
+    period: Optional[str] = None,       # "AM", "PM", or None (combined)
     figsize: Tuple[int, int] = (18, 6),
     cmap: str = "Greys",                # default white→black (low→high)
     value_label: str = "Proportion per Period",
@@ -114,6 +138,7 @@ def plot_am_pm_syllable_heatmap(
     show: bool = True,
     save_path: Optional[Union[str, Path]] = None,
     line_position: str = "boundary",    # "boundary" or "center"
+    sort_rows_numerically: bool = True, # ensure 0,1,2,... row order
 ) -> tuple[plt.Figure, plt.Axes]:
     if table is None or table.empty:
         raise ValueError("Input table is empty.")
@@ -138,17 +163,19 @@ def plot_am_pm_syllable_heatmap(
         if table.empty:
             raise ValueError(f"No columns found for period='{period}'.")
 
+    # Optional numeric row order
+    if sort_rows_numerically:
+        new_row_order = sorted([str(x) for x in table.index], key=_numeric_aware_key)
+        table = table.reindex(index=new_row_order)
+
     plot_data = table.copy()
-    cbar_label = value_label
     if log_scale:
         plot_data = np.log10(plot_data + float(pseudocount))
-        cbar_label = f"log10({value_label} + {pseudocount:g})"
 
-    # Mask NaN/inf so true missing data shows as white
+    # Determine color limits
     finite_vals = plot_data.values[np.isfinite(plot_data.values)]
     mask = ~np.isfinite(plot_data.values)
 
-    # Determine color limits
     if vmin is None or vmax is None:
         if log_scale:
             if finite_vals.size:
@@ -161,6 +188,9 @@ def plot_am_pm_syllable_heatmap(
             vmin = 0.0 if vmin is None else vmin
             vmax = 1.0 if vmax is None else vmax
 
+    # Proper mathtext label so log10 renders correctly
+    cbar_label = (r"$\log_{10}$ " + value_label) if log_scale else value_label
+
     fig, ax = plt.subplots(figsize=figsize)
     sns.heatmap(
         plot_data, cmap=cmap, vmin=vmin, vmax=vmax, mask=mask,
@@ -168,19 +198,20 @@ def plot_am_pm_syllable_heatmap(
     )
 
     ax.set_xticks(np.arange(len(plot_data.columns)) + 0.5)
-    ax.set_xticklabels(plot_data.columns, rotation=45, ha="right")
+    ax.set_xticklabels(plot_data.columns, rotation=90, ha="right")
     if period is None:
         ax.set_xlabel("Date (AM / PM)")
     else:
         ax.set_xlabel(f"Date ({period} only)")
     ax.set_ylabel("Syllable Label")
 
-    title_scale = "Log" if log_scale else "Normalized"
+    # Title with mathtext for log base when needed
     if animal_id:
+        scale_txt = r"$\log_{10}$" if log_scale else "Normalized"
         if period is None:
-            ax.set_title(f"{animal_id} AM vs PM Syllable Occurrence ({title_scale} Scale)")
+            ax.set_title(f"{animal_id} AM vs PM Syllable Occurrence ({scale_txt} Scale)")
         else:
-            ax.set_title(f"{animal_id} {period} Syllable Occurrence ({title_scale} Scale)")
+            ax.set_title(f"{animal_id} {period} Syllable Occurrence ({scale_txt} Scale)")
 
     # Treatment line (if the date exists among filtered columns)
     if treatment_date:
@@ -212,7 +243,7 @@ def run_am_pm_syllable_heatmap(
     *,
     normalize: str = "proportion",
     log_scale: bool = False,
-    save_path: Optional[Union[str, Path]] = None,
+    save_path: Optional[Union[str, Path]] = None,   # directory OR a file path (we'll use its parent)
     show: bool = True,
     cmap: str = "Greys",
     verbose: bool = True,
@@ -249,6 +280,7 @@ def run_am_pm_syllable_heatmap(
         date_column="Date",
         syllable_labels=out.unique_syllable_labels,
         normalize=normalize,
+        sort_labels_numerically=True,
     )
 
     # Single animal id (if exactly one)
@@ -257,17 +289,21 @@ def run_am_pm_syllable_heatmap(
         ids = [x for x in organized_df["Animal ID"].dropna().unique().tolist() if isinstance(x, str)]
         if len(ids) == 1:
             animal_id = ids[0]
+    if not animal_id:
+        animal_id = "unknown_animal"
 
-    # Resolve save paths
-    save_combined = save_am = save_pm = None
-    if save_path:
-        save_path = Path(save_path)
-        parent = save_path.parent
-        stem = save_path.stem
-        ext = save_path.suffix or ".png"
-        save_combined = parent / f"{stem}_combined{ext}"
-        save_am = parent / f"{stem}_AM{ext}"
-        save_pm = parent / f"{stem}_PM{ext}"
+    # Resolve output directory and filenames:
+    # - If save_path is a file path, use its parent directory.
+    # - If save_path is a directory (or None), use it directly (or CWD).
+    outdir = Path(save_path) if save_path else Path.cwd()
+    if outdir.suffix.lower() in {".png", ".jpg", ".jpeg", ".pdf", ".svg"}:
+        outdir = outdir.parent
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    base = f"{animal_id}_syllable_heatmap"
+    save_combined = outdir / f"{base}_am_pm_combined.png"
+    save_am = outdir / f"{base}_am.png"
+    save_pm = outdir / f"{base}_pm.png"
 
     # Plot combined
     fig_all, ax_all = plot_am_pm_syllable_heatmap(
@@ -281,6 +317,7 @@ def run_am_pm_syllable_heatmap(
         save_path=save_combined,
         line_position="boundary",
         period=None,
+        sort_rows_numerically=True,
     )
 
     # Plot AM-only (skip gracefully if no AM columns)
@@ -297,6 +334,7 @@ def run_am_pm_syllable_heatmap(
             save_path=save_am,
             line_position="boundary",
             period="AM",
+            sort_rows_numerically=True,
         )
     except ValueError as e:
         if verbose:
@@ -316,6 +354,7 @@ def run_am_pm_syllable_heatmap(
             save_path=save_pm,
             line_position="boundary",
             period="PM",
+            sort_rows_numerically=True,
         )
     except ValueError as e:
         if verbose:
@@ -332,6 +371,9 @@ def run_am_pm_syllable_heatmap(
         "ax_pm": ax_pm,
         "animal_id": animal_id,
         "treatment_date": treatment_date,
+        "combined_png": str(save_combined),
+        "am_png": str(save_am),
+        "pm_png": str(save_pm),
     }
 
 if __name__ == "__main__":
@@ -341,7 +383,7 @@ if __name__ == "__main__":
     p.add_argument("creation_metadata_json", type=str)
     p.add_argument("--normalize", type=str, default="proportion", choices=["proportion", "per_song"])
     p.add_argument("--log-scale", action="store_true")
-    p.add_argument("--save", type=str, default="")
+    p.add_argument("--save", type=str, default="", help="Directory or file path; filenames are auto-set to animalID_syllable_heatmap_*.png")
     p.add_argument("--no-show", action="store_true")
     a = p.parse_args()
 
@@ -350,22 +392,3 @@ if __name__ == "__main__":
         normalize=a.normalize, log_scale=a.log_scale,
         save_path=(a.save or None), show=not a.no_show,
     )
-
-
-
-"""
-import os, sys, importlib
-from am_vs_pm_syllable_heatmap import run_am_pm_syllable_heatmap
-decoded = "/Users/mirandahulsey-vincent/Documents/allPythonCode/syntax_analysis/data_inputs/Area_X_lesions_balanced_training_data/USA5288_decoded_database.json"
-created = "/Users/mirandahulsey-vincent/Documents/allPythonCode/syntax_analysis/data_inputs/Area_X_lesions_balanced_training_data/USA5288_creation_data.json"
-
-res = run_am_pm_syllable_heatmap(
-    decoded, created,
-    normalize="proportion",           # default; each AM/PM column sums to 1
-    log_scale=True,                  # set True if you use per_song and want log
-    save_path="figures/USA5288_am_pm.png",
-    cmap="Greys",
-    show=True,
-)
-
-"""
