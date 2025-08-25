@@ -3,5 +3,6 @@
 *.txt
 *.json
 *.gif
+*.jsonl
 /outputs
 /data_inputs
