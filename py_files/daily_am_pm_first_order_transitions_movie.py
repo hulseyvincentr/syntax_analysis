@@ -34,6 +34,28 @@ def _ensure_dir(p: Optional[Union[str, Path]]) -> Optional[Path]:
     p.parent.mkdir(parents=True, exist_ok=True)
     return p
 
+def _pad_frames_to_same_size(frames: List[np.ndarray]) -> List[np.ndarray]:
+    """
+    Pad all frames to the same (max_h, max_w) with zeros (black).
+    Accepts a list of HxWxC arrays with identical C.
+    """
+    if not frames:
+        return frames
+    max_h = max(fr.shape[0] for fr in frames)
+    max_w = max(fr.shape[1] for fr in frames)
+    c = frames[0].shape[2] if frames[0].ndim == 3 else 3
+
+    out = []
+    for fr in frames:
+        h, w = fr.shape[:2]
+        if h == max_h and w == max_w:
+            out.append(fr)
+            continue
+        padded = np.zeros((max_h, max_w, c), dtype=fr.dtype)
+        padded[:h, :w, ...] = fr
+        out.append(padded)
+    return out
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # First-order transition matrices
@@ -101,13 +123,14 @@ def render_single_heatmap_frame(
 ) -> np.ndarray:
     """Render a single heatmap to an RGB frame (backend-safe)."""
     if probs.empty:
+        # small black frame to keep lists non-empty where expected
         return np.zeros((10, 10, 3), dtype=np.uint8)
 
     fig = plt.figure(figsize=figsize)
     ax = sns.heatmap(
         probs, cmap="binary", vmin=0.0, vmax=1.0, cbar=False, square=True
     )
-    ax.set_xlabel(""); ax.set_ylabel("")
+    ax.set_xlabel("Next Syllable"); ax.set_ylabel("Current Syllable")
     if title:
         ax.set_title(title)
     ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha="right", fontsize=fontsize)
@@ -137,8 +160,9 @@ def render_side_by_side_frame(
     for ax, probs, ttl in [(axes[0], left, left_title), (axes[1], right, right_title)]:
         if probs is not None and not probs.empty:
             sns.heatmap(probs, cmap="binary", vmin=0.0, vmax=1.0, cbar=False, square=True, ax=ax)
-            ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha="right", fontsize=fontsize)
+            ax.set_xticklabels(ax.get_xticklabels(), rotation=90, ha="right", fontsize=fontsize)
             ax.set_yticklabels(ax.get_yticklabels(), rotation=0, va="center", fontsize=fontsize)
+            ax.set_xlabel("Next Syllable"); ax.set_ylabel("Current Syllable")
         else:
             ax.axis("off")
             ax.text(0.5, 0.5, "No data", ha="center", va="center", fontsize=fontsize+2)
@@ -156,12 +180,13 @@ def render_side_by_side_frame(
 
 
 def _write_movie(path: Union[str, Path], frames: List[np.ndarray], fps: int) -> None:
-    """Write GIF/APNG/MP4 with sensible defaults."""
+    """Write GIF/APNG/MP4 with sensible defaults. Frames are padded to same size."""
+    if not frames:
+        return
+    frames = _pad_frames_to_same_size(frames)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     suffix = path.suffix.lower()
-    if not frames:
-        return
     if suffix in (".gif", ".apng"):
         # duration = seconds per frame; loop=0 means infinite
         iio.imwrite(path, frames, duration=1 / max(fps, 1), loop=0)
@@ -195,9 +220,10 @@ def run_daily_am_pm_first_order_transitions_with_movies(
     save_png: bool = True,
     show_plots: bool = False,
     # Movie outputs (set any subset you want)
-    save_movie_both_path: Optional[Union[str, Path]] = None,  # AM+PM side by side
-    save_movie_am_path: Optional[Union[str, Path]] = None,    # AM-only frames
-    save_movie_pm_path: Optional[Union[str, Path]] = None,    # PM-only frames
+    save_movie_both_path: Optional[Union[str, Path]] = None,   # AM+PM side by side (per-day frame)
+    save_movie_am_path: Optional[Union[str, Path]] = None,     # AM-only sequential frames
+    save_movie_pm_path: Optional[Union[str, Path]] = None,     # PM-only sequential frames
+    save_movie_in_order_path: Optional[Union[str, Path]] = None,  # Day1 AM → Day1 PM → Day2 AM → ...
     movie_fps: int = 2,
     # Frame sizes
     single_figsize: Tuple[float, float] = (8, 7),
@@ -206,7 +232,11 @@ def run_daily_am_pm_first_order_transitions_with_movies(
 ) -> Dict[str, Dict[str, Dict[str, Optional[Union[pd.DataFrame, Path]]]]]:
     """
     Build AM/PM first-order matrices per day, save per-day outputs, and write
-    three movies: AM+PM paired, AM-only, PM-only (each optional).
+    four movies:
+      • AM+PM paired frames per day  ( *_transition_matrix_am_pm_per_day.gif )
+      • AM-only sequential frames    ( *_transition_matrix_am_only.gif )
+      • PM-only sequential frames    ( *_transition_matrix_pm_only.gif )
+      • In-order AM→PM sequence      ( *_transition_matrix_am_pm_in_order.gif )
 
     Returns
     -------
@@ -226,16 +256,30 @@ def run_daily_am_pm_first_order_transitions_with_movies(
     df["DateOnly"] = pd.to_datetime(df["Date"]).dt.normalize()
     df["HourNum"] = pd.to_numeric(df["Hour"], errors="coerce")
 
-    # Animal ID for titles
+    # Animal ID for titles & standardized filenames
     animal_id = None
     if "Animal ID" in df.columns:
         nn = df["Animal ID"].dropna()
         if not nn.empty:
             animal_id = str(nn.iloc[0])
+    if not animal_id:
+        animal_id = "unknown_animal"
 
     out_dir = Path(output_dir) if output_dir else None
     if out_dir:
         out_dir.mkdir(parents=True, exist_ok=True)
+
+    # If caller didn’t supply movie paths, build standardized ones using animal_id
+    if out_dir:
+        base = out_dir / f"{animal_id}_transition_matrix"
+        if save_movie_both_path is None:
+            save_movie_both_path = base.with_name(base.stem + "_am_pm_per_day.gif")
+        if save_movie_am_path is None:
+            save_movie_am_path = base.with_name(base.stem + "_am_only.gif")
+        if save_movie_pm_path is None:
+            save_movie_pm_path = base.with_name(base.stem + "_pm_only.gif")
+        if save_movie_in_order_path is None:
+            save_movie_in_order_path = base.with_name(base.stem + "_am_pm_in_order.gif")
 
     # First pass: compute AM/PM probs per day and gather union of labels
     union_labels = set(_as_str_labels(restrict_to_labels)) if restrict_to_labels else set()
@@ -275,6 +319,7 @@ def run_daily_am_pm_first_order_transitions_with_movies(
     frames_both: List[np.ndarray] = []
     frames_am: List[np.ndarray] = []
     frames_pm: List[np.ndarray] = []
+    frames_in_order: List[np.ndarray] = []
 
     results: Dict[str, Dict[str, Dict[str, Optional[Union[pd.DataFrame, Path]]]]] = OrderedDict()
 
@@ -294,10 +339,10 @@ def run_daily_am_pm_first_order_transitions_with_movies(
                 probs_pm = probs_pm.reindex(index=canonical, columns=canonical, fill_value=0)
 
         # Titles
-        base = f"{animal_id} " if animal_id else ""
-        title_am = f"{base}{date_str} AM First-Order Transition Probabilities"
-        title_pm = f"{base}{date_str} PM First-Order Transition Probabilities"
-        supertitle = f"{base}{date_str} AM (left)  |  PM (right)"
+        base_title = f"{animal_id} {date_str}"
+        title_am = f"{base_title} AM First-Order Transition Probabilities"
+        title_pm = f"{base_title} PM First-Order Transition Probabilities"
+        supertitle = f"{base_title}   AM (left) | PM (right)"
         if org.treatment_date:
             title_am += f" (Treatment: {org.treatment_date})"
             title_pm += f" (Treatment: {org.treatment_date})"
@@ -327,28 +372,31 @@ def run_daily_am_pm_first_order_transitions_with_movies(
                     csv_pm = out_dir / f"{date_str}_PM_first_order_probs.csv"
                     probs_pm.to_csv(csv_pm); results[date_str]["PM"]["probs_csv"] = csv_pm
 
-        # Build frames
+        # Build frames for movies
         if probs_am is not None:
-            frames_am.append(
-                render_single_heatmap_frame(probs_am, title=title_am, figsize=single_figsize)
-            )
+            frames_am.append(render_single_heatmap_frame(probs_am, title=title_am, figsize=single_figsize))
             results[date_str]["AM"]["probs"] = probs_am
         if probs_pm is not None:
-            frames_pm.append(
-                render_single_heatmap_frame(probs_pm, title=title_pm, figsize=single_figsize)
-            )
+            frames_pm.append(render_single_heatmap_frame(probs_pm, title=title_pm, figsize=single_figsize))
             results[date_str]["PM"]["probs"] = probs_pm
 
         # Paired frame (AM left, PM right). If a half is missing, it shows "No data".
-        if save_movie_both_path:
-            frame_both = render_side_by_side_frame(
-                probs_am if probs_am is not None else None,
-                probs_pm if probs_pm is not None else None,
-                left_title="AM", right_title="PM", supertitle=supertitle, figsize=pair_figsize
-            )
-            frames_both.append(frame_both)
+        frame_both = render_side_by_side_frame(
+            probs_am if probs_am is not None else None,
+            probs_pm if probs_pm is not None else None,
+            left_title="AM", right_title="PM", supertitle=supertitle, figsize=pair_figsize
+        )
+        frames_both.append(frame_both)
 
-        # Optional live plots in addition to PNGs
+        # In-order sequence: AM then PM (include "No data" panels if missing so timeline is consistent)
+        frames_in_order.append(
+            render_single_heatmap_frame(probs_am if probs_am is not None else pd.DataFrame(), title=title_am, figsize=single_figsize)
+        )
+        frames_in_order.append(
+            render_single_heatmap_frame(probs_pm if probs_pm is not None else pd.DataFrame(), title=title_pm, figsize=single_figsize)
+        )
+
+        # Optional live plots
         if show_plots:
             if probs_am is not None:
                 plt.figure(figsize=(9, 8))
@@ -359,13 +407,15 @@ def run_daily_am_pm_first_order_transitions_with_movies(
                 sns.heatmap(probs_pm, cmap="binary", vmin=0, vmax=1, cbar_kws={"label": "Transition Probability"}, square=True)
                 plt.title(title_pm); plt.xticks(rotation=45, ha="right"); plt.yticks(rotation=0, va="center"); plt.tight_layout(); plt.show()
 
-    # Write movies
+    # Write movies (filenames already standardized if out_dir was given)
     if save_movie_both_path and frames_both:
         _write_movie(save_movie_both_path, frames_both, movie_fps)
     if save_movie_am_path and frames_am:
         _write_movie(save_movie_am_path, frames_am, movie_fps)
     if save_movie_pm_path and frames_pm:
         _write_movie(save_movie_pm_path, frames_pm, movie_fps)
+    if save_movie_in_order_path and frames_in_order:
+        _write_movie(save_movie_in_order_path, frames_in_order, movie_fps)
 
     return results
 
@@ -387,12 +437,16 @@ if __name__ == "__main__":
         save_csv=True,
         save_png=True,
         show_plots=False,
-        save_movie_both_path="figures/daily_transitions_am_pm/am_pm_per_day.gif",
-        save_movie_am_path="figures/daily_transitions_am_pm/am_only.gif",
-        save_movie_pm_path="figures/daily_transitions_am_pm/pm_only.gif",
+        # You can omit the next four to use the standardized animalID-based names:
+        # save_movie_both_path="figures/daily_transitions_am_pm/USA5288_transition_matrix_am_pm_per_day.gif",
+        # save_movie_am_path="figures/daily_transitions_am_pm/USA5288_transition_matrix_am_only.gif",
+        # save_movie_pm_path="figures/daily_transitions_am_pm/USA5288_transition_matrix_pm_only.gif",
+        # save_movie_in_order_path="figures/daily_transitions_am_pm/USA5288_transition_matrix_am_pm_in_order.gif",
         movie_fps=2,
         enforce_consistent_order=True,
     )
+
+
 
 """
 from daily_am_pm_first_order_transitions_movie import run_daily_am_pm_first_order_transitions_with_movies
@@ -410,10 +464,7 @@ _ = run_daily_am_pm_first_order_transitions_with_movies(
     save_csv=False,
     save_png=False,
     show_plots=True,
-    save_movie_both_path="/Users/mirandahulsey-vincent/Documents/allPythonCode/syntax_analysis/py_files/figures/daily_transitions_am_pm/am_pm_per_day.gif",
-    save_movie_am_path="/Users/mirandahulsey-vincent/Documents/allPythonCode/syntax_analysis/py_files/figures/daily_transitions_am_pm/am_only.gif",
-    save_movie_pm_path="/Users/mirandahulsey-vincent/Documents/allPythonCode/syntax_analysis/py_files/figures/daily_transitions_am_pm/pm_only.gif",
-    movie_fps=2,
+    movie_fps=1,
     enforce_consistent_order=True,
 )
 
