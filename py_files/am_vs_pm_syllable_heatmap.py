@@ -248,12 +248,24 @@ def run_am_pm_syllable_heatmap(
     cmap: str = "Greys",
     verbose: bool = True,
 ) -> Dict[str, Any]:
+    # ── Organizer import (segments-aware first, fallback to legacy)
+    _USING_SEGMENTS = False
     try:
-        from organize_decoded_dataset import build_organized_dataset
-    except ImportError as e:
-        raise SystemExit(
-            "Could not import build_organized_dataset. Ensure organize_decoded_dataset.py is importable."
-        ) from e
+        from organize_decoded_with_segments import (
+            build_organized_segments_with_durations as _build_organized
+        )
+        _USING_SEGMENTS = True
+    except ImportError:
+        try:
+            from organize_decoded_dataset import (
+                build_organized_dataset as _build_organized
+            )
+        except ImportError as e:
+            raise SystemExit(
+                "Could not import an organizer. Ensure either "
+                "organize_decoded_with_segments.py or organize_decoded_dataset.py "
+                "is importable."
+            ) from e
 
     decoded = Path(decoded_database_json)
     meta = Path(creation_metadata_json)
@@ -262,23 +274,35 @@ def run_am_pm_syllable_heatmap(
     if not meta.exists():
         raise FileNotFoundError(f"Creation metadata JSON not found: {meta}")
 
-    out = build_organized_dataset(decoded, meta, verbose=verbose)
+    # Build the organized dataset using the available organizer
+    if _USING_SEGMENTS:
+        out = _build_organized(
+            decoded_database_json=decoded,
+            creation_metadata_json=meta,
+            only_song_present=False,
+            compute_durations=False,       # durations not needed for this heatmap
+            add_recording_datetime=True,   # harmless; handy for other tasks
+        )
+    else:
+        out = _build_organized(decoded, meta, verbose=verbose)
+
     organized_df = out.organized_df
 
-    # Try to read treatment date from metadata JSON
-    treatment_date = None
-    try:
-        with meta.open("r") as f:
-            treatment_date = json.load(f).get("treatment_date", None)
-    except Exception:
-        pass
+    # Treatment date: prefer organizer’s attribute, fallback to raw metadata
+    treatment_date = getattr(out, "treatment_date", None)
+    if not treatment_date:
+        try:
+            with meta.open("r") as f:
+                treatment_date = json.load(f).get("treatment_date", None)
+        except Exception:
+            treatment_date = None
 
     # Build AM/PM table
     table = build_am_pm_count_table(
         organized_df,
         label_column="syllable_onsets_offsets_ms_dict",
         date_column="Date",
-        syllable_labels=out.unique_syllable_labels,
+        syllable_labels=getattr(out, "unique_syllable_labels", None),
         normalize=normalize,
         sort_labels_numerically=True,
     )
@@ -302,8 +326,8 @@ def run_am_pm_syllable_heatmap(
 
     base = f"{animal_id}_syllable_heatmap"
     save_combined = outdir / f"{base}_am_pm_combined.png"
-    save_am = outdir / f"{base}_am.png"
-    save_pm = outdir / f"{base}_pm.png"
+    save_am = outdir / f"{base}_am.png"}
+    save_pm = outdir / f"{base}_pm.png"}
 
     # Plot combined
     fig_all, ax_all = plot_am_pm_syllable_heatmap(
@@ -392,3 +416,39 @@ if __name__ == "__main__":
         normalize=a.normalize, log_scale=a.log_scale,
         save_path=(a.save or None), show=not a.no_show,
     )
+    
+    """
+    from am_vs_pm_syllable_heatmap import run_am_pm_syllable_heatmap
+    from pathlib import Path
+    
+    # Input JSONs
+    decoded = "/Users/mirandahulsey-vincent/Desktop/SfN_data/USA5323/TweetyBERT_Pretrain_LLB_AreaX_FallSong_USA5323_decoded_database.json"
+    meta    = "/Users/mirandahulsey-vincent/Desktop/SfN_data/USA5323/USA5323_metadata.json"
+    
+    # Output directory (all three PNGs will be saved here: combined, AM-only, PM-only)
+    outdir = Path("/Users/mirandahulsey-vincent/Desktop/SfN_data/USA5323/figures")
+    outdir.mkdir(parents=True, exist_ok=True)
+    
+    # Run
+    res = run_am_pm_syllable_heatmap(
+        decoded_database_json=decoded,
+        creation_metadata_json=meta,
+        normalize="proportion",    # "proportion" (default) or "per_song"
+        log_scale=True,            # log10 scale, helpful if some values are very low
+        save_path=outdir,          # directory or full file path; filenames auto-set
+        show=True,                 # True = display plots interactively, False = just save PNGs
+        cmap="Greys",              # white→black, low→high
+    )
+    
+    # Inspect outputs
+    print("Animal ID:", res["animal_id"])
+    print("Treatment date:", res["treatment_date"])
+    print("Combined PNG:", res["combined_png"])
+    print("AM PNG:", res["am_png"])
+    print("PM PNG:", res["pm_png"])
+    
+    # Example: look at the table backing the heatmap
+    print(res["table"].head())
+
+    
+    """

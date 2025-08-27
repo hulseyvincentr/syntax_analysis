@@ -8,10 +8,22 @@ import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
 
-from organize_decoded_with_durations import (
-    build_organized_dataset_with_durations,
-    OrganizedDataset,
-)
+# ──────────────────────────────────────────────────────────────────────────────
+# Organizer import: prefer segments-aware, fallback to legacy durations organizer
+# ──────────────────────────────────────────────────────────────────────────────
+_USING_SEGMENTS = False
+try:
+    from organize_decoded_with_segments import (
+        build_organized_segments_with_durations as _build_organized,
+        OrganizedDataset,
+    )
+    _USING_SEGMENTS = True
+except ImportError:
+    from organize_decoded_with_durations import (
+        build_organized_dataset_with_durations as _build_organized,
+        OrganizedDataset,
+    )
+
 
 # ————————————————————————————————————————————————————————————————
 # Compatibility wrapper: seaborn 0.13+ uses density_norm; older uses scale
@@ -117,7 +129,7 @@ def _plot_one_syllable_am_pm(
             plt.legend()
 
     plt.tight_layout()
-    plt.savefig(out_path, format="png", dpi=300, transparent=True)
+    plt.savefig(out_path, format="png", dpi=300, transparent=False)
     if show_plots:
         plt.show()
     else:
@@ -150,12 +162,22 @@ def graph_AM_vs_PM_phrase_duration_over_days(
     save_dir = Path(save_output_to_this_file_path)
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    out = build_organized_dataset_with_durations(
-        decoded_database_json=decoded_database_json,
-        creation_metadata_json=creation_metadata_json,
-        only_song_present=only_song_present,
-        compute_durations=True,
-    )
+    # Build organized dataset (segments-aware or legacy). We need durations → compute_durations=True.
+    if _USING_SEGMENTS:
+        out = _build_organized(
+            decoded_database_json=decoded_database_json,
+            creation_metadata_json=creation_metadata_json,
+            only_song_present=only_song_present,
+            compute_durations=True,
+            add_recording_datetime=True,
+        )
+    else:
+        out = _build_organized(
+            decoded_database_json=decoded_database_json,
+            creation_metadata_json=creation_metadata_json,
+            only_song_present=only_song_present,
+            compute_durations=True,
+        )
 
     df = out.organized_df.copy()
     # Validate needed columns
@@ -269,6 +291,4 @@ out = graph_AM_vs_PM_phrase_duration_over_days(
     y_max_ms=2500,
     show_plots=True,           # True = display each plot interactively, False = just save PNGs
 )
-
-
 """

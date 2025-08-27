@@ -14,8 +14,9 @@ import matplotlib.pyplot as plt
 # ──────────────────────────────────────────────────────────────────────────────
 # Bring in your organizer
 # ──────────────────────────────────────────────────────────────────────────────
-from organize_decoded_with_durations import build_organized_dataset_with_durations
-
+from organize_decoded_with_segments import (
+    build_organized_segments_with_durations as build_organized_dataset_with_durations
+)
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers: build transitions from syllable_order
 # ──────────────────────────────────────────────────────────────────────────────
@@ -286,4 +287,35 @@ if __name__ == "__main__":
 
     # You can save results if you like:
     # ampm_entropy_df.to_csv("am_pm_total_transition_entropy.csv", index=False)
+"""
+from am_pm_transition_entropy_from_decoded import analyze_am_pm_transitions_from_decoded
 
+# Paths to your decoded + metadata files
+decoded = "/Users/mirandahulsey-vincent/Desktop/analysis_results/USA5507_RC4_Comp2/TweetyBERT_Pretrain_LLB_AreaX_FallSong_USA5507_RC4_Comp2_decoded_database.json"
+meta    = "/Users/mirandahulsey-vincent/Desktop/analysis_results/USA5507_RC4_Comp2/USA5507_RC4_Comp2_metadata.json"
+
+# Optional: override the treatment/surgery date (otherwise pulled from metadata)
+surgery_override_iso = None  # e.g., "2024-07-01"
+
+# Run the analysis
+organized_df, per_file_df, ampm_entropy_df = analyze_am_pm_transitions_from_decoded(
+    decoded_database_json=decoded,
+    creation_metadata_json=meta,
+    only_song_present=False,   # set True to restrict to rows where song_present == True
+    compute_durations=False,   # durations not needed for entropy
+    surgery_date_override=surgery_override_iso,
+    return_syllable_types=False,   # set True if you also want the global syllable label list back
+)
+
+# Inspect results
+print("\nOrganized dataset shape:", organized_df.shape)
+print("Per-file transitions shape:", per_file_df.shape)
+print("AM/PM entropy summary:\n", ampm_entropy_df.head())
+
+# If you want to save the entropy table for later analysis:
+out_csv = "/Users/mirandahulsey-vincent/Desktop/analysis_results/USA5507_RC4_Comp2/am_pm_total_transition_entropy.csv"
+ampm_entropy_df.to_csv(out_csv, index=False)
+print(f"Saved AM/PM entropy results → {out_csv}")
+
+
+"""

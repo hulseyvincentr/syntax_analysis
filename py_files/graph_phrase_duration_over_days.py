@@ -8,10 +8,21 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from organize_decoded_with_durations import (
-    build_organized_dataset_with_durations,
-    OrganizedDataset,
-)
+# ──────────────────────────────────────────────────────────────────────────────
+# Organizer import: prefer segments-aware, fallback to legacy durations organizer
+# ──────────────────────────────────────────────────────────────────────────────
+_USING_SEGMENTS = False
+try:
+    from organize_decoded_with_segments import (
+        build_organized_segments_with_durations as _build_organized,
+        OrganizedDataset,
+    )
+    _USING_SEGMENTS = True
+except ImportError:
+    from organize_decoded_with_durations import (
+        build_organized_dataset_with_durations as _build_organized,
+        OrganizedDataset,
+    )
 
 # ————————————————————————————————————————————————————————————————
 # Compatibility wrapper: seaborn 0.13+ uses density_norm; older uses scale
@@ -98,7 +109,7 @@ def _plot_one_syllable(
             plt.legend()
 
     plt.tight_layout()
-    plt.savefig(out_path, format="png", dpi=300, transparent=True)
+    plt.savefig(out_path, format="png", dpi=300, transparent=False)
     if show_plots:
         plt.show()
     else:
@@ -115,8 +126,8 @@ def graph_phrase_duration_over_days(
     point_alpha: float = 0.7,
     point_size: int = 5,
     jitter: float | bool = True,
-    dpi: int = 300,                        # kept for signature compatibility; used in helper
-    transparent: bool = True,              # kept for signature compatibility; used in helper
+    dpi: int = 300,                        # kept for signature compatibility
+    transparent: bool = True,              # kept for signature compatibility
     figsize: tuple[int, int] = (20, 11),
     font_size_labels: int = 30,
     xtick_fontsize: int = 8,
@@ -134,12 +145,22 @@ def graph_phrase_duration_over_days(
     save_dir = Path(save_output_to_this_file_path)
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    out = build_organized_dataset_with_durations(
-        decoded_database_json=decoded_database_json,
-        creation_metadata_json=creation_metadata_json,
-        only_song_present=only_song_present,
-        compute_durations=True,
-    )
+    # Build organized dataset (segments-aware or legacy). We need durations → compute_durations=True.
+    if _USING_SEGMENTS:
+        out = _build_organized(
+            decoded_database_json=decoded_database_json,
+            creation_metadata_json=creation_metadata_json,
+            only_song_present=only_song_present,
+            compute_durations=True,
+            add_recording_datetime=True,
+        )
+    else:
+        out = _build_organized(
+            decoded_database_json=decoded_database_json,
+            creation_metadata_json=creation_metadata_json,
+            only_song_present=only_song_present,
+            compute_durations=True,
+        )
 
     df = out.organized_df.copy()
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
@@ -234,8 +255,8 @@ if __name__ == "__main__":
 """
 from graph_phrase_duration_over_days import graph_phrase_duration_over_days
 
-decoded = "/Users/mirandahulsey-vincent/Documents/allPythonCode/syntax_analysis/data_inputs/Area_X_lesions_balanced_training_data/USA5288_decoded_database.json"
-meta = "/Users/mirandahulsey-vincent/Documents/allPythonCode/syntax_analysis/data_inputs/Area_X_lesions_balanced_training_data/USA5288_creation_data.json"
+decoded = "/Users/mirandahulsey-vincent/Desktop/SfN_data/USA5323/TweetyBERT_Pretrain_LLB_AreaX_FallSong_USA5323_decoded_database.json"
+meta    = "/Users/mirandahulsey-vincent/Desktop/SfN_data/USA5323/USA5323_metadata.json"
 outdir  = "/Users/mirandahulsey-vincent/Documents/allPythonCode/syntax_analysis/py_files/figures"
 
 out = graph_phrase_duration_over_days(
@@ -247,5 +268,4 @@ out = graph_phrase_duration_over_days(
     show_plots=True,           # keep False for batch saving
 )
 # Inspect: out.organized_df, out.unique_dates, out.unique_syllable_labels, out.treatment_date
-
 """

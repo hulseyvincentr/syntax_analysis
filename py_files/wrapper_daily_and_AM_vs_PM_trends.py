@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-
 # wrapper_daily_and_AM_vs_PM_trends.py
 from __future__ import annotations
 
@@ -26,22 +25,34 @@ def _ensure_dir(p: Union[str, Path]) -> Path:
 
 def get_animal_id_from_decoded(decoded_database_json: str | Path) -> str:
     """
-    Extract animal_id from the decoded JSON if present; otherwise fallback to filename.
-    Looks for keys: 'animal_id' or 'Animal ID' at the top level.
+    Extract animal_id from the decoded JSON if present; otherwise fallback heuristics:
+      1) top-level keys: 'animal_id' or 'Animal ID'
+      2) first results[*].file_name -> prefix before first underscore
+      3) filename stem up to first underscore
     """
     decoded_path = Path(decoded_database_json)
     try:
         with decoded_path.open("r") as f:
             data = json.load(f)
         if isinstance(data, dict):
-            if "animal_id" in data and data["animal_id"]:
-                return str(data["animal_id"])
-            if "Animal ID" in data and data["Animal ID"]:
-                return str(data["Animal ID"])
+            # direct top-level keys
+            for k in ("animal_id", "Animal ID"):
+                v = data.get(k, None)
+                if isinstance(v, (str, int)) and str(v).strip():
+                    return str(v)
+
+            # parsed from first result file_name if available
+            results = data.get("results", [])
+            if isinstance(results, list) and results:
+                fn = results[0].get("file_name") or results[0].get("filename") or results[0].get("path")
+                if isinstance(fn, str) and "_" in fn:
+                    return fn.split("_")[0]
     except Exception:
         pass
+
     # Fallback: filename stem up to first underscore
-    return decoded_path.stem.split("_")[0]
+    stem = decoded_path.stem
+    return stem.split("_")[0] if "_" in stem else stem
 
 
 def _replace_animal_id_tokens(obj: Any, animal_id: str) -> Any:
@@ -56,6 +67,17 @@ def _replace_animal_id_tokens(obj: Any, animal_id: str) -> Any:
     if isinstance(obj, str):
         return obj.replace("{animal_id}", animal_id)
     return obj
+
+
+def _load_json_or_path(s: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Accepts either an inline JSON string or a path to a JSON file."""
+    if not s:
+        return None
+    p = Path(s)
+    if p.suffix.lower() in {".json", ".jsonl"} and p.exists():
+        with p.open("r") as f:
+            return json.load(f)
+    return json.loads(s)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -85,8 +107,8 @@ def run_daily_and_am_pm_pipeline(
     """
     Orchestrate BOTH your 'daily' pipeline and your 'AM/PM' pipeline.
 
-    - Any '{animal_id}' tokens inside ampm_step_opts are auto-replaced using
-      the decoded JSON contents (fallback to filename).
+    - Any '{animal_id}' tokens inside daily_step_opts and ampm_step_opts are
+      auto-replaced using the decoded JSON contents (fallback to filename stem).
     """
     outdir = _ensure_dir(outdir)
     decoded = Path(decoded_database_json)
@@ -114,8 +136,9 @@ def run_daily_and_am_pm_pipeline(
     daily_step_opts = daily_step_opts or {}
     ampm_step_opts = ampm_step_opts or {}
 
-    # Resolve animal_id and hydrate any {animal_id} tokens inside the AM/PM opts
+    # Resolve animal_id and hydrate any {animal_id} tokens inside BOTH opts dicts
     animal_id = get_animal_id_from_decoded(decoded)
+    hydrated_daily_opts = _replace_animal_id_tokens(copy.deepcopy(daily_step_opts), animal_id)
     hydrated_ampm_opts = _replace_animal_id_tokens(copy.deepcopy(ampm_step_opts), animal_id)
 
     # DAILY half
@@ -129,7 +152,7 @@ def run_daily_and_am_pm_pipeline(
             creation_metadata_json=str(meta),
             outdir=str(outdir),
             steps=list(daily_steps),
-            step_opts=daily_step_opts,
+            step_opts=hydrated_daily_opts,
             resume=daily_resume,
             manifest_path=str(daily_manifest),
         )
@@ -202,17 +225,6 @@ def _parse_cli() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _load_json_or_path(s: Optional[str]) -> Optional[Dict[str, Any]]:
-    """Accepts either an inline JSON string or a path to a JSON file."""
-    if not s:
-        return None
-    p = Path(s)
-    if p.suffix.lower() in {".json", ".jsonl"} and p.exists():
-        with p.open("r") as f:
-            return json.load(f)
-    return json.loads(s)
-
-
 def main():
     ns = _parse_cli()
 
@@ -245,71 +257,67 @@ if __name__ == "__main__":
 """
 from wrapper_daily_and_AM_vs_PM_trends import run_daily_and_am_pm_pipeline
 
-decoded = "/Users/mirandahulsey-vincent/Documents/allPythonCode/syntax_analysis/data_inputs/Area_X_lesions_balanced_training_data/USA5288_decoded_database.json"
-meta    = "/Users/mirandahulsey-vincent/Documents/allPythonCode/syntax_analysis/data_inputs/Area_X_lesions_balanced_training_data/USA5288_creation_data.json"
-outdir  = "/Users/mirandahulsey-vincent/Documents/allPythonCode/syntax_analysis/py_files/figures"
+decoded = "/Users/mirandahulsey-vincent/Desktop/analysis_results/USA5199/TweetyBERT_Pretrain_LLB_AreaX_FallSong_USA5199_NEW_decoded_database.json"
+meta    = "/Users/mirandahulsey-vincent/Desktop/analysis_results/USA5199/USA5199_metadata.json"
+outdir  = "/Users/mirandahulsey-vincent/Desktop/analysis_results/USA5199/new_annotation_figures"
 
-# --- AM/PM OPTIONS (auto-fills {animal_id}) ---
 ampm_step_opts = {
     "am_pm_syllable_heatmap": {
         "normalize": "proportion",
         "log_scale": True,
-        "save_path": f"{outdir}/am_pm/{{animal_id}}_am_pm.png",
+        "save_path": f"{outdir}/am_pm/{{animal_id}}_am_pm.png",  # file
         "show": False,
     },
     "am_pm_transition_entropy": {
         "only_song_present": False,
         "compute_durations": False,
         "surgery_date_override": None,
-        "save_path": f"{outdir}/am_pm/{{animal_id}}_am_pm_entropy.png",
+        "save_path": f"{outdir}/am_pm/{{animal_id}}_am_pm_entropy.png",  # file
         "show": False,
     },
     "am_pm_phrase_duration": {
-        "save_output_to_this_file_path": f"{outdir}/am_pm_phrase_duration",
+        "save_output_to_this_file_path": f"{outdir}/am_pm_phrase_duration",  # dir
         "only_song_present": False,
         "y_max_ms": 25000,
         "show_plots": False,
     },
     "am_pm_transitions_movie": {
-        "output_dir": f"{outdir}/am_pm_transition_matrices",
+        "output_dir": f"{outdir}/am_pm_transition_matrices",  # dir for per-day PNG/CSV if enabled
         "save_movie_both_path": f"{outdir}/daily_transitions_am_pm/{{animal_id}}_transition_matrix_am_pm_per_day.gif",
         "save_movie_am_path":   f"{outdir}/daily_transitions_am_pm/{{animal_id}}_transition_matrix_am_only.gif",
         "save_movie_pm_path":   f"{outdir}/daily_transitions_am_pm/{{animal_id}}_transition_matrix_pm_only.gif",
         "movie_fps": 2,
         "enforce_consistent_order": True,
         "save_csv": False,
-        "save_png": True,
+        "save_png": True,       # turn on if you want per-day PNGs too
         "show_plots": False,
     },
 }
 
-# --- DAILY OPTIONS (this fixes the missing-arg error) ---
 daily_step_opts = {
-    # Required for the phrase-duration step
-    "phrase_duration_over_days": {
-        "save_output_to_this_file_path": f"{outdir}/daily_phrase_duration",
-        "only_song_present": False,
-        "y_max_ms": 25000,
-        "show_plots": False,
-    },
-    # Optional: examples for other daily steps (customize/omit as you like)
     "daily_first_order_transitions": {
-        "output_dir": f"{outdir}/daily_transitions",
-        "save_movie_path": f"{outdir}/daily_transitions/first_order_daily.gif",
+        "output_dir": f"{outdir}/daily_transitions",  # dir
+        "save_movie_path": f"{outdir}/daily_transitions/first_order_daily.gif",  # file
         "movie_fps": 2,
         "enforce_consistent_order": True,
         "save_csv": False,
-        "save_png": False,
+        "save_png": True,        # <= ensure PNGs are written if you want them
+        "show_plots": False,
+    },
+    "phrase_duration_over_days": {
+        "save_output_to_this_file_path": f"{outdir}/daily_phrase_duration",  # dir
+        "only_song_present": False,
+        "y_max_ms": 25000,
         "show_plots": False,
     },
     "transition_entropy_daily": {
         "only_song_present": False,
         "compute_durations": False,
         "surgery_date_override": None,
-        "save_dir": outdir,  # creates {animal_id}_transition_entropy_daily.png
+        "save_dir": outdir,  # dir -> {animal_id}_transition_entropy_daily.png
     },
     "syllable_heatmap": {
-        "save_dir": outdir,  # creates {animal_id}_daily_syllable_heatmap.png
+        "save_dir": outdir,   # dir -> {animal_id}_daily_syllable_heatmap.png
         "pseudocount": 1e-3,
         "cmap": "Greys",
         "show": False,
@@ -326,10 +334,14 @@ res = run_daily_and_am_pm_pipeline(
     outdir=outdir,
     run_daily=True,
     run_ampm=True,
-    daily_step_opts=daily_step_opts,   # ← supplies save_output_to_this_file_path
-    ampm_step_opts=ampm_step_opts,     # ← {animal_id} gets auto-replaced
+    daily_step_opts=daily_step_opts,
+    ampm_step_opts=ampm_step_opts,
+    daily_resume=False,   # force-run even if a manifest exists
+    ampm_resume=False,    # force-run AM/PM too
 )
+
 print(res)
+
 
 
 """

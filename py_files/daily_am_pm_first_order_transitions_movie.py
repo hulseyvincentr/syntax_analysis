@@ -12,7 +12,19 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import imageio.v3 as iio  # GIF/APNG out-of-the-box; MP4 needs imageio-ffmpeg/ffmpeg
 
-from organize_decoded_with_durations import build_organized_dataset_with_durations
+# ──────────────────────────────────────────────────────────────────────────────
+# Organizer import: prefer segments-aware, fallback to legacy durations organizer
+# ──────────────────────────────────────────────────────────────────────────────
+_USING_SEGMENTS = False
+try:
+    from organize_decoded_with_segments import (
+        build_organized_segments_with_durations as _build_organized
+    )
+    _USING_SEGMENTS = True
+except ImportError:
+    from organize_decoded_with_durations import (
+        build_organized_dataset_with_durations as _build_organized
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -242,12 +254,23 @@ def run_daily_am_pm_first_order_transitions_with_movies(
     -------
     results[date]['AM' or 'PM'] -> { 'probs': DF|None, 'figure_path': Path|None, ... }
     """
-    org = build_organized_dataset_with_durations(
-        decoded_database_json=decoded_database_json,
-        creation_metadata_json=creation_metadata_json,
-        only_song_present=only_song_present,
-        compute_durations=False,
-    )
+    # Build organized dataset (segments-aware or legacy)
+    if _USING_SEGMENTS:
+        org = _build_organized(
+            decoded_database_json=decoded_database_json,
+            creation_metadata_json=creation_metadata_json,
+            only_song_present=only_song_present,
+            compute_durations=False,
+            add_recording_datetime=True,
+        )
+    else:
+        org = _build_organized(
+            decoded_database_json=decoded_database_json,
+            creation_metadata_json=creation_metadata_json,
+            only_song_present=only_song_present,
+            compute_durations=False,
+        )
+
     df = org.organized_df.copy()
     if "Date" not in df.columns or "Hour" not in df.columns:
         raise KeyError("Organized DataFrame must include 'Date' and 'Hour' columns.")
@@ -343,7 +366,7 @@ def run_daily_am_pm_first_order_transitions_with_movies(
         title_am = f"{base_title} AM First-Order Transition Probabilities"
         title_pm = f"{base_title} PM First-Order Transition Probabilities"
         supertitle = f"{base_title}   AM (left) | PM (right)"
-        if org.treatment_date:
+        if getattr(org, "treatment_date", None):
             title_am += f" (Treatment: {org.treatment_date})"
             title_pm += f" (Treatment: {org.treatment_date})"
             supertitle += f"  (Treatment: {org.treatment_date})"
@@ -451,9 +474,8 @@ if __name__ == "__main__":
 """
 from daily_am_pm_first_order_transitions_movie import run_daily_am_pm_first_order_transitions_with_movies
 
-decoded = "/Users/mirandahulsey-vincent/Documents/allPythonCode/syntax_analysis/data_inputs/Area_X_lesions_balanced_training_data/USA5288_decoded_database.json"
-meta    = "/Users/mirandahulsey-vincent/Documents/allPythonCode/syntax_analysis/data_inputs/Area_X_lesions_balanced_training_data/USA5288_creation_data.json"
-
+decoded = "/Users/mirandahulsey-vincent/Desktop/SfN_data/USA5323/TweetyBERT_Pretrain_LLB_AreaX_FallSong_USA5323_decoded_database.json"
+meta    = "/Users/mirandahulsey-vincent/Desktop/SfN_data/USA5323/USA5323_metadata.json"
 _ = run_daily_am_pm_first_order_transitions_with_movies(
     decoded_database_json=decoded,
     creation_metadata_json=meta,
@@ -467,6 +489,4 @@ _ = run_daily_am_pm_first_order_transitions_with_movies(
     movie_fps=1,
     enforce_consistent_order=True,
 )
-
-
 """

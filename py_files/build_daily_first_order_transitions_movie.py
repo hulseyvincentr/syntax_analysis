@@ -13,7 +13,19 @@ import seaborn as sns
 # For movie writing
 import imageio.v3 as iio  # GIF works without ffmpeg; MP4 tries imageio-ffmpeg backend
 
-from organize_decoded_with_durations import build_organized_dataset_with_durations
+# ──────────────────────────────────────────────────────────────────────────────
+# Organizer import: prefer segments-aware, fallback to legacy durations organizer
+# ──────────────────────────────────────────────────────────────────────────────
+_USING_SEGMENTS = False
+try:
+    from organize_decoded_with_segments import (
+        build_organized_segments_with_durations as _build_organized
+    )
+    _USING_SEGMENTS = True
+except ImportError:
+    from organize_decoded_with_durations import (
+        build_organized_dataset_with_durations as _build_organized
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -205,12 +217,23 @@ def run_daily_first_order_transitions(
         'probs_csv': Optional[Path],
     }
     """
-    org = build_organized_dataset_with_durations(
-        decoded_database_json=decoded_database_json,
-        creation_metadata_json=creation_metadata_json,
-        only_song_present=only_song_present,
-        compute_durations=False,
-    )
+    # Build organized dataset (segments-aware or legacy)
+    if _USING_SEGMENTS:
+        org = _build_organized(
+            decoded_database_json=decoded_database_json,
+            creation_metadata_json=creation_metadata_json,
+            only_song_present=only_song_present,
+            compute_durations=False,
+            add_recording_datetime=True,
+        )
+    else:
+        org = _build_organized(
+            decoded_database_json=decoded_database_json,
+            creation_metadata_json=creation_metadata_json,
+            only_song_present=only_song_present,
+            compute_durations=False,
+        )
+
     df = org.organized_df.copy()
 
     if "Date" not in df.columns:
@@ -276,7 +299,7 @@ def run_daily_first_order_transitions(
             if save_png:
                 fig_path = output_dir / f"{stem}_probs.png"
             if save_csv:
-                counts_csv = output_dir / f"{stem}_counts.csv"
+                # Only saving probs here to avoid confusion; counts could be added if desired
                 probs_csv  = output_dir / f"{stem}_probs.csv"
 
         # Titles
@@ -284,11 +307,11 @@ def run_daily_first_order_transitions(
         if animal_id:
             title_bits.append(animal_id)
         title_bits.append(f"{date_str} First-Order Transition Probabilities")
-        if org.treatment_date:
+        if getattr(org, "treatment_date", None):
             title_bits.append(f"(Treatment: {org.treatment_date})")
         title = " ".join(title_bits)
 
-        # Save CSVs (recompute counts from probs' row-sums is lossy; skip – only probs here)
+        # Save CSVs
         if probs_csv:
             probs.to_csv(probs_csv)
 
@@ -310,10 +333,10 @@ def run_daily_first_order_transitions(
 
         # Store result
         results[date_str] = {
-            "counts": None,     # counts aren’t kept in this second pass to save memory
+            "counts": None,     # counts not stored in this pass to save memory
             "probs": probs,
             "figure_path": fig_path,
-            "counts_csv": counts_csv,
+            "counts_csv": None,    # not produced in this variant
             "probs_csv": probs_csv,
         }
 
@@ -370,10 +393,10 @@ if __name__ == "__main__":
 
 """
 from build_daily_first_order_transitions_movie import run_daily_first_order_transitions
-
-decoded = "/Users/mirandahulsey-vincent/Documents/allPythonCode/syntax_analysis/data_inputs/Area_X_lesions_balanced_training_data/USA5288_decoded_database.json"
-meta    = "/Users/mirandahulsey-vincent/Documents/allPythonCode/syntax_analysis/data_inputs/Area_X_lesions_balanced_training_data/USA5288_creation_data.json"
-
+ # Input JSONs
+decoded = "/Users/mirandahulsey-vincent/Desktop/SfN_data/USA5323/TweetyBERT_Pretrain_LLB_AreaX_FallSong_USA5323_decoded_database.json"
+meta    = "/Users/mirandahulsey-vincent/Desktop/SfN_data/USA5323/USA5323_metadata.json"
+ 
 _ = run_daily_first_order_transitions(
     decoded_database_json=decoded,
     creation_metadata_json=meta,
@@ -388,6 +411,4 @@ _ = run_daily_first_order_transitions(
     movie_fps=2,
     enforce_consistent_order=True,
 )
-
-
 """

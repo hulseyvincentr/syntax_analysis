@@ -1,8 +1,8 @@
 # ────────────────────────────────────────────────────────────────
 # USER-DEFINED VALUES
 # ────────────────────────────────────────────────────────────────
-main_folder        = '/Volumes/my_own_SSD/baseline_recordings/USA5507_RC4'
-animal_id          = 'USA5507'                 # Used for ID checking and convenience only
+main_folder        = '/Volumes/GLABSSD/Gardner_447D_Comp1_Comp2_and_laptop_SONGS_24June2025/2025_baseline/USA5508_RC2_Comp2'
+animal_id          = 'USA5508'                 # Used for ID checking and convenience only
 expected_animal_id = animal_id                 # Warn if files don't match this ID; set to None to disable
 treatment_date     = None                      # None → JSON null
 treatment_type     = "None (baseline only)"    # or None → JSON null
@@ -14,8 +14,8 @@ output_dir         = '/Users/mirandahulsey-vincent/Desktop/metadata_jsons'
 # Ranges support '-' or ':' plus 'start'/'end' keywords:
 #   "94-111", "94:111", "start-111", "94:end", "start:end"
 folder_year_map = {
-    2024: ["start:13"]
-    , 2025: ["147:end"] 
+    #2024: ["start:13"], 
+    2025: ["start:end"] 
 }
 
 # ────────────────────────────────────────────────────────────────

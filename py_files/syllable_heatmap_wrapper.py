@@ -7,7 +7,32 @@ from typing import Optional, Union, Dict, Any
 import json
 import pandas as pd
 
-from organize_decoded_dataset import build_organized_dataset
+# ──────────────────────────────────────────────────────────────────────────────
+# Organizer import preference order:
+#   1) segments-aware organizer (new format with per-file segments)
+#   2) legacy organizer (no durations) for backward compatibility
+#   3) durations organizer (also compatible; we won't require durations here)
+# ──────────────────────────────────────────────────────────────────────────────
+_ORG_MODE = "segments"  # "segments" | "legacy" | "durations"
+
+try:
+    # New, segment-aware API
+    from organize_decoded_with_segments import (
+        build_organized_segments_with_durations as _build_organized,
+    )
+    _ORG_MODE = "segments"
+except ImportError:
+    try:
+        # Original organizer used by this wrapper previously
+        from organize_decoded_dataset import build_organized_dataset as _build_organized  # type: ignore
+        _ORG_MODE = "legacy"
+    except ImportError:
+        # Fallback to durations-based organizer; still exposes same fields we need
+        from organize_decoded_with_durations import (  # type: ignore
+            build_organized_dataset_with_durations as _build_organized
+        )
+        _ORG_MODE = "durations"
+
 from syllable_heatmap import (
     build_daily_avg_count_table,
     plot_log_scaled_syllable_counts,
@@ -54,8 +79,25 @@ def run_daily_syllable_heatmap(
     if not meta.exists():
         raise FileNotFoundError(f"Creation metadata JSON not found: {meta}")
 
-    # 1) Organize dataset
-    out = build_organized_dataset(decoded, meta, verbose=verbose)
+    # 1) Organize dataset (choose args based on which organizer we imported)
+    if _ORG_MODE == "segments":
+        out = _build_organized(
+            decoded_database_json=decoded,
+            creation_metadata_json=meta,
+            only_song_present=False,
+            compute_durations=False,     # counts only; durations not required
+            add_recording_datetime=True, # ensures Date/Hour etc. are populated
+        )
+    elif _ORG_MODE == "durations":
+        out = _build_organized(
+            decoded_database_json=decoded,
+            creation_metadata_json=meta,
+            only_song_present=False,
+            compute_durations=False,     # keep false; we just need counts/labels
+        )
+    else:  # "legacy"
+        out = _build_organized(decoded, meta, verbose=verbose)
+
     organized_df = out.organized_df
 
     # 2) Build daily avg count table (mean counts per file per day)
@@ -63,7 +105,7 @@ def run_daily_syllable_heatmap(
         organized_df,
         label_column=label_column,
         date_column=date_column,
-        syllable_labels=out.unique_syllable_labels,  # stable order
+        syllable_labels=getattr(out, "unique_syllable_labels", None),  # stable row order if available
     )
 
     # 3) Animal ID (if consistent) or override
@@ -73,15 +115,19 @@ def run_daily_syllable_heatmap(
         if len(ids) == 1:
             animal_id = ids[0]
 
-    # 4) Treatment date from metadata or override
+    # 4) Treatment date from metadata or override (fallback to organizer attr if present)
     treatment_date = treatment_date_override
     if treatment_date is None:
+        # Prefer reading from metadata json for backward compatibility
         try:
             with meta.open("r") as f:
                 meta_json = json.load(f)
             treatment_date = meta_json.get("treatment_date", None)
         except Exception:
             treatment_date = None
+        # If organizer provided a formatted value, use that when metadata lacked one
+        if treatment_date is None:
+            treatment_date = getattr(out, "treatment_date", None)
 
     # 5) Plot heatmap
     fig, ax = plot_log_scaled_syllable_counts(
@@ -152,5 +198,4 @@ res = run_daily_syllable_heatmap(
     nearest_match=True,
     max_days_off=1,
 )
-
 """
