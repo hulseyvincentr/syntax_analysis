@@ -3,15 +3,21 @@ from __future__ import annotations
 """
 Per-day aggregated TTE for first-N from time range 1 and last-N from time range 2.
 
-New behavior:
-  • Excludes any file whose syllable_order contains only ONE unique label.
-    (e.g., ['A','A','A'] is excluded; must have >=2 unique labels.)
+Behavior:
+  • Excludes any file whose syllable_order contains only ONE unique label
+    if exclude_single_label=True (e.g., ['A','A','A'] gets excluded).
+  • For each calendar day:
+      - Select the first N files within Range1 and the last N files within Range2 (after filtering).
+      - Aggregate transitions across those N files (per range) and compute TTE.
+      - Plot a paired line plot (two x positions: Range1-firstN vs Range2-lastN),
+        one line per day, with a legend labeling each day.
+      - ALSO plot an AM/PM (Range1/Range2) trend across calendar days.
 
-For each calendar day:
-  • Select the first N files within Range1 and the last N files within Range2 (after filtering).
-  • Aggregate transitions across those N files (per range) and compute TTE.
-  • Plot a paired line plot with two x positions (Range1 first-N vs Range2 last-N),
-    one line per day, with a legend labeling each day.
+Returns:
+  BatchTTEByDayResult with:
+    - summary_df (day, n_r1, n_r2, tte_r1, tte_r2)
+    - figure_path (paired points figure)
+    - trend_figure_path (AM/PM trend across days)
 
 Example:
 --------
@@ -29,7 +35,7 @@ res = run_set_hour_and_batch_TTE_by_day(
     batch_size=10,
     min_required_per_range=1,  # require at least this many per range to include day
     only_song_present=True,
-    exclude_single_label=True,  # <-- default True
+    exclude_single_label=True,
     save_dir=Path("./figures"),
     show=True,
 )
@@ -204,6 +210,10 @@ def _tte_from_counts(counts: Dict[Tuple[str, str], int], syllable_types: List[st
     ent_by_syll = _calculate_transition_entropy(norm, syllable_types)
     return _calculate_total_transition_entropy(cm, syllable_types, ent_by_syll)
 
+def _clean_for_filename(s: str) -> str:
+    """Helper to sanitize strings for filenames."""
+    return s.replace(":", "").replace("-", "_")
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Result containers
 # ──────────────────────────────────────────────────────────────────────────────
@@ -220,7 +230,8 @@ class PerDayAggregate:
 class BatchTTEByDayResult:
     animal_id: str
     summary_df: pd.DataFrame   # columns: day, n_r1, n_r2, tte_r1, tte_r2
-    figure_path: Optional[Path]
+    figure_path: Optional[Path] = None        # paired points figure
+    trend_figure_path: Optional[Path] = None  # AM/PM trend across days
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Core routine
@@ -235,7 +246,7 @@ def run_set_hour_and_batch_TTE_by_day(
     batch_size: int,
     min_required_per_range: int = 1,  # require at least this many in each range to include day
     only_song_present: bool = False,
-    exclude_single_label: bool = True,  # <-- new flag; default True
+    exclude_single_label: bool = True,  # default True
     compute_durations: bool = False,
     save_dir: Optional[Union[str, Path]] = None,
     show: bool = True,
@@ -248,6 +259,7 @@ def run_set_hour_and_batch_TTE_by_day(
         built from all selected files across all days/ranges (consistent axes).
       - Plot paired points (Range1 vs Range2) with lines connecting each day's pair,
         and include a legend labeling each day.
+      - ALSO plot an AM/PM (Range1/Range2) trend across calendar days.
     """
     # Build dataset
     od = build_organized_dataset_with_durations(
@@ -272,7 +284,7 @@ def run_set_hour_and_batch_TTE_by_day(
     pf = _build_per_file_transitions(organized, exclude_single_label=exclude_single_label)
     if pf.empty:
         print("No valid per-file transitions found after filtering.")
-        return BatchTTEByDayResult(animal_id, pd.DataFrame(), None)
+        return BatchTTEByDayResult(animal_id, pd.DataFrame(), None, None)
 
     # Parse ranges
     s1, e1 = _parse_time_range(range1)
@@ -307,7 +319,7 @@ def run_set_hour_and_batch_TTE_by_day(
 
     if not per_day:
         print("No days met the selection criteria.")
-        return BatchTTEByDayResult(animal_id, pd.DataFrame(), None)
+        return BatchTTEByDayResult(animal_id, pd.DataFrame(), None, None)
 
     # Build a GLOBAL syllable set over all selected counts
     global_labels = set()
@@ -317,7 +329,7 @@ def run_set_hour_and_batch_TTE_by_day(
     syllable_types = sorted(global_labels)
     if not syllable_types:
         print("Selected data had no transitions.")
-        return BatchTTEByDayResult(animal_id, pd.DataFrame(), None)
+        return BatchTTEByDayResult(animal_id, pd.DataFrame(), None, None)
 
     # Compute TTE per day using the global axes
     rows: List[PerDayAggregate] = []
@@ -328,13 +340,12 @@ def run_set_hour_and_batch_TTE_by_day(
 
     summary_df = pd.DataFrame([r.__dict__ for r in rows]).sort_values("day").reset_index(drop=True)
 
-    # Plot paired lines (each day is a line from x=0 to x=1) + LEGEND
+    # ── PLOT 1: Paired points with lines (one line per day) ───────────────────
     fig, ax = plt.subplots(figsize=(12, 6))
     x_positions = [0, 1]
     x_labels = [f"{range1}\n(first N)", f"{range2}\n(last N)"]
 
-    handles = []
-    labels = []
+    handles, labels = [], []
     for _, row in summary_df.iterrows():
         lbl = pd.to_datetime(row["day"]).strftime("%Y-%m-%d")
         h, = ax.plot(x_positions, [row["tte_r1"], row["tte_r2"]],
@@ -347,7 +358,11 @@ def run_set_hour_and_batch_TTE_by_day(
     ax.set_ylabel("Total Transition Entropy (bits)")
     ax.set_title(f"{animal_id} – Per-day aggregated TTE\n"
                  f"First {batch_size} in {range1} vs Last {batch_size} in {range2}")
-    ax.grid(True, axis="y", alpha=0.25)
+    ax.grid(False)
+    # Hide top & right spines
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    ax.tick_params(top=False, right=False)
 
     # Legend outside on the right
     n = len(labels)
@@ -362,18 +377,58 @@ def run_set_hour_and_batch_TTE_by_day(
     if save_dir:
         save_dir = Path(save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
-        def clean(s: str) -> str:
-            return s.replace(":", "").replace("-", "_")
-        fig_path = save_dir / f"{animal_id}_PerDay_TTE_{clean(range1)}__{clean(range2)}__N{batch_size}.png"
+        fig_path = save_dir / f"{animal_id}_PerDay_TTE_{_clean_for_filename(range1)}__{_clean_for_filename(range2)}__N{batch_size}.png"
         fig.savefig(fig_path, dpi=200)
         print(f"Saved figure → {fig_path}")
 
-    if show:
-        plt.show()
-    else:
-        plt.close(fig)
+        # ── PLOT 2: Sequential AM/PM labels per day (Day 1 AM, Day 1 PM, ...) ────
+        fig2, ax2 = plt.subplots(figsize=(12, 6))
+    
+        # Pick friendly window names when they match AM/PM, otherwise show the spec
+        def _win_name(start_min: int, end_min: int, spec: str) -> str:
+            if start_min == 0 and end_min <= 720:    # 00:00–12:00
+                return "AM"
+            if start_min >= 720:                     # 12:00–24:00
+                return "PM"
+            return spec
+    
+        name_r1 = _win_name(s1, e1, range1)
+        name_r2 = _win_name(s2, e2, range2)
+    
+        # Build interleaved labels/values: Day 1 AM, Day 1 PM, Day 2 AM, Day 2 PM, ...
+        labels_seq, y_seq = [], []
+        for i, row in summary_df.reset_index(drop=True).iterrows():
+            day_idx = i + 1
+            labels_seq += [f"Day {day_idx} {name_r1}", f"Day {day_idx} {name_r2}"]
+            y_seq += [row["tte_r1"], row["tte_r2"]]
+    
+        x = np.arange(len(labels_seq))
+        ax2.plot(x, y_seq, marker="o", linewidth=1.8, alpha=0.9)
+    
+        ax2.set_xlabel("Day / Window")
+        ax2.set_ylabel("Total Transition Entropy (bits)")
+        ax2.set_title(
+            f"{animal_id} – AM/PM TTE sequence by day\n"
+            f"First {batch_size} in {range1} vs Last {batch_size} in {range2}"
+        )
+    
+        ax2.set_xticks(x)
+        ax2.set_xticklabels(labels_seq, rotation=90, ha="right")
+        ax2.grid(False)
+        for side in ("top", "right"):
+            ax2.spines[side].set_visible(False)
+        ax2.tick_params(top=False, right=False)
+        plt.tight_layout()
+    
+        trend_fig_path: Optional[Path] = None
+        if save_dir:
+            trend_fig_path = (
+                Path(save_dir) /
+                f"{animal_id}_PerDay_TTE_AMPM_SEQ_{_clean_for_filename(range1)}__{_clean_for_filename(range2)}__N{batch_size}.png"
+            )
+            fig2.savefig(trend_fig_path, dpi=200)
+            print(f"Saved sequential AM/PM figure → {trend_fig_path}")
 
-    return BatchTTEByDayResult(animal_id=animal_id, summary_df=summary_df, figure_path=fig_path)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CLI quick test
@@ -390,27 +445,32 @@ if __name__ == "__main__":
         min_required_per_range=1,
         only_song_present=True,
         exclude_single_label=True,  # exclude files with only one unique label
-        save_dir=Path("./figures"),
+        save_dir=Path("/figures"),
         show=True,
     )
 
 
-
 """
 # Paths to your decoded + metadata files
-from set_hour_and_batch_TTE_ import run_set_hour_and_batch_TTE
-decoded = "/Users/mirandahulsey-vincent/Desktop/analysis_results/R07_RC3_Comp2/TweetyBERT_Pretrain_LLB_AreaX_FallSong_R07_RC3_Comp2_decoded_database.json"
-meta    = "/Users/mirandahulsey-vincent/Desktop/analysis_results/R07_RC3_Comp2/R07_RC3_Comp2_metadata.json"
+from pathlib import Path
+import importlib, set_hour_and_batch_TTE   # import the module itself
+importlib.reload(set_hour_and_batch_TTE)   # force Python to use the new code
 
-_ = run_set_hour_and_batch_TTE(
-    decoded_database_json=decoded,
-    creation_metadata_json=meta,
-    range1="05:00-07:00",
-    range2="14:00-17:00",
-    batch_size=25,
+from set_hour_and_batch_TTE import run_set_hour_and_batch_TTE_by_day
+res = run_set_hour_and_batch_TTE_by_day(
+    decoded_database_json="/Users/mirandahulsey-vincent/Documents/allPythonCode/syntax_analysis/data_inputs/USA1234_decoded_database.json",
+    creation_metadata_json="/Users/mirandahulsey-vincent/Documents/allPythonCode/syntax_analysis/data_inputs/USA1234_metadata.json",
+    range1="00:00-12:00",
+    range2="12:00-23:59",
+    batch_size=5,
+    min_required_per_range=1,
     only_song_present=True,
+    exclude_single_label=False,
     save_dir=Path("./figures"),
     show=True,
 )
+print("paired:", res.figure_path)
+print("trend :", res.trend_figure_path)
+
 
 """

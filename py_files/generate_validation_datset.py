@@ -6,24 +6,22 @@ Create two validation JSON files for USA1234, matching your prior schemas:
 1) USA1234_metadata.json  (creation metadata format)
 2) USA1234_decoded_database.json  (decoded database format)
 
-AM/PM rules (10 songs/day = 5 AM + 5 PM):
-- Jan 1 & 2:
-    AM: syllable '0' only
-    PM: '0' -> '1' only
-- Jan 3 & 4:
-    AM: half '0'->'1', half '0'->'2'
-    PM: syllable '0' only
+AM/PM definition:
+- AM = 00:00–11:59
+- PM = 12:00–23:59
 
-Syllable timing:
-- Each syllable: 200 ms
-- Gap between consecutive syllables: 10 ms
-- Timebins = 10 ms; e.g., 200 ms spans 20 bins.
+Requested patterns (exact splits):
+1) 2000-01-01 AM: 0→1 only
+2) 2000-01-01 PM: half 0→1, half 0→2
+3) 2000-01-02 AM: equal thirds 0→1, 0→2, 0→3
+4) 2000-01-02 PM: 0→2 only
 
-Notes:
-- Uses year 2000 (pandas-safe) to avoid out-of-bounds issues later when
-  converting to pandas Timestamps in organizer-style code.
-- File names include a trailing segment index ("_0.wav") to match your parser.
-- The "random-looking" middle token in file_name is just a deterministic counter.
+Implementation notes:
+- To satisfy exact 1/2 and 1/3 splits, we use 12 songs/day → 6 AM + 6 PM.
+- AM songs are placed at 00:00..00:05, PM songs at 12:00..12:05.
+- Each syllable is 200 ms; gap between syllables is 10 ms; timebins are 10 ms (inclusive spans).
+- File names include the trailing segment index "_0.wav" to match your parser.
+- Year 2000 is used to keep pandas timestamps in range.
 """
 
 from __future__ import annotations
@@ -37,10 +35,10 @@ from typing import Dict, List, Tuple
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
 ANIMAL_ID = "USA1234"
 YEAR = 2000  # pandas-safe synthetic year
-DAYS = [1, 2, 3, 4]
-SONGS_PER_DAY = 10
-SONGS_AM = 5
-SONGS_PM = SONGS_PER_DAY - SONGS_AM
+DAYS = [1, 2]  # Only Jan 1 and Jan 2 per your request
+SONGS_PER_DAY = 12
+SONGS_AM = 6
+SONGS_PM = SONGS_PER_DAY - SONGS_AM  # 6
 
 SYL_MS = 200.0
 GAP_MS = 10.0
@@ -79,30 +77,12 @@ def _mk_syllables_two(a: str, b: str) -> Tuple[Dict[str, List[List[float]]], Dic
     return ms, tb
 
 
-def _am_patterns(day: int) -> List[List[str]]:
-    """Return list of label sequences for AM (length = SONGS_AM)."""
-    if day in (1, 2):
-        return [["0"]] * SONGS_AM
-    # day 3 & 4: half 0->1, half 0->2
-    half = SONGS_AM // 2
-    rem = SONGS_AM - half
-    return [["0", "1"]] * half + [["0", "2"]] * rem
-
-
-def _pm_patterns(day: int) -> List[List[str]]:
-    """Return list of label sequences for PM (length = SONGS_PM)."""
-    if day in (1, 2):
-        return [["0", "1"]] * SONGS_PM
-    # day 3 & 4: only '0'
-    return [["0"]] * SONGS_PM
-
-
 def _file_stem_token(i: int) -> str:
     """
     Deterministic “random-looking” token for the middle filename field.
     Format XXXXX.YYYYYYYY (digits only) to look like prior examples.
     """
-    return f"{(45300 + i):05d}.{(41751298 + 87123 * i):08d}"[-14:]  # keep width-ish similar
+    return f"{(45300 + i):05d}.{(41751298 + 87123 * i):08d}"[-14:]  # width-ish similar
 
 
 def _mk_filename(dt: datetime, i: int, segment: int = 0, with_ext: bool = True) -> str:
@@ -125,6 +105,49 @@ def _mk_filename(dt: datetime, i: int, segment: int = 0, with_ext: bool = True) 
     return f"{stem}.wav" if with_ext else stem
 
 
+# ── PATTERN BUILDERS (per your new rules) ──────────────────────────────────────
+def _am_patterns_for_day(day: int) -> List[List[str]]:
+    """
+    Return list of label sequences for AM (length = SONGS_AM).
+    2000-01-01 AM: all 0->1
+    2000-01-02 AM: equal thirds 0->1, 0->2, 0->3
+    """
+    if day == 1:
+        return [["0", "1"]] * SONGS_AM
+    elif day == 2:
+        third = SONGS_AM // 3
+        rem = SONGS_AM - third * 3  # should be 0 with SONGS_AM=6
+        patt = [["0", "1"]] * third + [["0", "2"]] * third + [["0", "3"]] * third
+        # If SONGS_AM not divisible by 3, distribute remainder (stable order)
+        for i in range(rem):
+            patt.append([["0", "1"], ["0", "2"], ["0", "3"]][i % 3])
+        return patt
+    else:
+        # Not used for DAYS=[1,2], but keep a fallback
+        return [["0"]] * SONGS_AM
+
+
+def _pm_patterns_for_day(day: int) -> List[List[str]]:
+    """
+    Return list of label sequences for PM (length = SONGS_PM).
+    2000-01-01 PM: half 0->1, half 0->2
+    2000-01-02 PM: all 0->2
+    """
+    if day == 1:
+        half = SONGS_PM // 2
+        rem = SONGS_PM - 2 * half  # should be 0 with SONGS_PM=6
+        patt = [["0", "1"]] * half + [["0", "2"]] * half
+        # If odd, add one more 0->1 first
+        if rem > 0:
+            patt.append(["0", "1"])
+        return patt
+    elif day == 2:
+        return [["0", "2"]] * SONGS_PM
+    else:
+        # Not used for DAYS=[1,2], but keep a fallback
+        return [["0"]] * SONGS_PM
+
+
 # ── DATA BUILDERS ──────────────────────────────────────────────────────────────
 @dataclass
 class DecodedRow:
@@ -137,7 +160,7 @@ class DecodedRow:
 def build_decoded_results() -> List[Dict]:
     """
     Build results list for the decoded_database.json.
-    10 songs/day → 5 AM (08:00..08:04), 5 PM (14:00..14:04) per day.
+    12 songs/day → 6 AM (00:00..00:05), 6 PM (12:00..12:05) per day.
     """
     results: List[Dict] = []
     counter = 0
@@ -145,9 +168,9 @@ def build_decoded_results() -> List[Dict]:
     for day in DAYS:
         day_base = datetime(YEAR, 1, day)
 
-        # AM block
-        am_start = day_base.replace(hour=8, minute=0, second=0, microsecond=0)
-        for idx, patt in enumerate(_am_patterns(day)):
+        # AM block: start at 00:00
+        am_start = day_base.replace(hour=0, minute=0, second=0, microsecond=0)
+        for idx, patt in enumerate(_am_patterns_for_day(day)):
             rec_dt = am_start + timedelta(minutes=idx)
             if len(patt) == 1:
                 ms, tb = _mk_syllables_one(patt[0])
@@ -164,9 +187,9 @@ def build_decoded_results() -> List[Dict]:
             )
             counter += 1
 
-        # PM block
-        pm_start = day_base.replace(hour=14, minute=0, second=0, microsecond=0)
-        for idx, patt in enumerate(_pm_patterns(day)):
+        # PM block: start at 12:00
+        pm_start = day_base.replace(hour=12, minute=0, second=0, microsecond=0)
+        for idx, patt in enumerate(_pm_patterns_for_day(day)):
             rec_dt = pm_start + timedelta(minutes=idx)
             if len(patt) == 1:
                 ms, tb = _mk_syllables_one(patt[0])
