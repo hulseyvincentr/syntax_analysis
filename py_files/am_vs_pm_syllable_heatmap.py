@@ -326,8 +326,8 @@ def run_am_pm_syllable_heatmap(
 
     base = f"{animal_id}_syllable_heatmap"
     save_combined = outdir / f"{base}_am_pm_combined.png"
-    save_am = outdir / f"{base}_am.png"}
-    save_pm = outdir / f"{base}_pm.png"}
+    save_am = outdir / f"{base}_am.png"
+    save_pm = outdir / f"{base}_pm.png"
 
     # Plot combined
     fig_all, ax_all = plot_am_pm_syllable_heatmap(

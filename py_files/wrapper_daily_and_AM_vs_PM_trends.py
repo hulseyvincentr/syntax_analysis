@@ -257,9 +257,9 @@ if __name__ == "__main__":
 """
 from wrapper_daily_and_AM_vs_PM_trends import run_daily_and_am_pm_pipeline
 
-decoded = "/Users/mirandahulsey-vincent/Desktop/analysis_results/USA5199/TweetyBERT_Pretrain_LLB_AreaX_FallSong_USA5199_NEW_decoded_database.json"
-meta    = "/Users/mirandahulsey-vincent/Desktop/analysis_results/USA5199/USA5199_metadata.json"
-outdir  = "/Users/mirandahulsey-vincent/Desktop/analysis_results/USA5199/new_annotation_figures"
+decoded = "/Users/mirandahulsey-vincent/Desktop/analysis_results/USA5272/TweetyBERT_Pretrain_LLB_AreaX_FallSong_USA5272_decoded_database.json"
+meta    = "/Users/mirandahulsey-vincent/Desktop/analysis_results/USA5272/USA5272_metadata.json"
+outdir  = "/Users/mirandahulsey-vincent/Desktop/analysis_results/USA5272/new_figures"
 
 ampm_step_opts = {
     "am_pm_syllable_heatmap": {
@@ -286,7 +286,7 @@ ampm_step_opts = {
         "save_movie_both_path": f"{outdir}/daily_transitions_am_pm/{{animal_id}}_transition_matrix_am_pm_per_day.gif",
         "save_movie_am_path":   f"{outdir}/daily_transitions_am_pm/{{animal_id}}_transition_matrix_am_only.gif",
         "save_movie_pm_path":   f"{outdir}/daily_transitions_am_pm/{{animal_id}}_transition_matrix_pm_only.gif",
-        "movie_fps": 2,
+        "movie_fps": 1,
         "enforce_consistent_order": True,
         "save_csv": False,
         "save_png": True,       # turn on if you want per-day PNGs too
@@ -298,7 +298,7 @@ daily_step_opts = {
     "daily_first_order_transitions": {
         "output_dir": f"{outdir}/daily_transitions",  # dir
         "save_movie_path": f"{outdir}/daily_transitions/first_order_daily.gif",  # file
-        "movie_fps": 2,
+        "movie_fps": 1,
         "enforce_consistent_order": True,
         "save_csv": False,
         "save_png": True,        # <= ensure PNGs are written if you want them

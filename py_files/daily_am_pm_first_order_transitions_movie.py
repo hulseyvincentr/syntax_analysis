@@ -236,7 +236,7 @@ def run_daily_am_pm_first_order_transitions_with_movies(
     save_movie_am_path: Optional[Union[str, Path]] = None,     # AM-only sequential frames
     save_movie_pm_path: Optional[Union[str, Path]] = None,     # PM-only sequential frames
     save_movie_in_order_path: Optional[Union[str, Path]] = None,  # Day1 AM → Day1 PM → Day2 AM → ...
-    movie_fps: int = 2,
+    movie_fps: int = 1,
     # Frame sizes
     single_figsize: Tuple[float, float] = (8, 7),
     pair_figsize: Tuple[float, float] = (14, 6),
@@ -465,7 +465,7 @@ if __name__ == "__main__":
         # save_movie_am_path="figures/daily_transitions_am_pm/USA5288_transition_matrix_am_only.gif",
         # save_movie_pm_path="figures/daily_transitions_am_pm/USA5288_transition_matrix_pm_only.gif",
         # save_movie_in_order_path="figures/daily_transitions_am_pm/USA5288_transition_matrix_am_pm_in_order.gif",
-        movie_fps=2,
+        movie_fps=1,
         enforce_consistent_order=True,
     )
 
