@@ -843,10 +843,10 @@ from batch_set_hour_and_batch_TTE import run_batch_set_hour_and_batch_TTE
 
 res = run_batch_set_hour_and_batch_TTE(
     parent_dir="/Users/mirandahulsey-vincent/Desktop/SfN_baseline_analysis",
-    range1="05:00-12:00",
-    range2="12:00-19:00",
-    batch_size=10,
-    min_required_per_range=10,
+    range1="00:00-12:00",
+    range2="12:00-23:59",
+    batch_size=30,
+    min_required_per_range=30,
     only_song_present=True,
     exclude_single_label=False,
     fig_subdir="batch_figures",

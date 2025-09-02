@@ -57,11 +57,20 @@ def _build_per_file_table(organized_df: pd.DataFrame) -> pd.DataFrame:
     Build a per-SEGMENT table:
       - date_time, day, tod_min
       - transition_frequencies (dict[(from,to)->count])
-      - file_name/File Stem, Segment (if present)
+      - file_name/File Stem, Segment (if present; derive if missing)
+
     Uses existing 'syllable_order' if available; otherwise derives one from
     syllable_onsets_offsets_ms (or _timebins). Accepts several datetime columns.
     """
     df = organized_df.copy()
+
+    # Derive Segment / File Stem from file_name if missing
+    if "file_name" in df.columns:
+        seg_extracted = df["file_name"].astype(str).str.extract(r'_(\d+)(?:\.\w+)?$', expand=False)
+        if "Segment" not in df.columns:
+            df["Segment"] = pd.to_numeric(seg_extracted, errors="coerce").fillna(0).astype(int)
+        if "File Stem" not in df.columns:
+            df["File Stem"] = df["file_name"].astype(str).str.replace(r'_(\d+)(?:\.\w+)?$', "", regex=True)
 
     # ---------------- Datetime ----------------
     # Try a series of likely columns
@@ -296,7 +305,7 @@ def run_set_hour_and_batch_TTE(
     decoded_database_json: str | Path,
     creation_metadata_json: str | Path,
     range1: str = "00:00-12:00",
-    range2: str = "12:01-23:59",
+    range2: str = "12:00-23:59",   # include noon by default
     batch_size: int = 10,
     min_required_per_range: Optional[int] = None,
     only_song_present: bool = True,
@@ -336,10 +345,17 @@ def run_set_hour_and_batch_TTE(
 
     rows = []
     for day, grp in pf.groupby("day"):
-        g = grp.sort_values("date_time").copy()
+        # Segment-aware sort: date_time, then Segment/segment/file_name
+        secondary = None
+        for cand in ["Segment", "segment", "file_name"]:
+            if cand in grp.columns:
+                secondary = cand
+                break
+        sort_by = ["date_time"] + ([secondary] if secondary else [])
+        g = grp.sort_values(sort_by, ascending=True).copy()
 
-        g1 = g[(g["tod_min"] >= r1_start) & (g["tod_min"] <= r1_end)].sort_values("date_time", ascending=True)
-        g2 = g[(g["tod_min"] >= r2_start) & (g["tod_min"] <= r2_end)].sort_values("date_time", ascending=True)
+        g1 = g[(g["tod_min"] >= r1_start) & (g["tod_min"] <= r1_end)].copy()
+        g2 = g[(g["tod_min"] >= r2_start) & (g["tod_min"] <= r2_end)].copy()
 
         firstN = g1.head(batch_size)
         lastN  = g2.tail(batch_size)
@@ -560,8 +576,54 @@ def run_set_hour_and_batch_TTE(
     )
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Validation helpers (module-scope, importable)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def summarize_tte_selection(results_df: pd.DataFrame, *, batch_size: int = 10) -> None:
+    """
+    Print a concise summary of how many segments were selected per day/range,
+    and list the exact filenames used.
+    """
+    for _, row in results_df.iterrows():
+        day = row["day"]
+        r1_count = int(row.get("range1_count", 0))
+        r2_count = int(row.get("range2_count", 0))
+        r1_files = row.get("range1_firstN_file_names", []) or []
+        r2_files = row.get("range2_lastN_file_names", []) or []
+
+        print(f"\n=== {pd.to_datetime(day).date()} ===")
+        print(f"Range1 (first {batch_size}): {r1_count} segments"
+              + (f"  ⚠️ missing {batch_size - r1_count}" if r1_count < batch_size else ""))
+        for fn in r1_files:
+            print("   ", fn)
+
+        print(f"\nRange2 (last {batch_size}): {r2_count} segments"
+              + (f"  ⚠️ missing {batch_size - r2_count}" if r2_count < batch_size else ""))
+        for fn in r2_files:
+            print("   ", fn)
+
+def summarize_tte_selection_or_raise(results_df: pd.DataFrame, *, batch_size: int = 10) -> None:
+    """
+    Same as summarize_tte_selection, but raises ValueError if any day fails
+    to include at least `batch_size` segments in either range.
+    """
+    summarize_tte_selection(results_df, batch_size=batch_size)
+    problems = []
+    for _, row in results_df.iterrows():
+        day = pd.to_datetime(row["day"]).date()
+        r1_count = int(row.get("range1_count", 0))
+        r2_count = int(row.get("range2_count", 0))
+        if r1_count < batch_size:
+            problems.append(f"{day}: range1 captured {r1_count} < {batch_size}")
+        if r2_count < batch_size:
+            problems.append(f"{day}: range2 captured {r2_count} < {batch_size}")
+    if problems:
+        raise ValueError("Segment capture check failed:\n  - " + "\n  - ".join(problems))
+
+# ──────────────────────────────────────────────────────────────────────────────
 # CLI
 # ──────────────────────────────────────────────────────────────────────────────
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Average TTE of FIRST N songs in range1 vs LAST N songs in range2, per day."
@@ -569,7 +631,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--decoded", required=True, help="Path to decoded_database.json")
     p.add_argument("--meta", required=True, help="Path to creation/metadata .json")
     p.add_argument("--range1", default="00:00-12:00", help="Time range 1, e.g., '00:00-12:00'")
-    p.add_argument("--range2", default="12:01-23:59", help="Time range 2, e.g., '12:01-23:59'")
+    p.add_argument("--range2", default="12:00-23:59", help="Time range 2, e.g., '12:00-23:59'")
     p.add_argument("--batch_size", type=int, default=10, help="Songs to take in each subset")
     p.add_argument("--min_required", type=int, default=None,
                    help="Minimum songs required per subset (default = batch_size). If unmet, avg is NaN.")
@@ -612,31 +674,27 @@ if __name__ == "__main__":
 
 
 
-
 """
 import importlib, set_hour_and_batch_TTE
 importlib.reload(set_hour_and_batch_TTE)
-from set_hour_and_batch_TTE import run_set_hour_and_batch_TTE
+from set_hour_and_batch_TTE import run_set_hour_and_batch_TTE, summarize_tte_selection_or_raise
 
-decoded = "/Users/mirandahulsey-vincent/Desktop/SfN_baseline_analysis/USA5507_RC5/TweetyBERT_Pretrain_LLB_AreaX_FallSong_USA5507_RC5_Comp2_decoded_database.json"
-meta    = "/Users/mirandahulsey-vincent/Desktop/SfN_baseline_analysis/USA5507_RC5/USA5507_RC5_Comp2_metadata.json"
+decoded = "/Users/mirandahulsey-vincent/Documents/allPythonCode/syntax_analysis/data_inputs/USA1234_decoded_database.json"
+meta    = "/Users/mirandahulsey-vincent/Documents/allPythonCode/syntax_analysis/data_inputs/USA1234_metadata.json"
 
 out = run_set_hour_and_batch_TTE(
     decoded_database_json=decoded,
     creation_metadata_json=meta,
-    range1="00:00-10:00",
-    range2="12:01-23:59",
-    batch_size=10,
-    min_required_per_range =10,
+    range1="00:00-12:00",
+    range2="12:00-23:59",
+    batch_size=30,
+    min_required_per_range=30,
     only_song_present=True,
     fig_dir=None,
     show=True,
 )
 
-print(out.results_df.head())
-
-print("Paired figure saved at :", out.figure_path_paired)
-print("Overlay figure saved at:", out.figure_path_overlay)
+summarize_tte_selection_or_raise(out.results_df, batch_size=20)
 
 
 """

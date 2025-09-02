@@ -405,8 +405,8 @@ def build_organized_segments_with_durations(
 """
 from organize_decoded_with_segments import build_organized_segments_with_durations
 
-decoded = "/Users/mirandahulsey-vincent/Desktop/SfN_baseline_analysis/R13_R09_Comp1/TweetyBERT_Pretrain_LLB_AreaX_FallSong_R13_RC09_Comp1_decoded_database.json"
-meta    = "/Users/mirandahulsey-vincent/Desktop/SfN_baseline_analysis/R13_R09_Comp1/R07_RC09_Comp1_metadata.json"
+decoded = "/Users/mirandahulsey-vincent/Documents/allPythonCode/syntax_analysis/data_inputs/USA1234_decoded_database.json"
+meta    = "/Users/mirandahulsey-vincent/Documents/allPythonCode/syntax_analysis/data_inputs/USA1234_metadata.json"
 
 out = build_organized_segments_with_durations(
     decoded_database_json=decoded,
