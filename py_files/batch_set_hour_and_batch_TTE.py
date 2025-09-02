@@ -1,20 +1,27 @@
 # batch_set_hour_and_batch_TTE.py
 from __future__ import annotations
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Union, List
 import re
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
 from set_hour_and_batch_TTE import run_set_hour_and_batch_TTE_by_day
 
-__all__ = ["run_batch_set_hour_and_batch_TTE", "BirdResult", "BatchResults"]
+__all__ = [
+    "run_batch_set_hour_and_batch_TTE",
+    "BirdResult",
+    "BatchResults",
+]
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Data containers
 # ───────────────────────────────────────────────────────────────────────────────
+
 @dataclass
 class BirdResult:
     animal_id: str
@@ -31,6 +38,7 @@ class BatchResults:
 # ───────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ───────────────────────────────────────────────────────────────────────────────
+
 def _find_json_pair(dirpath: Path) -> Optional[Tuple[Path, Path]]:
     """Return (decoded_json, metadata_json) if found under dirpath, else None."""
     if not dirpath.exists() or not dirpath.is_dir():
@@ -78,6 +86,7 @@ def _monthly_mean_composite(summary_df: pd.DataFrame) -> pd.Series:
 # ───────────────────────────────────────────────────────────────────────────────
 # Aggregate plotters
 # ───────────────────────────────────────────────────────────────────────────────
+
 def _plot_aggregate_am_pm(
     bird_summary_map: Dict[str, pd.DataFrame],
     *,
@@ -85,60 +94,108 @@ def _plot_aggregate_am_pm(
     range1: str,
     range2: str,
     batch_size: int,
+    style: str = "overlay",  # "overlay" (2 ticks, legend per animal) or "paired_xticks"
 ) -> Optional[Path]:
     """
-    Build ONE figure where the x-axis is:
-      R07 AM, R07 PM, R13 AM, R13 PM, ...
-    Each bird is a line segment connecting its AM mean to PM mean.
+    Aggregate AM↔PM figure, two styles:
+
+    - overlay (default): two x-ticks (AM, PM). One line per animal; legend lists animal IDs.
+    - paired_xticks: interleaved ticks per animal (e.g., 'R07 AM', 'R07 PM', ...).
+
+    Returns the saved figure path or None if no data.
     """
-    rows: List[Tuple[str, float, float]] = []
+    # collect means
+    birds: List[str] = []
+    am_means: List[float] = []
+    pm_means: List[float] = []
+
     for animal_id, df in bird_summary_map.items():
         if df is None or df.empty:
             continue
         mu_am, _sd_am, mu_pm, _sd_pm = _means_for_bird(df)
         if np.isnan(mu_am) and np.isnan(mu_pm):
             continue
-        rows.append((_short_label(animal_id), mu_am, mu_pm))
+        birds.append(_short_label(animal_id))
+        am_means.append(mu_am)
+        pm_means.append(mu_pm)
 
-    if not rows:
+    if not birds:
         print("[INFO] No birds with qualifying data to aggregate for AM/PM figure.")
         return None
 
-    rows.sort(key=lambda x: x[0])  # stable, alphabetical by short label
+    # stable order
+    order = np.argsort(birds)
+    birds    = [birds[i] for i in order]
+    am_means = [am_means[i] for i in order]
+    pm_means = [pm_means[i] for i in order]
 
-    # Interleaved x positions and labels
-    x_positions, x_labels = [], []
-    paired_vals: List[Tuple[int, int, float, float]] = []
-    for i, (bird, mu_am, mu_pm) in enumerate(rows):
-        x_am = 2 * i
-        x_pm = 2 * i + 1
-        x_positions.extend([x_am, x_pm])
-        x_labels.extend([f"{bird} AM", f"{bird} PM"])
-        paired_vals.append((x_am, x_pm, mu_am, mu_pm))
+    style = style.lower().strip()
+    if style not in {"overlay", "paired_xticks"}:
+        style = "overlay"
 
-    fig, ax = plt.subplots(figsize=(max(12, len(x_labels) * 0.35), 6))
+    if style == "overlay":
+        # Two shared x positions
+        fig, ax = plt.subplots(figsize=(12, 6))
+        x_am, x_pm = 0, 1
 
-    # Draw paired AM→PM segments
-    for x_am, x_pm, mu_am, mu_pm in paired_vals:
-        ax.plot([x_am, x_pm], [mu_am, mu_pm], marker="o", linewidth=1.8, alpha=0.95)
+        handles = []
+        labels  = []
+        for b, y0, y1 in zip(birds, am_means, pm_means):
+            h, = ax.plot([x_am, x_pm], [y0, y1], marker="o", linewidth=1.8, alpha=0.95, label=b)
+            handles.append(h); labels.append(b)
 
-    ax.set_xticks(x_positions)
-    ax.set_xticklabels(x_labels, rotation=45, ha="right")
-    ax.set_ylabel("Total Transition Entropy (bits)")
-    ax.set_title(
-        "Aggregate AM vs PM TTE (per bird; means)\n"
-        f"Range1={range1} (AM), Range2={range2} (PM), batch_size={batch_size}"
-    )
-    for s in ("top", "right"):
-        ax.spines[s].set_visible(False)
-    ax.grid(axis="y", linestyle=":", alpha=0.35)
-    fig.tight_layout()
+        ax.set_xlim(-0.25, 1.25)
+        ax.set_xticks([x_am, x_pm])
+        ax.set_xticklabels([f"{range1}\n(AM mean)", f"{range2}\n(PM mean)"])
+        ax.set_ylabel("Total Transition Entropy (bits)")
+        ax.set_title(
+            "Aggregate AM vs PM TTE (overlay; one line per animal)\n"
+            f"Range1={range1}, Range2={range2}, batch_size={batch_size}"
+        )
+        # Legend per animal
+        n = len(birds)
+        ncol = 1 if n <= 12 else 2 if n <= 24 else 3
+        ax.legend(handles, labels, title="Animal", bbox_to_anchor=(1.02, 1),
+                  loc="upper left", frameon=False, ncol=ncol, fontsize=9)
+        for s in ("top", "right"):
+            ax.spines[s].set_visible(False)
+        ax.grid(axis="y", linestyle=":", alpha=0.35)
+        fig.tight_layout()
+
+    else:  # "paired_xticks"
+        # Interleaved positions per animal; ticks include animal_id
+        x_positions, x_labels = [], []
+        fig, ax = plt.subplots(figsize=(max(12, len(birds) * 0.8), 6))
+        handles = []; labels = []
+        for i, (b, y0, y1) in enumerate(zip(birds, am_means, pm_means)):
+            x0, x1 = 2 * i, 2 * i + 1
+            h, = ax.plot([x0, x1], [y0, y1], marker="o", linewidth=1.8, alpha=0.95, label=b)
+            handles.append(h); labels.append(b)
+            x_positions.extend([x0, x1])
+            x_labels.extend([f"{b} AM", f"{b} PM"])
+
+        ax.set_xticks(x_positions)
+        ax.set_xticklabels(x_labels, rotation=45, ha="right")
+        ax.set_ylabel("Total Transition Entropy (bits)")
+        ax.set_title(
+            "Aggregate AM vs PM TTE (paired x-ticks per animal)\n"
+            f"Range1={range1}, Range2={range2}, batch_size={batch_size}"
+        )
+        n = len(birds)
+        ncol = 1 if n <= 12 else 2 if n <= 24 else 3
+        ax.legend(handles, labels, title="Animal", bbox_to_anchor=(1.02, 1),
+                  loc="upper left", frameon=False, ncol=ncol, fontsize=9)
+        for s in ("top", "right"):
+            ax.spines[s].set_visible(False)
+        ax.grid(axis="y", linestyle=":", alpha=0.35)
+        fig.tight_layout()
 
     save_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(save_path, dpi=200)
     plt.close(fig)
-    print(f"[OK] Saved aggregate AM/PM paired-lines figure → {save_path}")
+    print(f"[OK] Saved aggregate AM/PM figure → {save_path}")
     return save_path
+
 
 def _plot_monthly_lines_by_bird(
     bird_summary_map: Dict[str, pd.DataFrame],
@@ -166,7 +223,7 @@ def _plot_monthly_lines_by_bird(
     xs = np.arange(1, 13)
 
     fig, ax = plt.subplots(figsize=(12, 6))
-    for bird_label, series in monthly_map.items():
+    for bird_label, series in sorted(monthly_map.items(), key=lambda kv: kv[0]):
         y = series.values.astype(float)
         ax.plot(xs, y, marker="o", linewidth=1.8, alpha=0.9, label=bird_label)
 
@@ -190,13 +247,14 @@ def _plot_monthly_lines_by_bird(
 # ───────────────────────────────────────────────────────────────────────────────
 # Main wrapper
 # ───────────────────────────────────────────────────────────────────────────────
+
 def run_batch_set_hour_and_batch_TTE(
     parent_dir: Union[str, Path],
     *,
     range1: str = "05:00-12:00",
     range2: str = "12:00-19:00",
     batch_size: int = 10,
-    min_required_per_range: Optional[int] = None,     # None → defaults to batch_size
+    min_required_per_range: Optional[int] = None,     # None → defaults to batch_size inside callee
     only_song_present: bool = True,
     exclude_single_label: bool = True,
     compute_durations: bool = False,
@@ -204,12 +262,15 @@ def run_batch_set_hour_and_batch_TTE(
     fig_subdir: Optional[str] = "figures",
     make_monthly_lines: bool = True,
     show: bool = False,
+    aggregate_style: str = "overlay",                 # "overlay" or "paired_xticks"
 ) -> BatchResults:
     """
     1) Finds JSON pairs in subfolders of `parent_dir`.
     2) For each bird, calls run_set_hour_and_batch_TTE_by_day(...) to generate *individual* figures.
-    3) Builds ONE aggregate AM vs PM figure with all birds on the x-axis (paired AM/PM labels).
-       Optionally builds a monthly lines figure.
+    3) Builds ONE aggregate AM vs PM figure:
+         - aggregate_style="overlay"      → two ticks (AM, PM), one line per animal (legend per animal).
+         - aggregate_style="paired_xticks"→ 'R07 AM','R07 PM','R13 AM','R13 PM',... on x-axis.
+    4) Optionally builds a monthly lines figure (Jan..Dec; year ignored).
     """
     parent = Path(parent_dir)
     if not parent.exists() or not parent.is_dir():
@@ -264,8 +325,13 @@ def run_batch_set_hour_and_batch_TTE(
     # Build aggregate inputs: animal_id -> summary_df
     bird_summary_map = {aid: br.summary_df for aid, br in per_bird.items()}
 
-    # Aggregate AM vs PM (single figure with all birds, AM/PM labels per bird)
-    ampm_name = f"ALL_BIRDS_AM_vs_PM_TTE__R1_{range1.replace(':','').replace('-','_')}__R2_{range2.replace(':','').replace('-','_')}__N{batch_size}.png"
+    # Aggregate AM vs PM (single figure)
+    style_tag = "OVERLAY" if aggregate_style.lower() == "overlay" else "PAIRED"
+    ampm_name = (
+        f"ALL_BIRDS_AM_vs_PM_TTE_{style_tag}__"
+        f"R1_{range1.replace(':','').replace('-','_')}__"
+        f"R2_{range2.replace(':','').replace('-','_')}__N{batch_size}.png"
+    )
     ampm_path = base_dir / ampm_name
     ampm_path = _plot_aggregate_am_pm(
         bird_summary_map,
@@ -273,12 +339,17 @@ def run_batch_set_hour_and_batch_TTE(
         range1=range1,
         range2=range2,
         batch_size=batch_size,
+        style=aggregate_style,
     )
 
     # Optional: monthly lines figure
     monthly_path = None
     if make_monthly_lines:
-        monthly_name = f"ALL_BIRDS_monthly_TTE_lines__R1_{range1.replace(':','').replace('-','_')}__R2_{range2.replace(':','').replace('-','_')}__N{batch_size}.png"
+        monthly_name = (
+            f"ALL_BIRDS_monthly_TTE_lines__"
+            f"R1_{range1.replace(':','').replace('-','_')}__"
+            f"R2_{range2.replace(':','').replace('-','_')}__N{batch_size}.png"
+        )
         monthly_path = base_dir / monthly_name
         monthly_path = _plot_monthly_lines_by_bird(
             bird_summary_map,
@@ -287,30 +358,43 @@ def run_batch_set_hour_and_batch_TTE(
             range2=range2,
             batch_size=batch_size,
         )
-        
+
     return BatchResults(
         per_bird=per_bird,
         am_pm_figure_path=ampm_path,
         monthly_figure_path=monthly_path,
     )
+
 # ───────────────────────────────────────────────────────────────────────────────
 # CLI
 # ───────────────────────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Batch TTE wrapper for multiple birds (individual + aggregate figures).")
-    parser.add_argument("parent_dir", type=str, help="Directory whose subfolders contain decoded/metadata JSON pairs.")
+    parser = argparse.ArgumentParser(
+        description="Batch TTE wrapper for multiple birds (individual + aggregate figures)."
+    )
+    parser.add_argument("parent_dir", type=str,
+                        help="Directory whose subfolders contain decoded/metadata JSON pairs.")
     parser.add_argument("--range1", type=str, default="05:00-12:00")
     parser.add_argument("--range2", type=str, default="12:00-19:00")
     parser.add_argument("--batch-size", type=int, default=10)
     parser.add_argument("--min-required-per-range", type=int, default=None)
     parser.add_argument("--only-song-present", action="store_true", default=True)
-    parser.add_argument("--include-single-label", action="store_true", default=False, help="Include single-label files.")
+    parser.add_argument("--include-single-label", action="store_true", default=False,
+                        help="Include single-label files.")
     parser.add_argument("--compute-durations", action="store_true", default=False)
-    parser.add_argument("--save-dir", type=str, default=None, help="Base directory for outputs; default next to each decoded JSON.")
+    parser.add_argument("--save-dir", type=str, default=None,
+                        help="Base directory for outputs; default next to each decoded JSON.")
     parser.add_argument("--fig-subdir", type=str, default="figures")
-    parser.add_argument("--no-monthly-lines", action="store_true", help="Skip the monthly lines aggregate figure.")
+    parser.add_argument("--no-monthly-lines", action="store_true",
+                        help="Skip the monthly lines aggregate figure.")
+    parser.add_argument("--aggregate-style", type=str, default="overlay",
+                        choices=["overlay", "paired_xticks"],
+                        help="overlay: 2 ticks (AM/PM) with one line per animal; "
+                             "paired_xticks: interleaved 'ANIMAL AM/PM' ticks.")
     parser.add_argument("--show", action="store_true", default=False)
+
     args = parser.parse_args()
 
     out = run_batch_set_hour_and_batch_TTE(
@@ -326,6 +410,7 @@ if __name__ == "__main__":
         fig_subdir=args.fig_subdir,
         make_monthly_lines=not args.no_monthly_lines,
         show=args.show,
+        aggregate_style=args.aggregate_style,
     )
     print("AM/PM aggregate:", out.am_pm_figure_path)
     print("Monthly figure :", out.monthly_figure_path)
@@ -334,12 +419,9 @@ if __name__ == "__main__":
 """
 from pathlib import Path
 import importlib, batch_set_hour_and_batch_TTE as batch_mod
-
-# Reload in case you've just edited the file
 importlib.reload(batch_mod)
 from batch_set_hour_and_batch_TTE import run_batch_set_hour_and_batch_TTE
 
-# Run the batch job
 res = run_batch_set_hour_and_batch_TTE(
     parent_dir="/Users/mirandahulsey-vincent/Desktop/SfN_baseline_analysis",
     range1="05:00-12:00",
@@ -348,18 +430,12 @@ res = run_batch_set_hour_and_batch_TTE(
     min_required_per_range=10,
     only_song_present=True,
     exclude_single_label=False,
-    save_dir=Path("./figures"),
     fig_subdir="batch_figures",
-    show=False,   # set True if you want the plots to pop up interactively
+    show=False,
+    aggregate_style="paired_xticks",   # <<< this makes one figure with {ANIMAL AM, ANIMAL PM} ticks
 )
-
-# Inspect outputs
-for animal_id, br in res.per_bird.items():
-    print(f"{animal_id} paired:", br.paired_fig_path)
-    print(f"{animal_id} trend :", br.seq_fig_path)
-
-print("ALL birds AM/PM aggregate:", res.am_pm_figure_path)
-print("ALL birds monthly aggregate:", res.monthly_figure_path)
+print("AM/PM aggregate:", res["am_pm_figure_path"] if isinstance(res, dict) else res.am_pm_figure_path)
+print("Monthly figure :", res["monthly_figure_path"] if isinstance(res, dict) else res.monthly_figure_path)
 
 
 
