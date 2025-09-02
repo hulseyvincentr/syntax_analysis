@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # batch_set_hour_and_batch_TTE.py
 from __future__ import annotations
 
@@ -16,7 +17,8 @@ try:
 except Exception:
     _HAVE_SCIPY = False
 
-from set_hour_and_batch_TTE import run_set_hour_and_batch_TTE_by_day
+# Import the adjusted single-bird runner (aggregated TTE means; SEM from per-song TTEs)
+from set_hour_and_batch_TTE import run_set_hour_and_batch_TTE
 
 __all__ = [
     "run_batch_set_hour_and_batch_TTE",
@@ -72,16 +74,27 @@ def _short_label(animal_id: str) -> str:
     m = re.match(r"USA(\d+)", str(animal_id), flags=re.IGNORECASE)
     return m.group(1) if m else str(animal_id)
 
+def _extract_id_from_text(text: str) -> Optional[str]:
+    """Find USA#### (anywhere) or R## even if followed by underscores/letters."""
+    m = re.search(r"(usa\d{4,6})", text, re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+    m = re.search(r"(R\d{1,3})(?=[_\W]|$)", text)
+    if m:
+        return m.group(1)
+    return None
+
+def _infer_animal_id_from_paths(decoded_json: Path, meta_json: Path, default: str) -> str:
+    for t in [decoded_json.name, meta_json.name, decoded_json.stem, meta_json.stem, str(decoded_json), str(meta_json)]:
+        g = _extract_id_from_text(t)
+        if g:
+            return g
+    return default
+
 def _first_month(df: pd.DataFrame) -> int:
     """Earliest month number (1-12) in df['day'] (ignores year)."""
     d = pd.to_datetime(df["day"], errors="coerce").dropna()
     return int(d.dt.month.min()) if len(d) else 13
-
-def _first_last_dates(df: pd.DataFrame) -> Tuple[Optional[pd.Timestamp], Optional[pd.Timestamp]]:
-    d = pd.to_datetime(df["day"], errors="coerce").dropna().sort_values()
-    if not len(d):
-        return None, None
-    return d.iloc[0], d.iloc[-1]
 
 def _means_for_bird(summary_df: pd.DataFrame) -> Tuple[float, float, float, float]:
     """Return mean±sd of AM (tte_r1) and PM (tte_r2) for a bird."""
@@ -160,7 +173,7 @@ def _paired_test(am: np.ndarray, pm: np.ndarray, method: str = "wilcoxon") -> Tu
         np.mean(perm_means <= -abs(obs))
     )
     p = float(min(1.0, p))
-    return float(obs), p  # stat not comparable to Wilcoxon; report mean(diffs) as stat
+    return float(obs), p  # stat is mean(diffs) here
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Aggregate AM/PM plot (paired x-ticks, with optional error bars)
@@ -180,6 +193,10 @@ def _plot_aggregate_am_pm(
       5177\nAM, 5177\nPM, 5185\nAM, 5185\nPM, ...
     Each bird is a line segment connecting its AM mean to PM mean.
     """
+    def _first_month(df: pd.DataFrame) -> int:
+        d = pd.to_datetime(df["day"], errors="coerce").dropna()
+        return int(d.dt.month.min()) if len(d) else 13
+
     rows: List[Tuple[str, float, float, float, float, int]] = []
     for animal_id, df in bird_summary_map.items():
         if df is None or df.empty:
@@ -387,7 +404,6 @@ def _plot_am_pm_significance_differences(
                 res = _scipy_stats.wilcoxon(diff, alternative="two-sided", zero_method="wilcox")
                 pval = float(res.pvalue)
             except Exception:
-                # fall back to sign-permutation
                 _stat, pval = _paired_test(am, pm, method="perm")
         else:
             _stat, pval = _paired_test(am, pm, method="perm")
@@ -577,18 +593,18 @@ def run_batch_set_hour_and_batch_TTE(
     batch_size: int = 10,
     min_required_per_range: Optional[int] = None,     # None → defaults to batch_size inside callee
     only_song_present: bool = True,
-    exclude_single_label: bool = True,
+    exclude_single_label: bool = True,                # kept for API continuity; no-op (singles carry no transitions)
     compute_durations: bool = False,
     save_dir: Optional[Union[str, Path]] = None,      # None → save next to each decoded JSON
     fig_subdir: Optional[str] = "figures",
     make_monthly_lines: bool = True,
     make_daily_points: bool = True,
-    make_significance_plots: bool = True,             # NEW: make both significance plots
+    make_significance_plots: bool = True,             # make BOTH significance figures
     show: bool = False,
 ) -> BatchResults:
     """
     1) Finds JSON pairs in subfolders of `parent_dir`.
-    2) For each bird, calls run_set_hour_and_batch_TTE_by_day(...) to generate *individual* figures.
+    2) For each bird, calls run_set_hour_and_batch_TTE(...) to generate *individual* figures.
     3) Builds aggregate AM vs PM plot (paired x-ticks; mean ± SD).
     4) Optionally builds:
          - monthly lines plot (year ignored),
@@ -611,7 +627,14 @@ def run_batch_set_hour_and_batch_TTE(
             continue
         decoded_json, meta_json = pair
 
-        out = run_set_hour_and_batch_TTE_by_day(
+        # Where to save individual figures for this bird
+        if save_dir is None:
+            fig_dir = decoded_json.parent / (fig_subdir or "")
+        else:
+            fig_dir = Path(save_dir) / (fig_subdir or "")
+        _ensure_dir(fig_dir)
+
+        res = run_set_hour_and_batch_TTE(
             decoded_database_json=decoded_json,
             creation_metadata_json=meta_json,
             range1=range1,
@@ -619,22 +642,30 @@ def run_batch_set_hour_and_batch_TTE(
             batch_size=batch_size,
             min_required_per_range=min_required_per_range,
             only_song_present=only_song_present,
-            exclude_single_label=exclude_single_label,
             compute_durations=compute_durations,
-            save_dir=save_dir if save_dir is not None else decoded_json.parent,
-            fig_subdir=fig_subdir,
+            fig_dir=fig_dir,
             show=show,
         )
-        if out.summary_df is None or out.summary_df.empty:
+        if res.results_df is None or res.results_df.empty:
             print(f"[INFO] No qualifying days for {sub.name}.")
             continue
 
-        animal_id = out.animal_id or sub.name
+        # Build the per-day summary used by aggregate plots
+        summary_df = res.results_df.rename(columns={
+            "range1_firstN_avg_TTE": "tte_r1",
+            "range2_lastN_avg_TTE":  "tte_r2",
+            "range1_sem":            "sem_r1",
+            "range2_sem":            "sem_r2",
+            "range1_count":          "n1",
+            "range2_count":          "n2",
+        })[["day", "tte_r1", "tte_r2", "sem_r1", "sem_r2", "n1", "n2"]].copy()
+
+        animal_id = _infer_animal_id_from_paths(decoded_json, meta_json, default=sub.name)
         per_bird[animal_id] = BirdResult(
             animal_id=animal_id,
-            summary_df=out.summary_df.copy(),
-            paired_fig_path=out.figure_path,
-            seq_fig_path=out.trend_figure_path,
+            summary_df=summary_df,
+            paired_fig_path=res.figure_path_paired,
+            seq_fig_path=res.figure_path_overlay,
         )
 
     if not per_bird:
@@ -765,7 +796,7 @@ if __name__ == "__main__":
     parser.add_argument("--min-required-per-range", type=int, default=None)
     parser.add_argument("--only-song-present", action="store_true", default=True)
     parser.add_argument("--include-single-label", action="store_true", default=False,
-                        help="Include single-label files.")
+                        help="Include single-label files (no effect on aggregated TTE).")
     parser.add_argument("--compute-durations", action="store_true", default=False)
     parser.add_argument("--save-dir", type=str, default=None,
                         help="Base directory for outputs; default next to each decoded JSON.")
@@ -803,6 +834,7 @@ if __name__ == "__main__":
     print("Significance (groups) figure :", out.significance_groups_figure_path)
 
 
+
 """
 from pathlib import Path
 import importlib, batch_set_hour_and_batch_TTE as batch_mod
@@ -813,8 +845,8 @@ res = run_batch_set_hour_and_batch_TTE(
     parent_dir="/Users/mirandahulsey-vincent/Desktop/SfN_baseline_analysis",
     range1="05:00-12:00",
     range2="12:00-19:00",
-    batch_size=5,
-    min_required_per_range=5,
+    batch_size=10,
+    min_required_per_range=10,
     only_song_present=True,
     exclude_single_label=False,
     fig_subdir="batch_figures",
