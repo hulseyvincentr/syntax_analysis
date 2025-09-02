@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Union, List
 import re
-
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -34,6 +33,8 @@ class BatchResults:
     per_bird: Dict[str, BirdResult]
     am_pm_figure_path: Optional[Path]
     monthly_figure_path: Optional[Path]
+    daily_points_figure_path: Optional[Path] = None  # NEW (optional)
+
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -73,20 +74,47 @@ def _means_for_bird(summary_df: pd.DataFrame) -> Tuple[float, float, float, floa
     std_pm  = float(pm.std(ddof=1)) if len(pm) > 1 else 0.0
     return mean_am, std_am, mean_pm, std_pm
 
-def _monthly_mean_composite(summary_df: pd.DataFrame) -> pd.Series:
+def _first_last_dates(summary_df: pd.DataFrame) -> Tuple[pd.Timestamp, pd.Timestamp]:
+    dts = pd.to_datetime(summary_df["day"], errors="coerce").dropna()
+    return (pd.NaT, pd.NaT) if dts.empty else (dts.min(), dts.max())
+
+def _earliest_monthday_key(summary_df: pd.DataFrame) -> Tuple[int, int]:
+    """Sort key ignoring year: (min month, min day) across that bird's data."""
+    dts = pd.to_datetime(summary_df["day"], errors="coerce").dropna()
+    if dts.empty:
+        return (13, 32)  # put unknowns at the end
+    m = int(dts.dt.month.min())
+    d = int(dts[dts.dt.month == m].dt.day.min())
+    return (m, d)
+
+def _monthly_stats_composite(summary_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Per-day composite = mean(AM, PM).
-    Return monthly means (index 1..12), NaN where no data.
+    Per-day composite = mean(AM, PM). Return DataFrame with:
+    index=month (1..12), columns=['mean','std'].
     """
     df = summary_df.copy()
     df["month"] = pd.to_datetime(df["day"]).dt.month
     df["tte_composite"] = (df["tte_r1"].astype(float) + df["tte_r2"].astype(float)) / 2.0
-    return df.groupby("month")["tte_composite"].mean().reindex(range(1, 13))
+    g = df.groupby("month")["tte_composite"].agg(["mean", "std"])
+    g = g.reindex(range(1, 13))
+    return g
+
+def _daily_composite(summary_df: pd.DataFrame) -> pd.DataFrame:
+    d = summary_df.copy()
+    d["month"] = pd.to_datetime(d["day"]).dt.month
+    d["tte_composite"] = (d["tte_r1"].astype(float) + d["tte_r2"].astype(float)) / 2.0
+    return d[["day", "month", "tte_composite"]].dropna()
+
+def _colors_for_labels(labels: List[str]) -> Dict[str, str]:
+    """Deterministic color for each label using Matplotlib's prop cycle."""
+    base = plt.rcParams['axes.prop_cycle'].by_key().get('color', list(plt.cm.tab10.colors))
+    labels_sorted = sorted(labels)
+    return {lab: base[i % len(base)] for i, lab in enumerate(labels_sorted)}
+
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Aggregate plotters
 # ───────────────────────────────────────────────────────────────────────────────
-
 def _plot_aggregate_am_pm(
     bird_summary_map: Dict[str, pd.DataFrame],
     *,
@@ -94,101 +122,127 @@ def _plot_aggregate_am_pm(
     range1: str,
     range2: str,
     batch_size: int,
-    style: str = "overlay",  # "overlay" (2 ticks, legend per animal) or "paired_xticks"
+    style: str = "paired_xticks",   # 'paired_xticks' or 'overlay'
+    show_std: bool = True,          # draw mean ± SD
+    error_capsize: int = 4,
+    error_alpha: float = 0.85,
 ) -> Optional[Path]:
     """
-    Aggregate AM↔PM figure, two styles:
+    Aggregate AM vs PM plot.
 
-    - overlay (default): two x-ticks (AM, PM). One line per animal; legend lists animal IDs.
-    - paired_xticks: interleaved ticks per animal (e.g., 'R07 AM', 'R07 PM', ...).
+    style='paired_xticks' → x-axis shows {<ANIMAL>\\nAM, <ANIMAL>\\nPM, ...} with a
+    short segment per animal (and SD error bars). Legend includes first→last dates.
+    Birds are ordered by earliest month/day (year ignored).
 
-    Returns the saved figure path or None if no data.
+    style='overlay'       → two x positions (AM, PM); all animals overlaid with
+    slight horizontal jitter (and SD error bars).
     """
-    # collect means
-    birds: List[str] = []
-    am_means: List[float] = []
-    pm_means: List[float] = []
-
+    rows: List[Tuple[str, float, float, float, float, pd.Timestamp, pd.Timestamp, Tuple[int,int]]] = []
     for animal_id, df in bird_summary_map.items():
         if df is None or df.empty:
             continue
-        mu_am, _sd_am, mu_pm, _sd_pm = _means_for_bird(df)
+        mu_am, sd_am, mu_pm, sd_pm = _means_for_bird(df)
         if np.isnan(mu_am) and np.isnan(mu_pm):
             continue
-        birds.append(_short_label(animal_id))
-        am_means.append(mu_am)
-        pm_means.append(mu_pm)
+        first_dt, last_dt = _first_last_dates(df)
+        sort_key = _earliest_monthday_key(df)
+        rows.append((_short_label(animal_id), mu_am, sd_am, mu_pm, sd_pm, first_dt, last_dt, sort_key))
 
-    if not birds:
+    if not rows:
         print("[INFO] No birds with qualifying data to aggregate for AM/PM figure.")
         return None
 
-    # stable order
-    order = np.argsort(birds)
-    birds    = [birds[i] for i in order]
-    am_means = [am_means[i] for i in order]
-    pm_means = [pm_means[i] for i in order]
+    # Stable order: earliest month/day, then label
+    rows.sort(key=lambda r: (r[7], r[0]))
 
-    style = style.lower().strip()
-    if style not in {"overlay", "paired_xticks"}:
-        style = "overlay"
+    labels_for_color = [r[0] for r in rows]
+    color_map = _colors_for_labels(labels_for_color)
 
-    if style == "overlay":
-        # Two shared x positions
-        fig, ax = plt.subplots(figsize=(12, 6))
-        x_am, x_pm = 0, 1
+    if style not in {"paired_xticks", "overlay"}:
+        print(f"[WARN] Unknown style '{style}', falling back to 'paired_xticks'.")
+        style = "paired_xticks"
 
-        handles = []
-        labels  = []
-        for b, y0, y1 in zip(birds, am_means, pm_means):
-            h, = ax.plot([x_am, x_pm], [y0, y1], marker="o", linewidth=1.8, alpha=0.95, label=b)
-            handles.append(h); labels.append(b)
+    if style == "paired_xticks":
+        x_positions: List[int] = []
+        x_labels: List[str] = []
+        paired_vals: List[Tuple[int, int, float, float, float, float, str, str]] = []
 
-        ax.set_xlim(-0.25, 1.25)
-        ax.set_xticks([x_am, x_pm])
-        ax.set_xticklabels([f"{range1}\n(AM mean)", f"{range2}\n(PM mean)"])
-        ax.set_ylabel("Total Transition Entropy (bits)")
-        ax.set_title(
-            "Aggregate AM vs PM TTE (overlay; one line per animal)\n"
-            f"Range1={range1}, Range2={range2}, batch_size={batch_size}"
-        )
-        # Legend per animal
-        n = len(birds)
-        ncol = 1 if n <= 12 else 2 if n <= 24 else 3
-        ax.legend(handles, labels, title="Animal", bbox_to_anchor=(1.02, 1),
-                  loc="upper left", frameon=False, ncol=ncol, fontsize=9)
-        for s in ("top", "right"):
-            ax.spines[s].set_visible(False)
-        ax.grid(axis="y", linestyle=":", alpha=0.35)
-        fig.tight_layout()
+        for i, (bird, mu_am, sd_am, mu_pm, sd_pm, first_dt, last_dt, _sk) in enumerate(rows):
+            x_am = 2 * i
+            x_pm = 2 * i + 1
+            x_positions.extend([x_am, x_pm])
+            # two-line tick: animal on first line, AM/PM on second
+            x_labels.extend([f"{bird}\nAM", f"{bird}\nPM"])
 
-    else:  # "paired_xticks"
-        # Interleaved positions per animal; ticks include animal_id
-        x_positions, x_labels = [], []
-        fig, ax = plt.subplots(figsize=(max(12, len(birds) * 0.8), 6))
-        handles = []; labels = []
-        for i, (b, y0, y1) in enumerate(zip(birds, am_means, pm_means)):
-            x0, x1 = 2 * i, 2 * i + 1
-            h, = ax.plot([x0, x1], [y0, y1], marker="o", linewidth=1.8, alpha=0.95, label=b)
-            handles.append(h); labels.append(b)
-            x_positions.extend([x0, x1])
-            x_labels.extend([f"{b} AM", f"{b} PM"])
+            # legend label with first→last dates (month/day only)
+            flabel = "n/a"
+            if pd.notna(first_dt) and pd.notna(last_dt):
+                flabel = f"{first_dt:%b %d} → {last_dt:%b %d}"
+
+            paired_vals.append((x_am, x_pm, mu_am, sd_am, mu_pm, sd_pm, bird, flabel))
+
+        fig, ax = plt.subplots(figsize=(max(12, len(x_labels) * 0.4), 6))
+
+        for x_am, x_pm, mu_am, sd_am, mu_pm, sd_pm, bird, flabel in paired_vals:
+            color = color_map[bird]
+            (line,) = ax.plot([x_am, x_pm], [mu_am, mu_pm],
+                              marker="o", linewidth=2.0, alpha=0.95,
+                              label=f"{bird} — {flabel}", color=color, zorder=3)
+            if show_std:
+                if np.isfinite(sd_am) and sd_am > 0:
+                    ax.errorbar(x_am, mu_am, yerr=sd_am, fmt="none",
+                                ecolor=color, elinewidth=1.6,
+                                capsize=error_capsize, alpha=error_alpha, zorder=2)
+                if np.isfinite(sd_pm) and sd_pm > 0:
+                    ax.errorbar(x_pm, mu_pm, yerr=sd_pm, fmt="none",
+                                ecolor=color, elinewidth=1.6,
+                                capsize=error_capsize, alpha=error_alpha, zorder=2)
 
         ax.set_xticks(x_positions)
-        ax.set_xticklabels(x_labels, rotation=45, ha="right")
-        ax.set_ylabel("Total Transition Entropy (bits)")
-        ax.set_title(
-            "Aggregate AM vs PM TTE (paired x-ticks per animal)\n"
-            f"Range1={range1}, Range2={range2}, batch_size={batch_size}"
-        )
-        n = len(birds)
-        ncol = 1 if n <= 12 else 2 if n <= 24 else 3
-        ax.legend(handles, labels, title="Animal", bbox_to_anchor=(1.02, 1),
-                  loc="upper left", frameon=False, ncol=ncol, fontsize=9)
-        for s in ("top", "right"):
-            ax.spines[s].set_visible(False)
-        ax.grid(axis="y", linestyle=":", alpha=0.35)
-        fig.tight_layout()
+        ax.set_xticklabels(x_labels, rotation=0, ha="center")
+
+    else:  # overlay
+        x_am_base, x_pm_base = 0.0, 1.0
+        jitters = np.linspace(-0.22, 0.22, len(rows))
+        fig, ax = plt.subplots(figsize=(12, 6))
+
+        for j, (bird, mu_am, sd_am, mu_pm, sd_pm, first_dt, last_dt, _sk) in zip(jitters, rows):
+            x_am = x_am_base + j
+            x_pm = x_pm_base + j
+            color = color_map[bird]
+            flabel = "n/a"
+            if pd.notna(first_dt) and pd.notna(last_dt):
+                flabel = f"{first_dt:%b %d} → {last_dt:%b %d}"
+
+            (line,) = ax.plot([x_am, x_pm], [mu_am, mu_pm],
+                              marker="o", linewidth=2.0, alpha=0.95,
+                              label=f"{bird} — {flabel}", color=color, zorder=3)
+            if show_std:
+                if np.isfinite(sd_am) and sd_am > 0:
+                    ax.errorbar(x_am, mu_am, yerr=sd_am, fmt="none",
+                                ecolor=color, elinewidth=1.6,
+                                capsize=error_capsize, alpha=error_alpha, zorder=2)
+                if np.isfinite(sd_pm) and sd_pm > 0:
+                    ax.errorbar(x_pm, mu_pm, yerr=sd_pm, fmt="none",
+                                ecolor=color, elinewidth=1.6,
+                                capsize=error_capsize, alpha=error_alpha, zorder=2)
+
+        ax.set_xticks([x_am_base, x_pm_base])
+        ax.set_xticklabels([f"AM ({range1})", f"PM ({range2})"])
+
+    # Shared cosmetics & save
+    ax.set_ylabel("Total Transition Entropy (bits)")
+    title_mode = "paired x-ticks per animal" if style == "paired_xticks" else "overlay"
+    ax.set_title(
+        f"Aggregate AM vs PM TTE ({title_mode})\n"
+        f"Range1={range1}, Range2={range2}, batch_size={batch_size}"
+    )
+    ax.legend(title="Animal (first → last day recorded)", frameon=False,
+              bbox_to_anchor=(1.02, 1), loc="upper left")
+    for s in ("top", "right"):
+        ax.spines[s].set_visible(False)
+    ax.grid(axis="y", linestyle=":", alpha=0.35)
+    fig.tight_layout()
 
     save_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(save_path, dpi=200)
@@ -204,45 +258,125 @@ def _plot_monthly_lines_by_bird(
     range1: str,
     range2: str,
     batch_size: int,
+    capsize: int = 4,
 ) -> Optional[Path]:
     """
-    Line plot: one line per bird; x-axis Jan..Dec (year ignored).
-    y = monthly mean of per-day composite TTE (mean of AM & PM).
+    Monthly line plot with error bars: one line per bird; x = Jan..Dec (year ignored).
+    y = monthly mean of per-day composite TTE (mean of AM & PM); error = monthly SD.
     """
-    monthly_map: Dict[str, pd.Series] = {}
+    months = np.arange(1, 13)
+    month_labels = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+
+    # build stats per bird
+    per_bird_stats: Dict[str, pd.DataFrame] = {}
     for animal_id, df in bird_summary_map.items():
         if df is None or df.empty:
             continue
-        monthly_map[_short_label(animal_id)] = _monthly_mean_composite(df)
+        per_bird_stats[_short_label(animal_id)] = _monthly_stats_composite(df)
 
-    if not monthly_map:
+    if not per_bird_stats:
         print("[INFO] No monthly data available for aggregate monthly figure.")
         return None
 
-    months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
-    xs = np.arange(1, 13)
+    labels = sorted(per_bird_stats.keys())
+    color_map = _colors_for_labels(labels)
 
     fig, ax = plt.subplots(figsize=(12, 6))
-    for bird_label, series in sorted(monthly_map.items(), key=lambda kv: kv[0]):
-        y = series.values.astype(float)
-        ax.plot(xs, y, marker="o", linewidth=1.8, alpha=0.9, label=bird_label)
+    for label in labels:
+        stats = per_bird_stats[label]
+        y = stats["mean"].to_numpy(dtype=float)
+        yerr = stats["std"].to_numpy(dtype=float)
+        color = color_map[label]
+        ax.errorbar(months, y, yerr=yerr, marker="o", linewidth=1.8,
+                    elinewidth=1.2, capsize=capsize, alpha=0.95,
+                    label=label, color=color)
 
-    ax.set_xticks(xs)
-    ax.set_xticklabels(months)
+    ax.set_xticks(months)
+    ax.set_xticklabels(month_labels)
     ax.set_ylabel("Monthly Mean TTE (AM/PM averaged, bits)")
     ax.set_title(
-        f"Monthly TTE by Bird (year ignored)\n"
+        f"Monthly TTE by Bird (mean ± SD; year ignored)\n"
         f"Per-day composite = mean(AM, PM); Range1={range1}, Range2={range2}, batch_size={batch_size}"
     )
-    ax.legend(title="Bird", bbox_to_anchor=(1.02, 1), loc="upper left", frameon=False)
+    ax.legend(title="Animal", bbox_to_anchor=(1.02, 1), loc="upper left", frameon=False)
     for s in ("top", "right"):
         ax.spines[s].set_visible(False)
+    ax.grid(axis="y", linestyle=":", alpha=0.35)
     fig.tight_layout()
     save_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(save_path, dpi=200)
     plt.close(fig)
     print(f"[OK] Saved aggregate monthly figure → {save_path}")
     return save_path
+
+
+def _plot_monthly_daily_points(
+    bird_summary_map: Dict[str, pd.DataFrame],
+    *,
+    save_path: Path,
+    range1: str,
+    range2: str,
+    batch_size: int,
+    jitter: float = 0.12,
+    s: float = 28,
+    alpha: float = 0.75,
+) -> Optional[Path]:
+    """
+    Scatter of per-day composite TTE for all days, x = month (1..12) with slight jitter.
+    Exactly ONE scatter call per animal → one consistent color and legend entry per animal.
+    """
+    # collect all day-points per bird label
+    by_animal: Dict[str, List[pd.DataFrame]] = {}
+    for animal_id, df in bird_summary_map.items():
+        if df is None or df.empty:
+            continue
+        d = _daily_composite(df)
+        if d.empty:
+            continue
+        by_animal.setdefault(_short_label(animal_id), []).append(d)
+
+    if not by_animal:
+        print("[INFO] No daily points found for monthly daily points figure.")
+        return None
+
+    labels = sorted(by_animal.keys())
+    color_map = _colors_for_labels(labels)
+
+    months = np.arange(1, 13)
+    month_labels = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    # one scatter per animal
+    for label in labels:
+        D = pd.concat(by_animal[label], ignore_index=True)
+        x = D["month"].to_numpy(dtype=float)
+        y = D["tte_composite"].to_numpy(dtype=float)
+        # deterministic jitter per animal (no color cycling issues)
+        rng = np.random.default_rng(abs(hash(label)) % (2**32))
+        xj = x + rng.uniform(-jitter, jitter, size=len(x))
+        ax.scatter(xj, y, s=s, alpha=alpha, color=color_map[label], label=label)
+
+    ax.set_xticks(months)
+    ax.set_xticklabels(month_labels, rotation=0)
+    ax.set_xlim(0.5, 12.5)
+    ax.set_ylabel("Per-day composite TTE (AM/PM averaged, bits)")
+    ax.set_title(
+        f"Daily composite TTE by month (all animals)\n"
+        f"Points = individual days; Range1={range1}, Range2={range2}, batch_size={batch_size}"
+    )
+    ax.legend(title="Animal", bbox_to_anchor=(1.02, 1), loc="upper left", frameon=False)
+    for s_ in ("top", "right"):
+        ax.spines[s_].set_visible(False)
+    ax.grid(axis="y", linestyle=":", alpha=0.35)
+    fig.tight_layout()
+
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(save_path, dpi=200)
+    plt.close(fig)
+    print(f"[OK] Saved monthly daily-points figure → {save_path}")
+    return save_path
+
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Main wrapper
@@ -254,23 +388,22 @@ def run_batch_set_hour_and_batch_TTE(
     range1: str = "05:00-12:00",
     range2: str = "12:00-19:00",
     batch_size: int = 10,
-    min_required_per_range: Optional[int] = None,     # None → defaults to batch_size inside callee
+    min_required_per_range: Optional[int] = None,     # None → pass-through, callee handles default
     only_song_present: bool = True,
     exclude_single_label: bool = True,
     compute_durations: bool = False,
     save_dir: Optional[Union[str, Path]] = None,      # None → save next to each decoded JSON
     fig_subdir: Optional[str] = "figures",
     make_monthly_lines: bool = True,
+    make_daily_points: bool = True,
     show: bool = False,
-    aggregate_style: str = "overlay",                 # "overlay" or "paired_xticks"
+    aggregate_style: str = "paired_xticks",           # "overlay" or "paired_xticks"
 ) -> BatchResults:
     """
     1) Finds JSON pairs in subfolders of `parent_dir`.
     2) For each bird, calls run_set_hour_and_batch_TTE_by_day(...) to generate *individual* figures.
-    3) Builds ONE aggregate AM vs PM figure:
-         - aggregate_style="overlay"      → two ticks (AM, PM), one line per animal (legend per animal).
-         - aggregate_style="paired_xticks"→ 'R07 AM','R07 PM','R13 AM','R13 PM',... on x-axis.
-    4) Optionally builds a monthly lines figure (Jan..Dec; year ignored).
+    3) Builds ONE aggregate AM vs PM figure (style selectable).
+    4) Builds a monthly mean (±SD) figure and a per-day-points-by-month figure.
     """
     parent = Path(parent_dir)
     if not parent.exists() or not parent.is_dir():
@@ -342,7 +475,7 @@ def run_batch_set_hour_and_batch_TTE(
         style=aggregate_style,
     )
 
-    # Optional: monthly lines figure
+    # Optional: monthly means ± SD
     monthly_path = None
     if make_monthly_lines:
         monthly_name = (
@@ -359,11 +492,30 @@ def run_batch_set_hour_and_batch_TTE(
             batch_size=batch_size,
         )
 
+    # Optional: daily points by month (one color per animal)
+    daily_points_path = None
+    if make_daily_points:
+        daily_name = (
+            f"ALL_BIRDS_monthly_daily_points__"
+            f"R1_{range1.replace(':','').replace('-','_')}__"
+            f"R2_{range2.replace(':','').replace('-','_')}__N{batch_size}.png"
+        )
+        daily_points_path = base_dir / daily_name
+        daily_points_path = _plot_monthly_daily_points(
+            bird_summary_map,
+            save_path=daily_points_path,
+            range1=range1,
+            range2=range2,
+            batch_size=batch_size,
+        )
+
     return BatchResults(
         per_bird=per_bird,
         am_pm_figure_path=ampm_path,
         monthly_figure_path=monthly_path,
+        daily_points_figure_path=daily_points_path,
     )
+
 
 # ───────────────────────────────────────────────────────────────────────────────
 # CLI
@@ -388,11 +540,13 @@ if __name__ == "__main__":
                         help="Base directory for outputs; default next to each decoded JSON.")
     parser.add_argument("--fig-subdir", type=str, default="figures")
     parser.add_argument("--no-monthly-lines", action="store_true",
-                        help="Skip the monthly lines aggregate figure.")
-    parser.add_argument("--aggregate-style", type=str, default="overlay",
+                        help="Skip the monthly means ± SD figure.")
+    parser.add_argument("--no-daily-points", action="store_true",
+                        help="Skip the daily composite-by-month scatter.")
+    parser.add_argument("--aggregate-style", type=str, default="paired_xticks",
                         choices=["overlay", "paired_xticks"],
                         help="overlay: 2 ticks (AM/PM) with one line per animal; "
-                             "paired_xticks: interleaved 'ANIMAL AM/PM' ticks.")
+                             "paired_xticks: interleaved '<ANIMAL>\\nAM/PM' ticks, sorted by earliest month/day.")
     parser.add_argument("--show", action="store_true", default=False)
 
     args = parser.parse_args()
@@ -409,11 +563,13 @@ if __name__ == "__main__":
         save_dir=(Path(args.save_dir) if args.save_dir else None),
         fig_subdir=args.fig_subdir,
         make_monthly_lines=not args.no_monthly_lines,
+        make_daily_points=not args.no_daily_points,
         show=args.show,
         aggregate_style=args.aggregate_style,
     )
     print("AM/PM aggregate:", out.am_pm_figure_path)
     print("Monthly figure :", out.monthly_figure_path)
+    print("Daily points  :", out.daily_points_figure_path)
 
 
 """
