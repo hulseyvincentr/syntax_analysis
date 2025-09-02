@@ -1,7 +1,7 @@
 # ────────────────────────────────────────────────────────────────
 # USER-DEFINED VALUES
 # ────────────────────────────────────────────────────────────────
-main_folder        = '/Volumes/GLABSSD/Gardner_447D_Comp1_Comp2_and_laptop_SONGS_24June2025/2025_baseline/USA5508_RC2_Comp2'
+main_folder        = '/Volumes/GLABSSD/SfN_poster_baseline_analysis/curated_wav_files/spring_song/R07_RC09_Comp1'
 animal_id          = 'USA5508'                 # Used for ID checking and convenience only
 expected_animal_id = animal_id                 # Warn if files don't match this ID; set to None to disable
 treatment_date     = None                      # None → JSON null

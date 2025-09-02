@@ -54,47 +54,98 @@ def _row_transition_frequencies(syllable_order: Iterable[str]) -> Dict[Tuple[str
 
 def _build_per_file_table(organized_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Returns a slim per-file table with:
-      - date_time (Timestamp), day (date), tod_min (minutes since midnight)
+    Build a per-SEGMENT table:
+      - date_time, day, tod_min
       - transition_frequencies (dict[(from,to)->count])
-      - file_name (if available)
-    Filters out rows with missing timestamp or with no transitions.
+      - file_name/File Stem, Segment (if present)
+    Uses existing 'syllable_order' if available; otherwise derives one from
+    syllable_onsets_offsets_ms (or _timebins). Accepts several datetime columns.
     """
     df = organized_df.copy()
-    for c in ["Date", "Hour", "Minute", "Second", "syllable_order"]:
-        if c not in df.columns:
-            df[c] = None
 
-    dt_list = []
-    for _, r in df.iterrows():
-        d = r.get("Date", pd.NaT)
-        if pd.isna(d):
-            dt_list.append(pd.NaT)
-            continue
-        hh = _safe_pad(r.get("Hour"))
-        mm = _safe_pad(r.get("Minute"))
-        ss = _safe_pad(r.get("Second"))
-        try:
-            dstr = pd.to_datetime(d).strftime('%Y-%m-%d')
-            dt_list.append(pd.to_datetime(f"{dstr} {hh}:{mm}:{ss}"))
-        except Exception:
-            dt_list.append(pd.NaT)
+    # ---------------- Datetime ----------------
+    # Try a series of likely columns
+    dt = None
+    for cand in ["creation_date", "Recording DateTime", "recording_datetime", "date_time"]:
+        if cand in df.columns:
+            dt = pd.to_datetime(df[cand], errors="coerce")
+            break
 
-    df["date_time"] = dt_list
+    if dt is None:
+        # Fallback to legacy split parts
+        for c in ["Date", "Hour", "Minute", "Second"]:
+            if c not in df.columns:
+                df[c] = None
+        dstr = pd.to_datetime(df["Date"], errors="coerce")
+        hh = df["Hour"].apply(_safe_pad) if "Hour" in df.columns else "00"
+        mm = df["Minute"].apply(_safe_pad) if "Minute" in df.columns else "00"
+        ss = df["Second"].apply(_safe_pad) if "Second" in df.columns else "00"
+        dt = pd.to_datetime(
+            dstr.dt.strftime("%Y-%m-%d") + " " + hh.astype(str) + ":" + mm.astype(str) + ":" + ss.astype(str),
+            errors="coerce"
+        )
+
+    df["date_time"] = dt
     df["day"] = df["date_time"].dt.date
     df["tod_min"] = df["date_time"].apply(lambda x: _minutes_since_midnight(x) if pd.notna(x) else np.nan)
-    df["transition_frequencies"] = df["syllable_order"].apply(_row_transition_frequencies)
 
-    ok = (
-        ~df["date_time"].isna()
-        & df["transition_frequencies"].apply(lambda d: isinstance(d, dict) and len(d) > 0)
-    )
+    # ---------------- Syllable order ----------------
+    def _derive_order_from_dict(row) -> list[str]:
+        # Prefer ms, fall back to timebins
+        dct = row.get("syllable_onsets_offsets_ms_dict") or row.get("syllable_onsets_offsets_ms")
+        if not isinstance(dct, dict) or len(dct) == 0:
+            dct = row.get("syllable_onsets_offsets_timebins")
+            if not isinstance(dct, dict) or len(dct) == 0:
+                return []
+        events = []
+        for lab, spans in dct.items():
+            try:
+                for on_off in spans:
+                    if not on_off:
+                        continue
+                    on = float(on_off[0])
+                    events.append((on, str(lab)))
+            except Exception:
+                continue
+        if not events:
+            return []
+        events.sort(key=lambda x: x[0])
+        seq = [events[0][1]]
+        for _, lab in events[1:]:
+            if lab != seq[-1]:  # collapse repeats inside a syllable
+                seq.append(lab)
+        return seq
+
+    if "syllable_order" not in df.columns:
+        df["syllable_order"] = df.apply(_derive_order_from_dict, axis=1)
+    else:
+        # Coerce to list of strings, drop NAs
+        def _coerce_seq(x):
+            if isinstance(x, (list, tuple)):
+                return [str(v) for v in x]
+            return []
+        df["syllable_order"] = df["syllable_order"].apply(_coerce_seq)
+
+    # ---------------- Transition frequencies ----------------
+    def _freq(seq: list[str]) -> dict[tuple[str, str], int]:
+        from collections import Counter
+        if not seq or len(seq) < 2:
+            return {}
+        bigrams = [(seq[i], seq[i+1]) for i in range(len(seq)-1)]
+        return dict(Counter(bigrams))
+
+    df["transition_frequencies"] = df["syllable_order"].apply(_freq)
+
+    # ---------------- Keep per-segment rows with valid time + transitions ----------------
+    ok = (~df["date_time"].isna()) & (df["transition_frequencies"].apply(lambda d: isinstance(d, dict) and len(d) > 0))
 
     keep_cols = ["date_time", "day", "tod_min", "transition_frequencies"]
-    if "file_name" in df.columns:
-        keep_cols.append("file_name")
+    for name in ["file_name", "File Stem", "Segment", "segment"]:
+        if name in df.columns:
+            keep_cols.append(name)
 
     return df.loc[ok, keep_cols].reset_index(drop=True)
+
 
 def _generate_normalized_transition_matrix(
     transition_list: List[Tuple[str, str]],
@@ -567,16 +618,16 @@ import importlib, set_hour_and_batch_TTE
 importlib.reload(set_hour_and_batch_TTE)
 from set_hour_and_batch_TTE import run_set_hour_and_batch_TTE
 
-decoded = "/Users/mirandahulsey-vincent/Desktop/SfN_baseline_analysis/USA5507_RC4/TweetyBERT_Pretrain_LLB_AreaX_FallSong_USA5507_RC5_Comp2_decoded_database.json"
-meta    = "/Users/mirandahulsey-vincent/Desktop/SfN_baseline_analysis/USA5507_RC4/USA5507_RC4_metadata.json"
+decoded = "/Users/mirandahulsey-vincent/Desktop/SfN_baseline_analysis/USA5507_RC5/TweetyBERT_Pretrain_LLB_AreaX_FallSong_USA5507_RC5_Comp2_decoded_database.json"
+meta    = "/Users/mirandahulsey-vincent/Desktop/SfN_baseline_analysis/USA5507_RC5/USA5507_RC5_Comp2_metadata.json"
 
 out = run_set_hour_and_batch_TTE(
     decoded_database_json=decoded,
     creation_metadata_json=meta,
     range1="00:00-10:00",
     range2="12:01-23:59",
-    batch_size=5,
-    min_required_per_range = 5,
+    batch_size=10,
+    min_required_per_range =10,
     only_song_present=True,
     fig_dir=None,
     show=True,
