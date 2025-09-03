@@ -241,6 +241,7 @@ def _plot_aggregate_am_pm(
     ax.set_xticks(x_positions)
     ax.set_xticklabels(x_labels, rotation=0)
     ax.set_ylabel("Total Transition Entropy (bits)")
+    ax.set_ylim(0, 2)
     ax.set_title(
         "Aggregate AM vs PM TTE (paired x-ticks per bird; mean ± SD)\n"
         f"Range1={range1}, Range2={range2}, batch_size={batch_size}"
@@ -291,6 +292,7 @@ def _plot_monthly_lines_by_bird(
     ax.set_xticks(xs)
     ax.set_xticklabels(months)
     ax.set_ylabel("Monthly Mean TTE (AM/PM averaged, bits)")
+    ax.set_ylim(0, 2)
     ax.set_title(
         f"Monthly TTE by Bird (year ignored)\n"
         f"Per-day composite = mean(AM, PM); Range1={range1}, Range2={range2}, batch_size={batch_size}"
@@ -355,6 +357,7 @@ def _plot_daily_points_by_month_all_birds(
     ax.set_xticks(np.arange(1, 13))
     ax.set_xticklabels(["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"])
     ax.set_ylabel("Per-day composite TTE (bits)")
+    ax.set_ylim(0, 2)
     ax.set_title(
         "Daily TTE Points by Month (all birds)\n"
         f"Points = individual days; Range1={range1}, Range2={range2}, batch_size={batch_size}"
@@ -843,10 +846,10 @@ from batch_set_hour_and_batch_TTE import run_batch_set_hour_and_batch_TTE
 
 res = run_batch_set_hour_and_batch_TTE(
     parent_dir="/Users/mirandahulsey-vincent/Desktop/SfN_baseline_analysis",
-    range1="00:00-12:00",
-    range2="12:00-23:59",
-    batch_size=30,
-    min_required_per_range=30,
+    range1="00:00-6:00",
+    range2="6:01-12:00",
+    batch_size=10,
+    min_required_per_range=5,
     only_song_present=True,
     exclude_single_label=False,
     fig_subdir="batch_figures",
