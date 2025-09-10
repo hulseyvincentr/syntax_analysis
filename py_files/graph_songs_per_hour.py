@@ -160,6 +160,7 @@ def songs_per_hour(
                 plotted_any = True
         plt.xticks(range(0, 24))
         plt.xlim(0, 23)
+        plt.ylim(0, 150)
         plt.xlabel("Hour of Day (0–23)")
         plt.ylabel("Number of Songs")
         title = "Songs per Hour (one line per day)"
@@ -181,7 +182,7 @@ def songs_per_hour(
 
     # Optional export
     if export_offhours_json_path is not None:
-        export_path = Path(export_offhours_json_path)
+        export_path = Path(export_offhours_json_path).parent / f"{animal_id}_offhours_segments.json"
         export_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "animal_id": animal_id,
@@ -205,7 +206,7 @@ def songs_per_hour(
 from pathlib import Path
 from graph_songs_per_hour import songs_per_hour
 
-decoded = Path("/Users/mirandahulsey-vincent/Desktop/SfN_baseline_analysis/R07_RC3_Comp2/TweetyBERT_Pretrain_LLB_AreaX_FallSong_R07_RC3_Comp2_decoded_database.json")
+decoded = Path("/Users/mirandahulsey-vincent/Desktop/AFP_lesion_QC_detection/USA5510/TweetyBERT_Pretrain_LLB_AreaX_FallSong_USA5510_RC3_Comp2_decoded_database.json")
 
 # Output dir = same folder as decoded JSON
 outdir = decoded.parent

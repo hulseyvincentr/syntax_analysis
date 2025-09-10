@@ -3,13 +3,17 @@
 """
 Generate validation JSON for USA1234 with AM and PM blocks and segment-aware filenames.
 
+CHANGE: the number immediately after the ID is now an Excel 1900-system serial
+        computed from the actual timestamp (dt → serial). The organizer that
+        reads from the serial will therefore see the intended AM/PM times.
+
 What this creates (per day: 2000-01-01 and 2000-01-02):
 - AM block: timestamps at 00:00..00:19 (20 stems), each with segments _0 and _1 → 40 segments
 - PM block: timestamps at 12:00..12:19 (20 stems), each with segments _0 and _1 → 40 segments
 Total per day = 80 segments; across two days = 160 segments.
 
 Filename format (no extension):
-  USA1234_<token>_<M>_<D>_<H>_<MIN>_<S>_<SEG>
+  USA1234_<excel_serial>_<M>_<D>_<H>_<MIN>_<S>_<SEG>
 
 `creation_date` is ISO8601 and identical for both segments of the same stem.
 
@@ -63,14 +67,24 @@ def _mk_syllables_two(a: str, b: str):
     tb = {a: [_ms_to_bins_span(a_on, a_off)], b: [_ms_to_bins_span(b_on, b_off)]}
     return ms, tb
 
-def _file_stem_token(stem_index: int) -> str:
-    # Deterministic token; same for _0 and _1 of the same stem
-    return f"{(45300 + stem_index):05d}.{(41751298 + 87123 * stem_index):08d}"[-14:]
+def _excel_serial_from_dt(dt: datetime) -> float:
+    """
+    Convert naive datetime -> Excel (1900 system) serial day.
+    Matches pandas origin='1899-12-30' used by the organizer.
+    """
+    excel_epoch = datetime(1899, 12, 30)
+    delta = dt - excel_epoch
+    return delta.days + (delta.seconds + delta.microseconds / 1e6) / 86400.0
 
-def _mk_filename(dt: datetime, stem_index: int, seg: int) -> str:
+def _mk_filename(dt: datetime, seg: int) -> str:
+    """
+    Build the filename so that the token immediately after the ID is the Excel serial
+    for `dt`. Both segments of the same stem share the same serial and creation_date.
+    """
+    serial = _excel_serial_from_dt(dt)
     parts = [
         ANIMAL_ID,
-        _file_stem_token(stem_index),
+        f"{serial:.8f}",          # <<< time-encoding token the organizer will use
         str(dt.month),
         str(dt.day),
         str(dt.hour),
@@ -116,10 +130,9 @@ class DecodedRow:
     syllable_onsets_offsets_ms: Dict[str, List[List[float]]]
     syllable_onsets_offsets_timebins: Dict[str, List[List[int]]]
 
-def _emit_block(results: List[Dict], *, day_base: datetime, hour: int, day: int, block_name: str, stem_start: int) -> int:
+def _emit_block(results: List[Dict], *, day_base: datetime, hour: int, day: int, block_name: str) -> None:
     """
     Emit one block (AM or PM) of STEMS_PER_BLOCK stems, each with SEGMENTS_PER_STEM segments.
-    Returns the next stem index after emitting.
     """
     start_dt = day_base.replace(hour=hour, minute=0, second=0, microsecond=0)
 
@@ -127,45 +140,35 @@ def _emit_block(results: List[Dict], *, day_base: datetime, hour: int, day: int,
     patterns = _patterns_for_block(total_segments, day=day, block=block_name)
     p = 0  # pattern cursor
 
-    stem_index = stem_start
     for minute_idx in range(STEMS_PER_BLOCK):
         rec_dt = start_dt + timedelta(minutes=minute_idx)
         creation_date = rec_dt.isoformat()
 
-        # Emit SEGMENTS_PER_STEM segments for this stem (same token & creation_date)
+        # Emit SEGMENTS_PER_STEM segments for this stem (same serial & creation_date)
         for seg in range(SEGMENTS_PER_STEM):
             frm, to = patterns[p]
             p += 1
             ms, tb = _mk_syllables_two(frm, to)
             results.append(
                 {
-                    "file_name": _mk_filename(rec_dt, stem_index, seg=seg),
+                    "file_name": _mk_filename(rec_dt, seg=seg),
                     "creation_date": creation_date,
                     "song_present": True,
                     "syllable_onsets_offsets_ms": ms,
                     "syllable_onsets_offsets_timebins": tb,
                 }
             )
-        stem_index += 1
-
-    return stem_index
 
 def build_decoded_results() -> List[Dict]:
     results: List[Dict] = []
-    stem_index = 0  # token index advances per stem (shared by _0 and _1)
-
     for day in DAYS:
         day_base = datetime(YEAR, 1, day, 0, 0, 0)
 
-        # AM block (00:00..00:19) – first-half-of-day selection
-        stem_index = _emit_block(
-            results, day_base=day_base, hour=0, day=day, block_name="AM", stem_start=stem_index
-        )
+        # AM block (00:00..00:19)
+        _emit_block(results, day_base=day_base, hour=0, day=day, block_name="AM")
 
-        # PM block (12:00..12:19) – last-half-of-day selection
-        stem_index = _emit_block(
-            results, day_base=day_base, hour=12, day=day, block_name="PM", stem_start=stem_index
-        )
+        # PM block (12:00..12:19)
+        _emit_block(results, day_base=day_base, hour=12, day=day, block_name="PM")
 
     return results
 

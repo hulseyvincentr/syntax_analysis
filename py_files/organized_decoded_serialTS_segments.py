@@ -356,9 +356,10 @@ def build_organized_segments_with_durations(
 # Example usage
 # ───────────────────────────
 """
+from pathlib import Path
 from organized_decoded_serialTS_segments import build_organized_segments_with_durations
 
-decoded = Path("/Users/mirandahulsey-vincent/Desktop/SfN_baseline_analysis/R07_RC3_Comp2/TweetyBERT_Pretrain_LLB_AreaX_FallSong_R07_RC3_Comp2_decoded_database.json")
+decoded = Path("/Users/mirandahulsey-vincent/Desktop/SfN_baseline_analysis/USA1234_decoded_database.json")
 
 out = build_organized_segments_with_durations(
     decoded_database_json=decoded,
