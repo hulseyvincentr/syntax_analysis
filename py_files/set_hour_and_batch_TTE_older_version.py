@@ -399,9 +399,9 @@ if __name__ == "__main__":
 from pathlib import Path
 from graph_num_songs_per_day_and_hour import run_set_hour_and_batch_TTE_by_day
 
-decoded = "/Users/mirandahulsey-vincent/Desktop/analysis_results/USA5507_RC4/TweetyBERT_Pretrain_LLB_AreaX_FallSong_USA5507_RC5_Comp2_decoded_database.json"
-meta = "/Users/mirandahulsey-vincent/Desktop/analysis_results/USA5507_RC4/USA5507_RC4_metadata.json"
-outdir = Path("/Users/mirandahulsey-vincent/Desktop/USA5507_RC4/USA5497/batch_figures")
+decoded = "/Users/mirandahulsey-vincent/Desktop/USA1234_VALIDATION_Data/USA1234_decoded_database.json"
+meta = "/Users/mirandahulsey-vincent/Desktop/USA1234_VALIDATION_Data/USA1234_metadata.json"
+outdir = Path("/Users/mirandahulsey-vincent/Desktop/USA1234_VALIDATION_Data")
 save_day = outdir / "songs_per_day.png"
 save_hour = outdir / "songs_per_hour_by_day.png"
 

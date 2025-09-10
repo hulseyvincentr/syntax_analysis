@@ -1,14 +1,14 @@
 # ────────────────────────────────────────────────────────────────
 # USER-DEFINED VALUES
 # ────────────────────────────────────────────────────────────────
-main_folder        = '/Volumes/GLABSSD/SfN_poster_baseline_analysis/curated_wav_files/spring_song/R07_RC09_Comp1'
-animal_id          = 'USA5508'                 # Used for ID checking and convenience only
+main_folder        = '/Volumes/GLABSSD/Gardner_447D_Comp1_Comp2_and_laptop_SONGS_24June2025/2025_AreaX/USA5510_RC3_Comp2'
+animal_id          = 'USA5510'                 # Used for ID checking and convenience only
 expected_animal_id = animal_id                 # Warn if files don't match this ID; set to None to disable
 treatment_date     = None                      # None → JSON null
 treatment_type     = "None (baseline only)"    # or None → JSON null
 
 # Where to save output JSON file. Use None to save in main_folder.
-output_dir         = '/Users/mirandahulsey-vincent/Desktop/metadata_jsons'
+output_dir         = '/Users/mirandahulsey-vincent/Desktop/'
 
 # You can mix single entries and ranges.
 # Ranges support '-' or ':' plus 'start'/'end' keywords:
