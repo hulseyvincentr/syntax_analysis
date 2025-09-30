@@ -4,18 +4,39 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple, Callable, Union
 
 import argparse
 import re
+import inspect
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# Organizer (segments-aware)
-from organize_decoded_with_segments import (
-    build_organized_segments_with_durations as build_organized_dataset_with_durations
-)
+# ──────────────────────────────────────────────────────────────────────────────
+# Preferred organizer: Excel-serial timestamps from filename
+# Fallbacks: alt module name, then legacy organizer.
+# ──────────────────────────────────────────────────────────────────────────────
+_ORGANIZE_DEFAULT: Optional[Callable] = None
+try:
+    # preferred (your new module)
+    from organized_decoded_serialTS_segments import (
+        build_organized_segments_with_durations as _ORGANIZE_DEFAULT  # type: ignore
+    )
+except Exception:
+    try:
+        # alternate filename
+        from organize_decoded_serialTS_segments import (
+            build_organized_segments_with_durations as _ORGANIZE_DEFAULT  # type: ignore
+        )
+    except Exception:
+        try:
+            # legacy organizer (uses metadata, but we can pass None)
+            from organize_decoded_with_segments import (
+                build_organized_segments_with_durations as _ORGANIZE_DEFAULT  # type: ignore
+            )
+        except Exception:
+            _ORGANIZE_DEFAULT = None
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -58,9 +79,6 @@ def _build_per_file_table(organized_df: pd.DataFrame) -> pd.DataFrame:
       - date_time, day, tod_min
       - transition_frequencies (dict[(from,to)->count])
       - file_name/File Stem, Segment (if present; derive if missing)
-
-    Uses existing 'syllable_order' if available; otherwise derives one from
-    syllable_onsets_offsets_ms (or _timebins). Accepts several datetime columns.
     """
     df = organized_df.copy()
 
@@ -73,13 +91,11 @@ def _build_per_file_table(organized_df: pd.DataFrame) -> pd.DataFrame:
             df["File Stem"] = df["file_name"].astype(str).str.replace(r'_(\d+)(?:\.\w+)?$', "", regex=True)
 
     # ---------------- Datetime ----------------
-    # Try a series of likely columns
     dt = None
     for cand in ["creation_date", "Recording DateTime", "recording_datetime", "date_time"]:
         if cand in df.columns:
             dt = pd.to_datetime(df[cand], errors="coerce")
             break
-
     if dt is None:
         # Fallback to legacy split parts
         for c in ["Date", "Hour", "Minute", "Second"]:
@@ -121,14 +137,13 @@ def _build_per_file_table(organized_df: pd.DataFrame) -> pd.DataFrame:
         events.sort(key=lambda x: x[0])
         seq = [events[0][1]]
         for _, lab in events[1:]:
-            if lab != seq[-1]:  # collapse repeats inside a syllable
+            if lab != seq[-1]:  # collapse repeats
                 seq.append(lab)
         return seq
 
     if "syllable_order" not in df.columns:
         df["syllable_order"] = df.apply(_derive_order_from_dict, axis=1)
     else:
-        # Coerce to list of strings, drop NAs
         def _coerce_seq(x):
             if isinstance(x, (list, tuple)):
                 return [str(v) for v in x]
@@ -145,16 +160,13 @@ def _build_per_file_table(organized_df: pd.DataFrame) -> pd.DataFrame:
 
     df["transition_frequencies"] = df["syllable_order"].apply(_freq)
 
-    # ---------------- Keep per-segment rows with valid time + transitions ----------------
     ok = (~df["date_time"].isna()) & (df["transition_frequencies"].apply(lambda d: isinstance(d, dict) and len(d) > 0))
-
     keep_cols = ["date_time", "day", "tod_min", "transition_frequencies"]
     for name in ["file_name", "File Stem", "Segment", "segment"]:
         if name in df.columns:
             keep_cols.append(name)
 
     return df.loc[ok, keep_cols].reset_index(drop=True)
-
 
 def _generate_normalized_transition_matrix(
     transition_list: List[Tuple[str, str]],
@@ -215,7 +227,7 @@ def _subset_aggregated_tte(subdf: pd.DataFrame, syllable_types: List[str]) -> fl
     ent_by = _transition_entropy_per_row(norm_mat, syllable_types)
     return _total_transition_entropy(counts_mat, syllable_types, ent_by)
 
-def _save_dir(fig_dir: str | Path | None, decoded_database_json: Path) -> Path:
+def _save_dir(fig_dir: Union[str, Path, None], decoded_database_json: Path) -> Path:
     if fig_dir is None or str(fig_dir).strip() == "":
         fig_dir = decoded_database_json.parent
     fig_dir = Path(fig_dir)
@@ -231,9 +243,6 @@ def _most_common(strings: Iterable[str]) -> Optional[str]:
     return c.most_common(1)[0][0] if c else None
 
 def _extract_id_from_text(text: str) -> Optional[str]:
-    """
-    Find USA#### (anywhere) or R## even if followed by underscores/letters.
-    """
     m = re.search(r'(usa\d{4,6})', text, re.IGNORECASE)
     if m:
         return m.group(1).upper()
@@ -255,8 +264,10 @@ def _infer_animal_id_from_df(organized_df: pd.DataFrame) -> Optional[str]:
         return _most_common(matches) if matches else None
     return None
 
-def _infer_animal_id(decoded_path: Path, metadata_path: Path,
-                     organized_df: Optional[pd.DataFrame] = None, od: Optional[object] = None) -> str:
+def _infer_animal_id(decoded_path: Path,
+                     metadata_path: Optional[Path] = None,
+                     organized_df: Optional[pd.DataFrame] = None,
+                     od: Optional[object] = None) -> str:
     # A) Organizer attribute
     if od is not None:
         for attr in ["animal_id", "animalID", "Animal_ID"]:
@@ -269,8 +280,11 @@ def _infer_animal_id(decoded_path: Path, metadata_path: Path,
         guess = _infer_animal_id_from_df(organized_df)
         if guess:
             return guess
-    # C) Paths
-    for text in [str(decoded_path), str(metadata_path), decoded_path.stem, metadata_path.stem]:
+    # C) Paths (metadata optional)
+    texts: List[str] = [str(decoded_path), decoded_path.stem]
+    if metadata_path is not None:
+        texts.extend([str(metadata_path), metadata_path.stem])
+    for text in texts:
         guess = _extract_id_from_text(text)
         if guess:
             return guess
@@ -278,9 +292,6 @@ def _infer_animal_id(decoded_path: Path, metadata_path: Path,
     return decoded_path.stem.split("_")[0]
 
 def _mean_sem(vals: List[float]) -> Tuple[float, Optional[float], int]:
-    """
-    Return (mean, sem, n). sem uses sample std (ddof=1) if n>1; 0.0 if n==1; None if n==0.
-    """
     n = len(vals)
     if n == 0:
         return float("nan"), None, 0
@@ -302,29 +313,47 @@ class SetHourAndBatchTTEResult:
 
 def run_set_hour_and_batch_TTE(
     *,
-    decoded_database_json: str | Path,
-    creation_metadata_json: str | Path,
+    decoded_database_json: Union[str, Path],
+    creation_metadata_json: Optional[Union[str, Path]] = None,  # ← now optional
     range1: str = "00:00-12:00",
-    range2: str = "12:00-23:59",   # include noon by default
+    range2: str = "12:00-23:59",
     batch_size: int = 10,
     min_required_per_range: Optional[int] = None,
     only_song_present: bool = True,
     compute_durations: bool = False,
-    fig_dir: str | Path | None = None,
+    fig_dir: Optional[Union[str, Path]] = None,
     show: bool = True,
+    organize_builder: Optional[Callable] = _ORGANIZE_DEFAULT,
 ) -> SetHourAndBatchTTEResult:
 
     decoded_database_json = Path(decoded_database_json)
-    creation_metadata_json = Path(creation_metadata_json)
+    metadata_path = Path(creation_metadata_json) if creation_metadata_json else None
 
-    od = build_organized_dataset_with_durations(
-        decoded_database_json=decoded_database_json,
-        creation_metadata_json=creation_metadata_json,
-        only_song_present=only_song_present,
-        compute_durations=compute_durations,
-    )
+    builder = organize_builder or _ORGANIZE_DEFAULT
+    if builder is None:
+        raise ImportError(
+            "No organizer available. Ensure one of these modules is importable:\n"
+            "  - organized_decoded_serialTS_segments.py\n"
+            "  - organize_decoded_serialTS_segments.py\n"
+            "  - organize_decoded_with_segments.py"
+        )
+
+    # Call organizer with signature-aware kwargs (no metadata required)
+    params = inspect.signature(builder).parameters
+    kwargs = {
+        "decoded_database_json": decoded_database_json,
+        "only_song_present": only_song_present,
+        "compute_durations": compute_durations,
+    }
+    if "add_recording_datetime" in params:
+        kwargs["add_recording_datetime"] = True
+    if "creation_metadata_json" in params:
+        kwargs["creation_metadata_json"] = metadata_path  # may be None; organizer may ignore
+
+    od = builder(**kwargs)
+
     organized = od.organized_df
-    animal_id = _infer_animal_id(decoded_database_json, creation_metadata_json, organized_df=organized, od=od)
+    animal_id = _infer_animal_id(decoded_database_json, metadata_path, organized_df=organized, od=od)
 
     pf = _build_per_file_table(organized)
     if pf.empty:
@@ -375,11 +404,11 @@ def run_set_hour_and_batch_TTE(
         firstN_files = list(firstN["file_name"]) if "file_name" in firstN.columns else []
         lastN_files  = list(lastN["file_name"]) if "file_name" in lastN.columns else []
 
-        # Aggregated TTE (this is what we PLOT and store in *_avg_TTE)
+        # Aggregated TTE (plotted & stored in *_avg_TTE)
         r1_agg = _subset_aggregated_tte(firstN, syllable_types) if len(firstN) >= min_required_per_range else float("nan")
         r2_agg = _subset_aggregated_tte(lastN,  syllable_types) if len(lastN)  >= min_required_per_range else float("nan")
 
-        # SEM from per-file TTEs (even though mean comes from aggregated matrix)
+        # SEM from per-file TTEs
         r1_mean_perfile, r1_sem, _ = _mean_sem(firstN_ttes)
         r2_mean_perfile, r2_sem, _ = _mean_sem(lastN_ttes)
         if len(firstN) < min_required_per_range:
@@ -389,26 +418,18 @@ def run_set_hour_and_batch_TTE(
 
         rows.append({
             "day": day,
-
-            # Plotted means (aggregated across subset)
             "range1_firstN_avg_TTE": r1_agg,
             "range2_lastN_avg_TTE":  r2_agg,
-
-            # Uncertainty from per-file TTEs
             "range1_sem": r1_sem,
             "range2_sem": r2_sem,
-
-            # Counts + raw arrays for auditing
             "range1_count": int(len(firstN)),
             "range1_firstN_TTEs": firstN_ttes,
             "range1_firstN_file_names": firstN_files,
             "range2_count": int(len(lastN)),
             "range2_lastN_TTEs": lastN_ttes,
             "range2_lastN_file_names": lastN_files,
-
-            # Optional: per-file mean kept for reference
-            "range1_firstN_avg_TTE_perfile": r1_mean_perfile,
-            "range2_lastN_avg_TTE_perfile": r2_mean_perfile,
+            "range1_firstN_avg_TTE_perfile": r1_mean_perfile,  # ref only
+            "range2_lastN_avg_TTE_perfile": r2_mean_perfile,   # ref only
         })
 
     results_df = pd.DataFrame(rows).sort_values("day").reset_index(drop=True)
@@ -481,7 +502,6 @@ def run_set_hour_and_batch_TTE(
     # ──────────────────────────────────────────────────────────────────────────
     fig_path_paired_sem = None
     if not results_df.empty:
-        # Build flattened axis; draw generic colored points with error bars
         x_vals, y_vals, y_sem, labels = [], [], [], []
         for _, row in results_df.iterrows():
             dstr = _date_str(row["day"])
@@ -497,7 +517,6 @@ def run_set_hour_and_batch_TTE(
         if x_vals:
             plt.figure(figsize=(max(10, len(x_vals) * 0.7), 6))
             plt.errorbar(x_vals, y_vals, yerr=y_sem, fmt='o', capsize=4, elinewidth=1.2)
-            # Connect within-day pairs roughly by sequence (cosmetic)
             cursor = 0
             for _, row in results_df.iterrows():
                 have_r1 = pd.notna(row["range1_firstN_avg_TTE"])
@@ -542,12 +561,9 @@ def run_set_hour_and_batch_TTE(
                 xs.append(1); ys.append(row["range2_lastN_avg_TTE"])
                 es.append(row["range2_sem"] if row["range2_sem"] is not None else 0.0)
 
-            # Draw the connected line and capture its color
             h_line, = plt.plot(xs, ys, linewidth=2.0 if len(xs) == 2 else 1.5,
                                label=dstr, marker='o')
             line_color = h_line.get_color()
-
-            # Error bars in the same color
             plt.errorbar(xs, ys, yerr=es, fmt='none', capsize=4, elinewidth=1.2,
                          ecolor=line_color)
 
@@ -576,14 +592,10 @@ def run_set_hour_and_batch_TTE(
     )
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Validation helpers (module-scope, importable)
+# Validation helpers (unchanged)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def summarize_tte_selection(results_df: pd.DataFrame, *, batch_size: int = 10) -> None:
-    """
-    Print a concise summary of how many segments were selected per day/range,
-    and list the exact filenames used.
-    """
     for _, row in results_df.iterrows():
         day = row["day"]
         r1_count = int(row.get("range1_count", 0))
@@ -603,10 +615,6 @@ def summarize_tte_selection(results_df: pd.DataFrame, *, batch_size: int = 10) -
             print("   ", fn)
 
 def summarize_tte_selection_or_raise(results_df: pd.DataFrame, *, batch_size: int = 10) -> None:
-    """
-    Same as summarize_tte_selection, but raises ValueError if any day fails
-    to include at least `batch_size` segments in either range.
-    """
     summarize_tte_selection(results_df, batch_size=batch_size)
     problems = []
     for _, row in results_df.iterrows():
@@ -629,7 +637,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         description="Average TTE of FIRST N songs in range1 vs LAST N songs in range2, per day."
     )
     p.add_argument("--decoded", required=True, help="Path to decoded_database.json")
-    p.add_argument("--meta", required=True, help="Path to creation/metadata .json")
+    p.add_argument("--meta", default=None,
+                   help="(Optional) Path to metadata .json — not required for Excel-serial organizer.")
     p.add_argument("--range1", default="00:00-12:00", help="Time range 1, e.g., '00:00-12:00'")
     p.add_argument("--range2", default="12:00-23:59", help="Time range 2, e.g., '12:00-23:59'")
     p.add_argument("--batch_size", type=int, default=10, help="Songs to take in each subset")
@@ -645,7 +654,7 @@ def main():
     args = _build_arg_parser().parse_args()
     res = run_set_hour_and_batch_TTE(
         decoded_database_json=args.decoded,
-        creation_metadata_json=args.meta,
+        creation_metadata_json=args.meta,  # may be None
         range1=args.range1,
         range2=args.range2,
         batch_size=args.batch_size,
@@ -654,6 +663,7 @@ def main():
         compute_durations=False,
         fig_dir=args.fig_dir,
         show=not args.no_show,
+        organize_builder=_ORGANIZE_DEFAULT,
     )
     print("\nResults (first 10 rows):")
     if not res.results_df.empty:
@@ -674,17 +684,17 @@ if __name__ == "__main__":
 
 
 
+
 """
-import importlib, set_hour_and_batch_TTE
-importlib.reload(set_hour_and_batch_TTE)
+import importlib, set_hour_and_batch_TTE as mod
+importlib.reload(mod)
 from set_hour_and_batch_TTE import run_set_hour_and_batch_TTE, summarize_tte_selection_or_raise
 
-decoded = "/Users/mirandahulsey-vincent/Documents/allPythonCode/syntax_analysis/data_inputs/USA1234_decoded_database.json"
-meta    = "/Users/mirandahulsey-vincent/Documents/allPythonCode/syntax_analysis/data_inputs/USA1234_metadata.json"
+
+decoded = "/Users/mirandahulsey-vincent/Desktop/USA1234_VALIDATION_Data/USA1234_decoded_database.json"
 
 out = run_set_hour_and_batch_TTE(
     decoded_database_json=decoded,
-    creation_metadata_json=meta,
     range1="00:00-12:00",
     range2="12:00-23:59",
     batch_size=30,

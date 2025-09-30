@@ -1,14 +1,17 @@
+# copy_and_visualize_oddly_time_songs.py
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import shutil
 import csv
 import collections
 
-# ───────── optional plotting (hour/date histograms) ─────────
+# ───────── optional plotting (hour/date histograms & PNG spectrograms) ─────────
 try:
     import matplotlib.pyplot as plt
     _HAVE_MPL = True
@@ -100,6 +103,64 @@ def _resolve_candidates(item: OffhourItem, index: Dict[str, List[Path]], audio_e
 
 
 # ─────────────────────────────────────────────────────────────
+# Title helpers (adds date & time to figure titles)
+# ─────────────────────────────────────────────────────────────
+def _guess_datetime_from_name(name: str) -> Optional[str]:
+    """
+    Try to recover 'YYYY-MM-DD HH:MM:SS' from a filename.
+    Supports common forms like:
+      YYYYMMDD_HHMMSS, YYYY-MM-DD_HH-MM-SS, YYYYMMDDHHMMSS, etc.
+    Returns a nice string or None.
+    """
+    stem = Path(name).stem
+
+    # YYYY[-_]MM[-_]DD[T/_ -]?HH[-_]MM[-_]SS
+    m = re.search(
+        r'(20\d{2})[-_]?(\d{2})[-_]?(\d{2})[T/_ -]?([01]\d|2[0-3])[-_]?([0-5]\d)[-_]?([0-5]\d)',
+        stem
+    )
+    if m:
+        y, mo, d, H, M, S = m.groups()
+        return f"{y}-{mo}-{d} {H}:{M}:{S}"
+
+    # Date only + time only (combine if both appear)
+    md = re.search(r'(20\d{2})[-_]?(\d{2})[-_]?(\d{2})', stem)
+    mt = re.search(r'([01]\d|2[0-3])[-_]?([0-5]\d)(?:[-_]?([0-5]\d))?', stem)
+    if md and mt:
+        y, mo, d = md.groups()
+        H, M, S = mt.group(1), mt.group(2), mt.group(3) or '00'
+        return f"{y}-{mo}-{d} {H}:{M}:{S}"
+
+    return None
+
+
+def _build_title_prefix(item: OffhourItem, path: Path) -> str:
+    """
+    Best-effort recording datetime string for the figure title.
+    Priority:
+      1) Parse full datetime from filename
+      2) JSON date_str + hour (HH:00)
+      3) File mtime
+    """
+    # 1) try filename
+    guess = _guess_datetime_from_name(path.name)
+    if guess:
+        return guess
+
+    # 2) JSON fields
+    if item.date_str and item.hour is not None:
+        return f"{item.date_str} {int(item.hour):02d}:00"
+    if item.date_str:
+        return item.date_str
+
+    # 3) mtime as a last resort
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return ""
+
+
+# ─────────────────────────────────────────────────────────────
 # Spectrogram drawing (whole file → stacked 10 s rows)
 # ─────────────────────────────────────────────────────────────
 def _draw_segment(ax, audio, sr, x_offset, seg_dur):
@@ -122,15 +183,26 @@ def _draw_segment(ax, audio, sr, x_offset, seg_dur):
     if S.size == 0:
         return
     S_db = 20 * np.log10(S + 1e-12)
-    ax.pcolormesh(x_offset + t, f, S_db, shading="auto", cmap="gray_r",
-                  vmin=SPEC_VMIN, vmax=SPEC_VMAX)
+    ax.pcolormesh(
+        x_offset + t, f, S_db, shading="auto", cmap="gray_r",
+        vmin=SPEC_VMIN, vmax=SPEC_VMAX
+    )
 
 
-def _save_spectrogram_png(wav_path: Path, out_png: Path, rows_per_fig: int = 6) -> None:
+def _save_spectrogram_png(
+    wav_path: Path,
+    out_png: Path,
+    rows_per_fig: int = 6,
+    title_prefix: Optional[str] = None
+) -> None:
     """
     Render WAV into stacked 10-second spectrogram rows and save to out_png.
     No overlays (the off-hours JSON has no spans).
+    If matplotlib is unavailable, silently skip creating PNGs.
     """
+    if not _HAVE_MPL:
+        return
+
     audio, sr = sf.read(wav_path)
     if audio.ndim > 1:
         audio = audio.mean(axis=1)
@@ -139,6 +211,9 @@ def _save_spectrogram_png(wav_path: Path, out_png: Path, rows_per_fig: int = 6) 
         # create an empty placeholder image to keep pipeline consistent
         fig, ax = plt.subplots(figsize=(10, 2))
         ax.axis("off")
+        base = f"{wav_path.name}  •  {dur_sec:.2f}s @ {sr} Hz"
+        title = f"{title_prefix}  •  {base}" if title_prefix else base
+        fig.suptitle(title, fontsize=11)
         fig.savefig(out_png, dpi=200, bbox_inches="tight")
         plt.close(fig)
         return
@@ -151,9 +226,11 @@ def _save_spectrogram_png(wav_path: Path, out_png: Path, rows_per_fig: int = 6) 
     # For longer files: multiple figures numbered ..._p01.png, _p02.png, etc.
     fig_index = 1
     while remaining > 1e-9:
-        fig, axes = plt.subplots(rows_per_fig, 1,
-                                 figsize=(10, 2 * rows_per_fig),
-                                 sharex=True, constrained_layout=True)
+        fig, axes = plt.subplots(
+            rows_per_fig, 1,
+            figsize=(10, 2 * rows_per_fig),
+            sharex=True, constrained_layout=True
+        )
         axes = np.atleast_1d(axes)
 
         for ax in axes:
@@ -186,10 +263,11 @@ def _save_spectrogram_png(wav_path: Path, out_png: Path, rows_per_fig: int = 6) 
             ax.tick_params(labelsize=8)
 
         axes[-1].set_xlabel("Time [s]")
-        title = f"{wav_path.name}  •  {dur_sec:.2f}s @ {sr} Hz"
+        base = f"{wav_path.name}  •  {dur_sec:.2f}s @ {sr} Hz"
+        title = f"{title_prefix}  •  {base}" if title_prefix else base
         fig.suptitle(title, fontsize=11)
 
-        if dur_sec <= ROW_DUR * rows_per_fig:
+        if dur_sec <= ROW_DUR * rows_per_fig and fig_index == 1:
             # simple (single figure)
             fig.savefig(out_png, dpi=300)
             plt.close(fig)
@@ -220,6 +298,8 @@ def copy_and_visualize_oddly_time_songs(
     - Spectrogram settings match your QC script:
       ROW_DUR=10 s, nperseg=1024, noverlap=512, grayscale, vmin=-90, vmax=-20.
     - Writes a manifest CSV with src, dest, and spectrogram path (if created).
+    - Figure title now includes a best-effort recording datetime (parsed from name,
+      else JSON date/hour, else file mtime).
 
     Returns
     -------
@@ -273,14 +353,22 @@ def copy_and_visualize_oddly_time_songs(
 
         # spectrogram PNG (one per audio; multi-page files get _p01, _p02…)
         png_path = ""
-        if make_spectrogram_pngs:
+        if make_spectrogram_pngs and _HAVE_MPL:
             try:
                 png_out = output_directory / (preferred.stem + ".png")
-                _save_spectrogram_png(dest if dest.exists() else preferred, png_out, rows_per_fig=rows_per_fig)
+                title_prefix = _build_title_prefix(item, preferred)
+                _save_spectrogram_png(
+                    dest if dest.exists() else preferred,
+                    png_out,
+                    rows_per_fig=rows_per_fig,
+                    title_prefix=title_prefix or None,
+                )
                 png_path = str(png_out)
             except Exception as e:
                 # keep pipeline resilient; note the error in manifest
                 png_path = f"ERROR: {e}"
+        elif make_spectrogram_pngs and not _HAVE_MPL:
+            png_path = "SKIPPED: matplotlib not available"
 
         manifest_rows.append({
             "animal_id": animal_id,
@@ -344,18 +432,17 @@ def copy_and_visualize_oddly_time_songs(
 # -------------------------
 # Example usage:
 # -------------------------
-
 from copy_and_visualize_oddly_timed_songs import copy_and_visualize_oddly_time_songs
 out = copy_and_visualize_oddly_time_songs(
-    json_path="/Users/mirandahulsey-vincent/Desktop/SfN_baseline_analysis/R07_RC3_Comp2/offhours_segments.json",
-    parent_directory="/Volumes/GLABSSD/SfN_poster_baseline_analysis/curated_wav_files/spring_song/R07_RC3_Comp2",
-    output_directory="/Volumes/GLABSSD/2025_song_detector_QC/R07",
-    audio_exts=(".wav", ".flac"),
-    overwrite=False,
-    make_histograms=True,
-    make_spectrogram_pngs=True,
-    rows_per_fig=6,
-)
+     json_path="/Users/mirandahulsey-vincent/Desktop/AFP_lesion_QC_detection/USA5483/USA5483_offhours_segments.json",
+     parent_directory="/Volumes/GLABSSD/Gardner_447D_Comp1_Comp2_and_laptop_SONGS_24June2025/2025_AreaX/USA5483_RC6_Comp2",
+     output_directory="/Volumes/GLABSSD/2025_song_detector_QC/USA5483",
+     audio_exts=(".wav", ".flac"),
+     overwrite=False,
+     make_histograms=True,
+     make_spectrogram_pngs=True,
+     rows_per_fig=6,
+ )
 print(out)
 
 """

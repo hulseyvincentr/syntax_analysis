@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Union, List
+from typing import Dict, Optional, Tuple, Union, List, Callable
 import re
 import numpy as np
 import pandas as pd
@@ -17,8 +17,27 @@ try:
 except Exception:
     _HAVE_SCIPY = False
 
-# Import the adjusted single-bird runner (aggregated TTE means; SEM from per-song TTEs)
+# ───────────────────────────────────────────────────────────────────────────────
+# Import the single-bird runner (aggregated TTE means; SEM from per-song TTEs)
+# ───────────────────────────────────────────────────────────────────────────────
 from set_hour_and_batch_TTE import run_set_hour_and_batch_TTE
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Prefer the Excel-serial–based organizer; handle either module filename
+# (organized_decoded_serialTS_segments.py or organize_decoded_serialTS_segments.py)
+# ───────────────────────────────────────────────────────────────────────────────
+_SERIAL_BUILDER: Optional[Callable] = None
+try:
+    from organized_decoded_serialTS_segments import (
+        build_organized_segments_with_durations as _SERIAL_BUILDER  # type: ignore
+    )
+except Exception:
+    try:
+        from organize_decoded_serialTS_segments import (
+            build_organized_segments_with_durations as _SERIAL_BUILDER  # type: ignore
+        )
+    except Exception:
+        _SERIAL_BUILDER = None  # we will warn at runtime if still None
 
 __all__ = [
     "run_batch_set_hour_and_batch_TTE",
@@ -604,21 +623,22 @@ def run_batch_set_hour_and_batch_TTE(
     make_daily_points: bool = True,
     make_significance_plots: bool = True,             # make BOTH significance figures
     show: bool = False,
+    organize_builder: Optional[Callable] = _SERIAL_BUILDER,   # ← NEW: defaults to Excel-serial builder if found
 ) -> BatchResults:
     """
     1) Finds JSON pairs in subfolders of `parent_dir`.
     2) For each bird, calls run_set_hour_and_batch_TTE(...) to generate *individual* figures.
+       If the single-bird function supports `organize_builder=...`, we pass your Excel-serial organizer
+       so that timestamps come from the Excel serial token in the filename.
     3) Builds aggregate AM vs PM plot (paired x-ticks; mean ± SD).
-    4) Optionally builds:
-         - monthly lines plot (year ignored),
-         - daily per-day composite scatter by month,
-         - BOTH significance plots:
-             a) distribution of PM−AM per bird (one distribution per bird),
-             b) two distributions per bird (AM vs PM) with paired lines.
+    4) Optionally builds: monthly lines, daily points-by-month, and BOTH significance plots.
     """
     parent = Path(parent_dir)
     if not parent.exists() or not parent.is_dir():
         raise NotADirectoryError(f"{parent} is not a directory")
+
+    if organize_builder is None:
+        print("[WARN] No Excel-serial organizer available; proceeding with the single-bird default organizer.")
 
     subdirs = [p for p in parent.iterdir() if p.is_dir()]
     per_bird: Dict[str, BirdResult] = {}
@@ -637,18 +657,43 @@ def run_batch_set_hour_and_batch_TTE(
             fig_dir = Path(save_dir) / (fig_subdir or "")
         _ensure_dir(fig_dir)
 
-        res = run_set_hour_and_batch_TTE(
-            decoded_database_json=decoded_json,
-            creation_metadata_json=meta_json,
-            range1=range1,
-            range2=range2,
-            batch_size=batch_size,
-            min_required_per_range=min_required_per_range,
-            only_song_present=only_song_present,
-            compute_durations=compute_durations,
-            fig_dir=fig_dir,
-            show=show,
-        )
+        # Call the single-bird runner, preferring to inject your Excel-serial organizer if supported.
+        try:
+            if organize_builder is not None:
+                res = run_set_hour_and_batch_TTE(
+                    decoded_database_json=decoded_json,
+                    creation_metadata_json=meta_json,
+                    range1=range1,
+                    range2=range2,
+                    batch_size=batch_size,
+                    min_required_per_range=min_required_per_range,
+                    only_song_present=only_song_present,
+                    compute_durations=compute_durations,
+                    fig_dir=fig_dir,
+                    show=show,
+                    organize_builder=organize_builder,  # <-- NEW (try this first)
+                )
+            else:
+                raise TypeError("Organizer not available")  # jump to except → call without param
+        except TypeError:
+            # Backward-compat: single-bird runner may not accept `organize_builder`.
+            # Fall back to the legacy call (it will use its internal organizer).
+            if organize_builder is not None:
+                print(f"[WARN] run_set_hour_and_batch_TTE() does not accept `organize_builder=` "
+                      f"(module likely older). Using its internal organizer for {sub.name}.")
+            res = run_set_hour_and_batch_TTE(
+                decoded_database_json=decoded_json,
+                creation_metadata_json=meta_json,
+                range1=range1,
+                range2=range2,
+                batch_size=batch_size,
+                min_required_per_range=min_required_per_range,
+                only_song_present=only_song_present,
+                compute_durations=compute_durations,
+                fig_dir=fig_dir,
+                show=show,
+            )
+
         if res.results_df is None or res.results_df.empty:
             print(f"[INFO] No qualifying days for {sub.name}.")
             continue
@@ -789,7 +834,8 @@ def run_batch_set_hour_and_batch_TTE(
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(
-        description="Batch TTE wrapper for multiple birds (individual + aggregate + significance figures)."
+        description="Batch TTE wrapper for multiple birds (individual + aggregate + significance figures). "
+                    "Prefers Excel-serial timestamps if organizer is available."
     )
     parser.add_argument("parent_dir", type=str,
                         help="Directory whose subfolders contain decoded/metadata JSON pairs.")
@@ -829,6 +875,7 @@ if __name__ == "__main__":
         make_daily_points=not args.no_daily_points,
         make_significance_plots=not args.no_significance,
         show=args.show,
+        organize_builder=_SERIAL_BUILDER,   # ← ensure CLI prefers the Excel-serial organizer when available
     )
     print("AM/PM aggregate              :", out.am_pm_figure_path)
     print("Monthly figure               :", out.monthly_figure_path)
@@ -838,25 +885,25 @@ if __name__ == "__main__":
 
 
 
+
 """
-from pathlib import Path
-import importlib, batch_set_hour_and_batch_TTE as batch_mod
+import importlib, set_hour_and_batch_TTE, batch_set_hour_and_batch_TTE as batch_mod
+importlib.reload(set_hour_and_batch_TTE)
 importlib.reload(batch_mod)
+
 from batch_set_hour_and_batch_TTE import run_batch_set_hour_and_batch_TTE
 
 res = run_batch_set_hour_and_batch_TTE(
     parent_dir="/Users/mirandahulsey-vincent/Desktop/SfN_baseline_analysis",
-    range1="00:00-6:00",
-    range2="6:01-12:00",
-    batch_size=10,
+    range1="00:00-08:00",
+    range2="12:00-18:00",
+    batch_size=20,
     min_required_per_range=5,
     only_song_present=True,
-    exclude_single_label=False,
     fig_subdir="batch_figures",
-    make_significance_plots=True,  # makes BOTH significance figures
+    make_significance_plots=True,
     show=False,
 )
-
 print("Diffs plot :", res.significance_diffs_figure_path)
 print("Groups plot:", res.significance_groups_figure_path)
 
