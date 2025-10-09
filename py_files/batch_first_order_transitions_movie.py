@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 
-# build_batch_first_order_transitions_movie.py
+# batch_first_order_transitions_movie.py
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple, Union, Dict
 from collections import defaultdict, OrderedDict
+import inspect
 
 import numpy as np
 import pandas as pd
@@ -15,19 +16,66 @@ import seaborn as sns
 # For movie writing
 import imageio.v3 as iio  # GIF/APNG work without ffmpeg; MP4 tries imageio-ffmpeg/pyav
 
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Organizer import: prefer segments-aware, fallback to legacy durations organizer
+# Organizer import (preference order):
+#   1) organize_decoded_serialTS_segments  ← Excel-serial timestamp in filename
+#   2) organized_decoded_serialTS_segments ← alt name (typo/back-compat)
+#   3) organize_decoded_with_segments
+#   4) organize_decoded_with_durations
 # ──────────────────────────────────────────────────────────────────────────────
-_USING_SEGMENTS = False
+_ORGANIZE_FUNC = None
+_ORGANIZER_NAME = None
+
 try:
-    from organize_decoded_with_segments import (
-        build_organized_segments_with_durations as _build_organized
+    from organize_decoded_serialTS_segments import (
+        build_organized_segments_with_durations as _ORGANIZE_FUNC  # type: ignore
     )
-    _USING_SEGMENTS = True
-except ImportError:
-    from organize_decoded_with_durations import (
-        build_organized_dataset_with_durations as _build_organized
-    )
+    _ORGANIZER_NAME = "organize_decoded_serialTS_segments"
+except Exception:
+    try:
+        from organized_decoded_serialTS_segments import (
+            build_organized_segments_with_durations as _ORGANIZE_FUNC  # type: ignore
+        )
+        _ORGANIZER_NAME = "organized_decoded_serialTS_segments"
+    except Exception:
+        try:
+            from organize_decoded_with_segments import (
+                build_organized_segments_with_durations as _ORGANIZE_FUNC  # type: ignore
+            )
+            _ORGANIZER_NAME = "organize_decoded_with_segments"
+        except Exception:
+            from organize_decoded_with_durations import (
+                build_organized_dataset_with_durations as _ORGANIZE_FUNC  # type: ignore
+            )
+            _ORGANIZER_NAME = "organize_decoded_with_durations"
+
+
+def _call_organizer(decoded_database_json: Union[str, Path],
+                    creation_metadata_json: Optional[Union[str, Path]] = None):
+    """
+    Call whichever organizer we imported, passing only the kwargs it supports.
+    This prefers the Excel-serial organizer, which does NOT need metadata.
+    """
+    if _ORGANIZE_FUNC is None:
+        raise ImportError("No organizer function could be imported.")
+
+    sig = inspect.signature(_ORGANIZE_FUNC)
+    kwargs = {}
+
+    # common/possible parameters
+    if "decoded_database_json" in sig.parameters:
+        kwargs["decoded_database_json"] = decoded_database_json
+    if "creation_metadata_json" in sig.parameters:
+        kwargs["creation_metadata_json"] = creation_metadata_json
+    if "only_song_present" in sig.parameters:
+        kwargs["only_song_present"] = False     # filter explicitly below
+    if "compute_durations" in sig.parameters:
+        kwargs["compute_durations"] = False     # we don't need durations here
+    if "add_recording_datetime" in sig.parameters:
+        kwargs["add_recording_datetime"] = True # Excel-serial organizer uses this
+
+    return _ORGANIZE_FUNC(**kwargs)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -195,11 +243,11 @@ def render_transition_frame_array(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Batch runner + movie maker
+# Batch runner + movie maker (now using the Excel-serial organizer by default)
 # ──────────────────────────────────────────────────────────────────────────────
 def run_batch_first_order_transitions(
     decoded_database_json: Union[str, Path],
-    creation_metadata_json: Union[str, Path],
+    creation_metadata_json: Optional[Union[str, Path]] = None,   # kept for back-compat; ignored by serialTS organizer
     *,
     batch_size: int = 100,                  # songs per batch
     stride: Optional[int] = None,           # None → non-overlapping; set < batch_size for overlap
@@ -210,7 +258,7 @@ def run_batch_first_order_transitions(
     save_png: bool = True,
     show_plots: bool = True,
     # movie options
-    save_movie_path: Optional[Union[str, Path]] = None,  # ".gif" recommended; ".mp4" tries ffmpeg
+    save_movie_path: Optional[Union[str, Path]] = None,  # ".gif" recommended; ".mp4" tries ffmpeg/pyav
     movie_fps: int = 2,
     movie_figsize: Tuple[float, float] = (8, 7),
     enforce_consistent_order: bool = True,  # keep same label order across batches
@@ -220,32 +268,13 @@ def run_batch_first_order_transitions(
     `batch_size` songs, builds and exports a first-order transition matrix. Also
     assembles frames into a movie if `save_movie_path` is provided.
 
-    Returns
-    -------
-    OrderedDict[str, dict]
-        key="Batch_### (i..j)" → {
-            'probs': DataFrame,
-            'figure_path': Optional[Path],
-            'probs_csv': Optional[Path],
-        }
+    Uses the Excel-serial organizer if available (no metadata required).
     """
-    # Build organized dataset (segments-aware or legacy)
-    if _USING_SEGMENTS:
-        org = _build_organized(
-            decoded_database_json=decoded_database_json,
-            creation_metadata_json=creation_metadata_json,
-            only_song_present=False,          # we'll filter explicitly below
-            compute_durations=False,
-            add_recording_datetime=True,
-        )
-    else:
-        org = _build_organized(
-            decoded_database_json=decoded_database_json,
-            creation_metadata_json=creation_metadata_json,
-            only_song_present=False,
-            compute_durations=False,
-        )
-
+    # Build organized dataset (prefers Excel-serial organizer)
+    org = _call_organizer(
+        decoded_database_json=decoded_database_json,
+        creation_metadata_json=creation_metadata_json,
+    )
     df = org.organized_df.copy()
 
     # Filter to song_present == True if available
@@ -386,24 +415,26 @@ def run_batch_first_order_transitions(
 # ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     decoded = "/path/to/decoded_database.json"
-    meta    = "/path/to/creation_metadata.json"
+    # For the Excel-serial organizer, metadata is not required:
+    meta    = None
 
     out = run_batch_first_order_transitions(
         decoded_database_json=decoded,
-        creation_metadata_json=meta,
-        batch_size=100,                    # batches of 100 song_present rows
-        stride=None,                       # None → non-overlapping; set e.g. 50 for rolling
-        restrict_to_labels=None,           # or provide your canonical label list to fix order
-        min_row_total=0,                   # e.g., 5 to suppress sparse rows
-        output_dir="figures/batch_transitions",  # per-batch PNG/CSV
+        creation_metadata_json=meta,         # kept for back-compat; ignored by serialTS organizer
+        batch_size=100,
+        stride=None,
+        restrict_to_labels=None,
+        min_row_total=0,
+        output_dir="figures/batch_transitions",
         save_csv=True,
         save_png=True,
-        show_plots=False,                  # disable live popups when making movies
+        show_plots=False,
         save_movie_path="figures/batch_transitions/first_order_batches.gif",
         movie_fps=2,
         movie_figsize=(8, 7),
         enforce_consistent_order=True,
     )
+    print(f"Organizer used: {_ORGANIZER_NAME}")
     print(f"Exported batch matrices for {len(out)} batch(es).")
 
 
@@ -411,26 +442,30 @@ if __name__ == "__main__":
 from batch_first_order_transitions_movie import run_batch_first_order_transitions
 
 # Paths to your inputs
-decoded = "/Users/mirandahulsey-vincent/Desktop/analysis_results/USA5497/TweetyBERT_Pretrain_LLB_AreaX_FallSong_USA5497_decoded_database.json"
-meta    = "/Users/mirandahulsey-vincent/Desktop/analysis_results/USA5497/USA5497_metadata.json"
-outdir  = "/Users/mirandahulsey-vincent/Desktop/analysis_results/USA5497/batch_figures"
+decoded = "/Users/mirandahulsey-vincent/Desktop/AreaX_lesion_2025/R08_RC6_Comp2_decoded_database.json"
+# The Excel-serial organizer doesn't need metadata; set to None.
+meta    = None
+outdir  = "/Users/mirandahulsey-vincent/Desktop/AreaX_lesion_2025/R08_figures/"
+
+# (Optional) Fix the label set/order across batches:
+# canonical_labels = ['0','1','2','3','4','5','6','7','8','9','10','11','12','13','14','15','16','17','18','19','20','21','22']
 
 # Run the batch transition pipeline
 results = run_batch_first_order_transitions(
     decoded_database_json=decoded,
-    creation_metadata_json=meta,
-    batch_size=100,                           # group songs into batches of 100
-    stride=None,                              # None = non-overlapping; set to e.g. 50 for rolling windows
-    restrict_to_labels=None,                  # or pass a fixed list of labels (e.g., ['0','1','2',...])
-    min_row_total=0,                          # filter out rows with very few transitions
-    output_dir=outdir,                        # save per-batch PNGs/CSVs here
+    creation_metadata_json=meta,             # ignored by the Excel-serial organizer
+    batch_size=100,                          # group songs into batches of 100
+    stride=None,                             # None = non-overlapping; e.g., 50 for rolling windows
+    restrict_to_labels=None,                 # or use canonical_labels to lock axes
+    min_row_total=0,                         # filter out rows with very few transitions (e.g., 5)
+    output_dir=outdir,                       # save per-batch PNGs/CSVs here
     save_csv=False,
     save_png=True,
-    show_plots=False,                         # don't pop up each figure interactively
+    show_plots=False,                        # don't pop up each figure interactively
     save_movie_path=f"{outdir}/first_order_batches.gif",  # final movie
-    movie_fps=2,                              # frames per second
+    movie_fps=2,                             # frames per second
     movie_figsize=(8, 7),
-    enforce_consistent_order=True,            # keep label order fixed across batches
+    enforce_consistent_order=True,           # keep label order fixed across batches
 )
 
 print(f"Exported transition matrices for {len(results)} batches.")
@@ -442,6 +477,7 @@ for batch_label, info in results.items():
     print("CSV:", info["probs_csv"])
     print(info["probs"].head())  # peek at transition probability table
     break  # just show the first batch
+
 
 
 """
