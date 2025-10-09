@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-# set_hour_and_batch_TTE.py
+# tte_set_hour_and_batch.py
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -686,9 +687,9 @@ if __name__ == "__main__":
 
 
 """
-import importlib, set_hour_and_batch_TTE as mod
+import importlib, tte_set_hour_and_batch as mod
 importlib.reload(mod)
-from set_hour_and_batch_TTE import run_set_hour_and_batch_TTE, summarize_tte_selection_or_raise
+from tte_set_hour_and_batch import run_set_hour_and_batch_TTE, summarize_tte_selection_or_raise
 
 
 decoded = "/Users/mirandahulsey-vincent/Desktop/USA1234_VALIDATION_Data/USA1234_decoded_database.json"
