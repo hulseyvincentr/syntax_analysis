@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Optional, Tuple, Union, List
+import re
 
 import numpy as np
 import pandas as pd
@@ -12,24 +13,38 @@ import seaborn as sns
 __all__ = ["plot_log_scaled_syllable_counts", "build_daily_avg_count_table"]
 
 # ───────────────────────────────────────────────────────────────────────────────
-# Organizer import preference order
+# Organizer import preference order (Excel-serial builder first)
 # ───────────────────────────────────────────────────────────────────────────────
-_ORG_MODE = "segments"
+_ORG_MODE = "serialTS"
 
 try:
-    from organize_decoded_with_segments import (
+    from organized_decoded_serialTS_segments import (
         build_organized_segments_with_durations as _build_organized,
     )
-    _ORG_MODE = "segments"
+    _ORG_MODE = "serialTS"
 except ImportError:
     try:
-        from organize_decoded_dataset import build_organized_dataset as _build_organized  # type: ignore
-        _ORG_MODE = "legacy"
-    except ImportError:
-        from organize_decoded_with_durations import (  # type: ignore
-            build_organized_dataset_with_durations as _build_organized,
+        from organize_decoded_serialTS_segments import (
+            build_organized_segments_with_durations as _build_organized,
         )
-        _ORG_MODE = "durations"
+        _ORG_MODE = "serialTS"
+    except ImportError:
+        try:
+            from organize_decoded_with_segments import (
+                build_organized_segments_with_durations as _build_organized,  # type: ignore
+            )
+            _ORG_MODE = "segments"
+        except ImportError:
+            try:
+                from organize_decoded_dataset import (
+                    build_organized_dataset as _build_organized,  # type: ignore
+                )
+                _ORG_MODE = "legacy"
+            except ImportError:
+                from organize_decoded_with_durations import (  # type: ignore
+                    build_organized_dataset_with_durations as _build_organized,
+                )
+                _ORG_MODE = "durations"
 
 
 # ───────────────────────────────────────────────────────────────────────────────
@@ -41,6 +56,35 @@ def _numeric_aware_key(x):
         return (0, int(s), s)
     except Exception:
         return (1, s.lower(), s)
+
+
+def _infer_animal_id(organized_df: pd.DataFrame, decoded_path: Union[str, Path] | None = None) -> Optional[str]:
+    """
+    Best-effort animal_id inference:
+      1) Single unique value in 'Animal ID' column (string) → return it
+      2) Regex on decoded filename: r'(USA\\d+)'  → return first match
+      3) Token before '_decoded_database' in filename → return it
+      4) Fallback: None
+    """
+    # 1) From dataframe
+    if "Animal ID" in organized_df.columns:
+        ids = [x for x in organized_df["Animal ID"].dropna().unique().tolist() if isinstance(x, str)]
+        if len(ids) == 1:
+            return ids[0]
+
+    # 2/3) From decoded path
+    if decoded_path is not None:
+        name = Path(decoded_path).name
+        # Prefer explicit USA#### pattern
+        m = re.search(r"(USA\d+)", name, flags=re.IGNORECASE)
+        if m:
+            return m.group(1)
+        # Token immediately before '_decoded_database'
+        m2 = re.search(r"([^_/]+)_decoded_database", name)
+        if m2:
+            return m2.group(1)
+
+    return None
 
 
 # ───────────────────────────────────────────────────────────────────────────────
@@ -99,8 +143,8 @@ def plot_log_scaled_syllable_counts(
     ax.set_xlabel("Date")
     ax.set_ylabel("Syllable Label")
 
-    if animal_id:
-        ax.set_title(f"{animal_id} Daily Avg Occurrence of Each Syllable ($\\log_{{10}}$ Scale)")
+    title_id = animal_id or "unknown_animal"
+    ax.set_title(f"{title_id} Daily Avg Occurrence of Each Syllable ($\\log_{{10}}$ Scale)")
 
     if mark_treatment and treatment_date is not None:
         try:
@@ -187,39 +231,44 @@ def build_daily_avg_count_table(
 
 
 # ───────────────────────────────────────────────────────────────────────────────
-# Example CLI
+# Example CLI (uses Excel-serial organizer; accepts --output-dir and auto filename)
 # ───────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import argparse
-    import json
 
     p = argparse.ArgumentParser(
-        description="Build daily avg syllable-count heatmap (log10) from decoded dataset."
+        description="Build daily avg syllable-count heatmap (log10) from decoded dataset (Excel-serial timestamps)."
     )
     p.add_argument("decoded_database_json", type=str, help="Path to *_decoded_database.json")
-    p.add_argument("creation_metadata_json", type=str, help="Path to *_creation_data.json")
-    p.add_argument("--save", type=str, default="", help="Optional path to save the figure (e.g., figures/heatmap.png)")
+    p.add_argument("--output-dir", type=str, default=None,
+                   help="Directory to save the figure. Default: the decoded JSON's parent directory.")
     p.add_argument("--no-show", action="store_true", help="Do not display the plot window")
     p.add_argument("--nearest-line", action="store_true", help="Mark nearest date to treatment (within 1 day)")
+    p.add_argument("--treatment-date", type=str, default=None, help="Optional treatment date (e.g., 2025-03-04)")
+    p.add_argument("--only-song-present", action="store_true", help="Filter to rows with song_present == True")
+    p.add_argument("--pseudocount", type=float, default=1e-3, help="Pseudocount added before log10")
     args = p.parse_args()
 
-    if _ORG_MODE == "segments":
+    decoded_path = Path(args.decoded_database_json)
+
+    # Build organized outputs using the preferred Excel-serial builder
+    if _ORG_MODE in {"serialTS", "segments"}:
         out = _build_organized(
             decoded_database_json=args.decoded_database_json,
-            creation_metadata_json=args.creation_metadata_json,
-            only_song_present=False,
+            creation_metadata_json=None,
+            only_song_present=args.only_song_present,
             compute_durations=False,
             add_recording_datetime=True,
         )
     elif _ORG_MODE == "durations":
         out = _build_organized(
             decoded_database_json=args.decoded_database_json,
-            creation_metadata_json=args.creation_metadata_json,
-            only_song_present=False,
+            creation_metadata_json=None,
+            only_song_present=args.only_song_present,
             compute_durations=False,
         )
     else:
-        out = _build_organized(args.decoded_database_json, args.creation_metadata_json, verbose=True)
+        out = _build_organized(args.decoded_database_json, None)
 
     organized_df = out.organized_df
 
@@ -231,43 +280,67 @@ if __name__ == "__main__":
         sort_labels_numerically=True,
     )
 
-    animal_id = None
-    if "Animal ID" in organized_df.columns:
-        ids = [x for x in organized_df["Animal ID"].dropna().unique().tolist() if isinstance(x, str)]
-        if len(ids) == 1:
-            animal_id = ids[0]
+    # Infer animal_id and construct auto filename
+    animal_id = _infer_animal_id(organized_df, decoded_path) or "unknown_animal"
 
-    treatment_date = getattr(out, "treatment_date", None)
-    if treatment_date is None:
-        try:
-            with open(args.creation_metadata_json, "r") as f:
-                meta = json.load(f)
-            treatment_date = meta.get("treatment_date", None)
-        except Exception:
-            treatment_date = None
+    output_dir = Path(args.output_dir) if args.output_dir else decoded_path.parent
+    output_dir.mkdir(parents=True, exist_ok=True)
+    save_path = output_dir / f"{animal_id}_syllable_heatmap.png"
 
     _ = plot_log_scaled_syllable_counts(
         count_table,
         animal_id=animal_id,
-        treatment_date=treatment_date,
+        treatment_date=args.treatment_date,
         show=not args.no_show,
-        save_path=(args.save or None),
+        save_path=save_path,
         sort_dates=True,
         nearest_match=args.nearest_line,
         max_days_off=1,
         cmap="Greys",
         sort_rows_numerically=True,
+        pseudocount=args.pseudocount,
     )
 
 
+
 """
-from organize_decoded_dataset import build_organized_dataset
-from syllable_heatmap import build_daily_avg_count_table, plot_log_scaled_syllable_counts
+from organized_decoded_serialTS_segments import build_organized_segments_with_durations
+from syllable_heatmap import build_daily_avg_count_table, plot_log_scaled_syllable_counts, _infer_animal_id
+from pathlib import Path
 
-decoded = "/Users/mirandahulsey-vincent/Desktop/SfN_data/USA5323/TweetyBERT_Pretrain_LLB_AreaX_FallSong_USA5323_decoded_database.json"
-meta = "/Users/mirandahulsey-vincent/Desktop/SfN_data/USA5323/USA5323_metadata.json"
+decoded = Path("/Users/mirandahulsey-vincent/Desktop/AreaX_lesion_2025/R08_RC6_Comp2_decoded_database.json")
+
+# where to save the figure
+outdir = decoded.parent / "figures"
+outdir.mkdir(parents=True, exist_ok=True)
+
+out = build_organized_segments_with_durations(
+    decoded_database_json=decoded,
+    only_song_present=True,
+    compute_durations=False,
+    add_recording_datetime=True,
+)
+
+count_table = build_daily_avg_count_table(
+    out.organized_df,
+    label_column="syllable_onsets_offsets_ms_dict",
+    date_column="Date",
+    syllable_labels=out.unique_syllable_labels,
+)
+
+animal_id = _infer_animal_id(out.organized_df, decoded) or "unknown_animal"
+save_path = outdir / f"{animal_id}_syllable_heatmap.png"
+
+fig, ax = plot_log_scaled_syllable_counts(
+    count_table,
+    animal_id=animal_id,
+    treatment_date="2025-05-22",  # optional
+    save_path=save_path,
+    show=True,
+)
+
+print("Saved to:", save_path)
 
 
-out = build_organized_dataset(decoded, meta, verbose=True)
-df  = out.organized_df
+
 """
