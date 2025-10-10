@@ -311,8 +311,8 @@ Example usage:
 
 from graph_phrase_duration_over_days import graph_phrase_duration_over_days
 
-decoded = "/Users/mirandahulsey-vincent/Desktop/AreaX_lesion_2025/USA5506_RC1_Comp2_decoded_database.json"
-outdir  = "/Users/mirandahulsey-vincent/Desktop/AreaX_lesion_2025/USA5506"
+decoded = "/Users/mirandahulsey-vincent/Desktop/AreaX_lesion_2025/R08_RC6_Comp2_decoded_database.json"
+outdir  = "/Users/mirandahulsey-vincent/Desktop/AreaX_lesion_2025/R08"
 
 # Option A: provide a treatment_date explicitly (preferred)
 out = graph_phrase_duration_over_days(
