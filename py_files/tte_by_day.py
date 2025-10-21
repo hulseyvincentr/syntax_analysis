@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# Optional SciPy for stats
+# Optional SciPy for stats (kept for future extensions; not used in 3-group plot)
 try:
     from scipy import stats as _scipy_stats  # type: ignore
     _HAVE_SCIPY = True
@@ -220,6 +220,16 @@ def _per_file_ttes(subdf: pd.DataFrame, syllable_types: List[str]) -> List[float
         vals.append(_total_transition_entropy(counts_mat, syllable_types, ent_by))
     return vals
 
+def _tte_from_freq(freq: Dict[Tuple[str, str], int], syllable_types: List[str]) -> float:
+    """Compute TTE for a single file/segment given its transition_frequencies dict."""
+    if not freq:
+        return 0.0
+    tr_list = list(freq.keys())
+    tr_counts = list(freq.values())
+    norm_mat, counts_mat = _generate_normalized_transition_matrix(tr_list, tr_counts, syllable_types)
+    ent_by = _transition_entropy_per_row(norm_mat, syllable_types)
+    return _total_transition_entropy(counts_mat, syllable_types, ent_by)
+
 def _mean_sem(x: List[float]) -> Tuple[float, Optional[float], int]:
     n = len(x)
     if n == 0:
@@ -231,16 +241,12 @@ def _mean_sem(x: List[float]) -> Tuple[float, Optional[float], int]:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Stats helpers
+# Stats helpers (kept; not used in the new 3-group figure by default)
 # ──────────────────────────────────────────────────────────────────────────────
 def _p_to_stars(p: float) -> str:
     return "***" if p < 1e-3 else ("**" if p < 1e-2 else ("*" if p < 0.05 else "ns"))
 
 def _prepost_pvalue(pre_vals: List[float], post_vals: List[float]) -> Tuple[Optional[float], str]:
-    """
-    Returns (p_value, method). Uses Mann–Whitney U if SciPy is available, else a permutation
-    test on mean difference (two-sided). Returns (None, 'insufficient') if either group is empty.
-    """
     pre = np.asarray(pre_vals, dtype=float)
     post = np.asarray(post_vals, dtype=float)
     if pre.size == 0 or post.size == 0:
@@ -253,7 +259,6 @@ def _prepost_pvalue(pre_vals: List[float], post_vals: List[float]) -> Tuple[Opti
         except Exception:
             pass
 
-    # permutation fallback (two-sided on mean difference)
     rng = np.random.default_rng(0)
     pooled = np.concatenate([pre, post])
     n1 = pre.size
@@ -332,7 +337,7 @@ def _build_per_file_table(organized_df: pd.DataFrame) -> pd.DataFrame:
 class TTEByDayResult:
     results_df: pd.DataFrame
     figure_path_timecourse: Optional[Path]
-    figure_path_prepost_box: Optional[Path]
+    figure_path_prepost_box: Optional[Path]  # now points to the 3-group matched plot when treatment_date is given
     prepost_p_value: Optional[float]
     prepost_test: Optional[str]
 
@@ -354,7 +359,9 @@ def TTE_by_day(
     """
     Compute aggregated TTE per day and render:
       (1) a time-course line plot (optional treatment date vertical line),
-      (2) a Pre vs Post boxplot with jittered points and a significance annotation if treatment_date is given.
+      (2) a Balanced 3-group per-song plot (Early-Pre, Late-Pre, Post) if treatment_date is given:
+          n = min(floor(#pre_songs/2), #post_songs).
+          Use last 2n pre songs (split into halves) and first n post songs.
     """
     decoded_path = Path(decoded_database_json)
     metadata_path = Path(creation_metadata_json) if creation_metadata_json else None
@@ -462,94 +469,103 @@ def TTE_by_day(
         plt.close(fig)
 
     # ──────────────────────────────────────────────────────────────────────────
-    # Figure 2: Pre vs Post distribution with significance annotation
+    # Figure 2 (reworked): Balanced 3-group per-song plot (Early-Pre, Late-Pre, Post)
     # ──────────────────────────────────────────────────────────────────────────
     fig_path_prepost_box: Optional[Path] = None
     p_val: Optional[float] = None
     p_method: Optional[str] = None
 
     if tx_date is not None:
-        dseries = results_df["day"].dt.date
+        # Build per-file TTE column once for selection/plotting
+        pf_sorted = pf.sort_values(["date_time", *(c for c in ["Segment", "segment", "file_name"] if c in pf.columns)])
+        pf_sorted = pf_sorted.assign(
+            file_TTE=pf_sorted["transition_frequencies"].apply(lambda d: _tte_from_freq(d, syllable_types))
+        )
+
+        # Define pre/post masks per treatment_in policy
+        dts = pf_sorted["date_time"]
+        t0 = pd.Timestamp(tx_date)
         if treatment_in.lower() == "pre":
-            pre_mask  = dseries <= tx_date.date()
-            post_mask = dseries >  tx_date.date()
+            pre_mask  = dts.dt.date <= t0.date()
+            post_mask = dts.dt.date >  t0.date()
         elif treatment_in.lower() == "exclude":
-            pre_mask  = dseries <  tx_date.date()
-            post_mask = dseries >  tx_date.date()
-        else:  # default: "post"
-            pre_mask  = dseries <  tx_date.date()
-            post_mask = dseries >= tx_date.date()
+            pre_mask  = dts.dt.date <  t0.date()
+            post_mask = dts.dt.date >  t0.date()
+        else:  # "post" includes the treatment day in post
+            pre_mask  = dts.dt.date <  t0.date()
+            post_mask = dts.dt.date >= t0.date()
 
-        pre_vals  = results_df.loc[pre_mask,  "agg_TTE"].astype(float).tolist()
-        post_vals = results_df.loc[post_mask, "agg_TTE"].astype(float).tolist()
+        pre_df  = pf_sorted.loc[pre_mask].copy()
+        post_df = pf_sorted.loc[post_mask].copy()
 
-        if len(pre_vals) + len(post_vals) > 0:
-            fig2, ax2 = plt.subplots(figsize=(7, 5))
+        # Sort within groups by time (ascending)
+        pre_df  = pre_df.sort_values("date_time")
+        post_df = post_df.sort_values("date_time")
 
-            data = []
-            labels = []
-            positions = []
-            if pre_vals:
-                data.append(pre_vals); labels.append(f"Pre (n={len(pre_vals)})"); positions.append(1)
-            if post_vals:
-                data.append(post_vals); labels.append(f"Post (n={len(post_vals)})"); positions.append(2 if pre_vals else 1)
+        # n = min(floor(#pre/2), #post)
+        n_pre   = len(pre_df)
+        n_post  = len(post_df)
+        n = min(n_pre // 2, n_post)
 
-            bp = ax2.boxplot(data, positions=positions, widths=0.5, showfliers=False,
-                             patch_artist=True, medianprops=dict(linewidth=2))
+        if n <= 0:
+            print("Balanced 3-group plot skipped: not enough songs to balance (need at least 1 in post and 2 in pre).")
+        else:
+            # Take last 2n pre songs → split into halves
+            pre_last_2n = pre_df.tail(2 * n).reset_index(drop=True)
+            early_pre_n = pre_last_2n.iloc[:n]   # older half of the last 2n
+            late_pre_n  = pre_last_2n.iloc[n:]   # newer half of the last 2n
+
+            # First n post songs
+            post_first_n = post_df.head(n).reset_index(drop=True)
+
+            # Grab per-song TTE lists
+            vals_early = early_pre_n["file_TTE"].astype(float).tolist()
+            vals_late  = late_pre_n["file_TTE"].astype(float).tolist()
+            vals_post  = post_first_n["file_TTE"].astype(float).tolist()
+
+            # Make 3-group box + jitter
+            fig3, ax3 = plt.subplots(figsize=(8, 5))
+            data = [vals_early, vals_late, vals_post]
+            labels = [f"Early Pre (n={n})", f"Late Pre (n={n})", f"Post (n={n})"]
+            positions = [1, 2, 3]
+
+            bp = ax3.boxplot(
+                data, positions=positions, widths=0.6, showfliers=False,
+                patch_artist=True, medianprops=dict(linewidth=2)
+            )
             for patch in bp["boxes"]:
                 patch.set_alpha(0.25)
 
             rng = np.random.default_rng(0)
-            if pre_vals:
-                x = np.full(len(pre_vals), positions[0]) + rng.uniform(-0.08, 0.08, size=len(pre_vals))
-                ax2.scatter(x, pre_vals, s=20, alpha=0.8)
-            if post_vals:
-                pos = positions[-1]
-                vals = post_vals
+            for pos, vals in zip(positions, data):
+                if not vals:
+                    continue
                 x = np.full(len(vals), pos) + rng.uniform(-0.08, 0.08, size=len(vals))
-                ax2.scatter(x, vals, s=20, alpha=0.8)
+                ax3.scatter(x, vals, s=22, alpha=0.9)
 
-            ax2.set_xticks(positions)
-            ax2.set_xticklabels(labels, rotation=0)
-            ax2.set_ylabel("Per-day Aggregated TTE (bits)")
-            ax2.set_title(f"{animal_id} – Pre vs Post (per-day aggregated TTE)")
+            ax3.set_xticks(positions)
+            ax3.set_xticklabels(labels)
+            ax3.set_ylabel("Per-song Total Transition Entropy (bits)")
+            ax3.set_title(f"{animal_id} – Balanced per-song TTE (Early/Late Pre vs Post)")
 
-            ax2.grid(False)
+            ax3.grid(False)
             for side in ("top", "right"):
-                ax2.spines[side].set_visible(False)
-            ax2.tick_params(top=False, right=False)
+                ax3.spines[side].set_visible(False)
+            ax3.tick_params(top=False, right=False)
 
-            # significance test and annotation (only if both groups present)
-            if pre_vals and post_vals:
-                p_val, p_method = _prepost_pvalue(pre_vals, post_vals)
-                if p_val is not None:
-                    stars = _p_to_stars(p_val)
-                    y_min, y_max = ax2.get_ylim()
-                    y_pad = 0.05 * (y_max - y_min)
-                    y_bracket = (max(max(pre_vals), max(post_vals)) if (pre_vals and post_vals) else y_max) + y_pad
-                    x1 = positions[0]
-                    x2 = positions[-1]
-                    # bracket
-                    ax2.plot([x1, x1, x2, x2],
-                             [y_bracket, y_bracket + y_pad*0.4, y_bracket + y_pad*0.4, y_bracket],
-                             lw=1.2)
-                    ax2.text((x1 + x2)/2, y_bracket + y_pad*0.45,
-                             f"{stars}   p={p_val:.3g}",
-                             ha="center", va="bottom", fontsize=10)
-
-            fig2.tight_layout()
-            fig_path_prepost_box = fig_dir / f"{animal_id}_TTE_pre_vs_post_box.png"
-            fig2.savefig(fig_path_prepost_box, dpi=200)
+            fig3.tight_layout()
+            fig_path_prepost_box = fig_dir / f"{animal_id}_TTE_pre_vs_post_balanced_3group_box.png"
+            fig3.savefig(fig_path_prepost_box, dpi=200)
             if show:
                 plt.show()
             else:
-                plt.close(fig2)
+                plt.close(fig3)
 
     return TTEByDayResult(
         results_df=results_df,
         figure_path_timecourse=fig_path_timecourse,
-        figure_path_prepost_box=fig_path_prepost_box,
-        prepost_p_value=p_val,
+        figure_path_prepost_box=fig_path_prepost_box,  # now 3-group balanced plot (if treatment_date provided)
+        prepost_p_value=p_val,   # unchanged; 3-group plot does not compute stats by default
         prepost_test=p_method,
     )
 
@@ -559,7 +575,12 @@ def TTE_by_day(
 # ──────────────────────────────────────────────────────────────────────────────
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Compute aggregated TTE per day and plot (time-course; optional Pre/Post boxplot with stats)."
+        description=(
+            "Compute aggregated TTE per day and plot:\n"
+            " - Time-course by day\n"
+            " - Balanced 3-group per-song plot if treatment_date is given "
+            "(Early-Pre, Late-Pre, Post) with n = min(floor(#pre/2), #post)."
+        )
     )
     p.add_argument("--decoded", required=True, help="Path to decoded_database.json")
     p.add_argument("--meta", default=None,
@@ -572,7 +593,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--treatment_date", default=None,
                    help="Optional treatment date: 'YYYY-MM-DD' (also accepts 'YYYY.MM.DD')")
     p.add_argument("--treatment_in", default="post", choices=["post", "pre", "exclude"],
-                   help="Which side includes the treatment day (default: post)")
+                   help="Which side includes the treatment day for pre/post split (default: post)")
     p.add_argument("--no_show", action="store_true", help="Do not display plot windows")
     return p
 
@@ -596,7 +617,7 @@ def main():
     if res.figure_path_timecourse:
         print(f"Time-course plot → {res.figure_path_timecourse}")
     if res.figure_path_prepost_box:
-        print(f"Pre/Post box plot → {res.figure_path_prepost_box}")
+        print(f"Balanced 3-group plot → {res.figure_path_prepost_box}")
     if res.prepost_p_value is not None:
         print(f"Pre vs Post: p={res.prepost_p_value:.3g} ({res.prepost_test})")
 
