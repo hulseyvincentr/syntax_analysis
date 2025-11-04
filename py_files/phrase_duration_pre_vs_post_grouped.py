@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import math
 import json
@@ -44,16 +44,18 @@ plt.rcParams.update({
 })
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Organizer import
+# Organizer import (prefer YOUR file name)
 # ──────────────────────────────────────────────────────────────────────────────
 _ORGANIZE = None
 try:
-    from organized_decoded_serialTS_segments import (
-        build_organized_segments_with_durations as _ORGANIZE  # type: ignore
+    # Your module/file:
+    from organize_decoded_serialTS_segments import (  # type: ignore
+        build_organized_segments_with_durations as _ORGANIZE
     )
 except Exception:
-    from organize_decoded_serialTS_segments import (
-        build_organized_segments_with_durations as _ORGANIZE  # type: ignore
+    # Fallback alternate filename:
+    from organized_decoded_serialTS_segments import (  # type: ignore
+        build_organized_segments_with_durations as _ORGANIZE
     )
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -82,7 +84,7 @@ class GroupedPlotsResult:
 # ──────────────────────────────────────────────────────────────────────────────
 # Utilities: dates, parsing, table building
 # ──────────────────────────────────────────────────────────────────────────────
-def _parse_date_like(s: str | pd.Timestamp | None) -> pd.Timestamp | pd.NaT:
+def _parse_date_like(s: Union[str, pd.Timestamp, None]) -> Union[pd.Timestamp, pd.NaT]:
     if s is None:
         return pd.NaT
     if isinstance(s, pd.Timestamp):
@@ -91,6 +93,7 @@ def _parse_date_like(s: str | pd.Timestamp | None) -> pd.Timestamp | pd.NaT:
     return pd.to_datetime(s2, errors="coerce")
 
 def _choose_datetime_series(df: pd.DataFrame) -> pd.Series:
+    # Prefer your organizer’s column
     dt = df.get("Recording DateTime", pd.Series([pd.NaT]*len(df), index=df.index)).copy()
     if "creation_date" in df.columns:
         need = dt.isna()
@@ -131,7 +134,7 @@ def _maybe_parse_dict(obj):
     return None
 
 def _row_ms_per_bin(row: pd.Series) -> float | None:
-    for k in ["time_bin_ms", "bin_ms", "ms_per_bin"]:
+    for k in ["time_bin_ms", "timebin_ms", "bin_ms", "ms_per_bin"]:
         if k in row and pd.notna(row[k]):
             try:
                 return float(row[k])
@@ -139,16 +142,38 @@ def _row_ms_per_bin(row: pd.Series) -> float | None:
                 pass
     return None
 
-def _extract_durations_from_spans(spans, ms_per_bin: float | None) -> List[float]:
+def _is_timebin_col(colname: str) -> bool:
+    c = (colname or "").lower()
+    return "timebin" in c or c.endswith("_bins") or "bin" in c
+
+def _extract_durations_from_spans(spans, *, ms_per_bin: float | None, treat_as_bins: bool) -> List[float]:
+    """
+    Accepts:
+      • [[on, off], ...]
+      • [on, off]  (single flat pair)
+      • [{"onset_ms":..., "offset_ms":...}, ...]
+      • [{"onset_bin":..., "offset_bin":...}, ...]
+    Converts from bins→ms if treat_as_bins and ms_per_bin is provided.
+    """
     out: List[float] = []
     if spans is None:
         return out
+
+    # If it's a single flat pair [on, off], wrap it
+    if isinstance(spans, (list, tuple)) and len(spans) == 2 and all(isinstance(x, (int, float)) for x in spans):
+        spans = [spans]
+
+    # If it's a dict describing one interval, wrap it
     if isinstance(spans, dict):
         spans = [spans]
+
     if not isinstance(spans, (list, tuple)):
         return out
+
     for item in spans:
-        on = off = None; using_bins = False
+        on = off = None
+        using_bins = False
+
         if isinstance(item, dict):
             if "onset_ms" in item or "on" in item:
                 on = item.get("onset_ms", item.get("on"))
@@ -157,57 +182,66 @@ def _extract_durations_from_spans(spans, ms_per_bin: float | None) -> List[float
                 on = item.get("onset_bin", item.get("on_bin"))
                 off = item.get("offset_bin", item.get("off_bin"))
                 using_bins = True
+
         elif isinstance(item, (list, tuple)) and len(item) >= 2:
             on, off = item[:2]
+            using_bins = False  # unless treat_as_bins tells us otherwise
+
+        # Convert to duration
         try:
             dur = float(off) - float(on)
-            if using_bins and ms_per_bin:
-                dur *= float(ms_per_bin)
-            if dur >= 0:
-                out.append(dur)
+            if dur < 0:
+                continue
+            if treat_as_bins or using_bins:
+                if ms_per_bin:
+                    dur *= float(ms_per_bin)
+                else:
+                    # No conversion available; skip to avoid mixing units
+                    continue
+            out.append(dur)
         except Exception:
             continue
+
     return out
 
 def _collect_phrase_durations_per_song(row: pd.Series, spans_col: str) -> Dict[str, List[float]]:
-    out = {}
+    out: Dict[str, List[float]] = {}
     raw = row.get(spans_col, None)
     if raw is None or (isinstance(raw, float) and math.isnan(raw)):
         return out
-    if spans_col == "phrase_durations_ms_dict":
-        d = _maybe_parse_dict(raw)
-        if isinstance(d, dict):
-            for lbl, vals in d.items():
-                if isinstance(vals, (list, tuple)):
-                    clean = [float(v) for v in vals if isinstance(v, (int, float)) and v >= 0]
-                    if clean:
-                        out[str(lbl)] = clean
-        return out
-    d = _maybe_parse_dict(raw)
+
+    # If the column is already a dict of label -> intervals
+    d = _maybe_parse_dict(raw) if not isinstance(raw, dict) else raw
     if not isinstance(d, dict):
         return out
+
     mpb = _row_ms_per_bin(row)
+    treat_as_bins = _is_timebin_col(spans_col)
+
     for lbl, spans in d.items():
-        vals = _extract_durations_from_spans(spans, mpb)
+        vals = _extract_durations_from_spans(spans, ms_per_bin=mpb, treat_as_bins=treat_as_bins)
         if vals:
             out[str(lbl)] = vals
     return out
 
 def _find_best_spans_column(df: pd.DataFrame) -> str | None:
+    # Prefer ms, then timebins, then anything *_dict-like
     for c in [
         "syllable_onsets_offsets_ms_dict",
-        "syllable_onsets_offsets_dict",
+        "syllable_onsets_offsets_ms",
         "onsets_offsets_ms_dict",
-        "phrase_durations_ms_dict",
+    ]:
+        if c in df.columns:
+            return c
+    for c in [
+        "syllable_onsets_offsets_timebins",
+        "syllable_onsets_offsets_timebins_dict",
     ]:
         if c in df.columns:
             return c
     for c in df.columns:
         lc = c.lower()
-        if ("onset" in lc or "start" in lc) and ("offset" in lc or "stop" in lc):
-            return c
-    for c in df.columns:
-        if c.endswith("_dict") and df[c].notna().any():
+        if lc.endswith("_dict") and df[c].notna().any():
             return c
     return None
 
@@ -215,59 +249,67 @@ def _build_durations_table(df: pd.DataFrame, labels: Sequence[str]) -> tuple[pd.
     col = _find_best_spans_column(df)
     if col is None:
         return df.copy(), None
+
     per_song = df.apply(lambda r: _collect_phrase_durations_per_song(r, col), axis=1)
     out = df.copy()
-    for lbl in labels:
+    for lbl in labels:  # labels are strings
         out[f"syllable_{lbl}_durations"] = per_song.apply(lambda d: d.get(str(lbl), []))
     return out, col
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Label handling + plotting helpers (fixed x-order, labels as strings)
+# ──────────────────────────────────────────────────────────────────────────────
 def _explode_for_plot(dataset: pd.DataFrame, labels: Sequence[str]) -> pd.DataFrame:
+    """
+    Tall DF: ['Syllable','Phrase Duration (ms)'] with Syllable categorical set to full order.
+    """
+    order = [str(x) for x in labels]
     parts = []
-    for lbl in labels:
+
+    for lbl in order:
         col = f"syllable_{lbl}_durations"
         if col not in dataset.columns:
+            parts.append(pd.DataFrame({"Syllable": [lbl], "Phrase Duration (ms)": [np.nan]}))
             continue
-        e = dataset[[col]].explode(col).dropna()
+
+        e = dataset[[col]].explode(col)
         if e.empty:
+            parts.append(pd.DataFrame({"Syllable": [lbl], "Phrase Duration (ms)": [np.nan]}))
             continue
+
         e["Phrase Duration (ms)"] = pd.to_numeric(e[col], errors="coerce")
-        e = e.dropna()
+        e = e.dropna(subset=["Phrase Duration (ms)"])
         if e.empty:
+            parts.append(pd.DataFrame({"Syllable": [lbl], "Phrase Duration (ms)": [np.nan]}))
             continue
-        try:
-            s_val = int(lbl)
-        except Exception:
-            s_val = lbl
-        e["Syllable"] = s_val
+
+        e["Syllable"] = lbl
         parts.append(e[["Syllable", "Phrase Duration (ms)"]])
-    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=["Syllable", "Phrase Duration (ms)"])
 
-def _calc_global_ylim(datasets, labels):
-    vals = []
-    for ds in datasets:
-        t = _explode_for_plot(ds, labels)
-        if not t.empty:
-            vals.extend(t["Phrase Duration (ms)"].to_list())
-    if not vals:
-        return (0.0, 1.0)
-    return (float(np.nanmin(vals)), float(np.nanmax(vals)))
+    tall = pd.concat(parts, ignore_index=True)
+    tall["Syllable"] = pd.Categorical(tall["Syllable"], categories=order, ordered=True)
+    return tall
 
-# seaborn violin back-compat
 def _violin_kwargs():
     params = inspect.signature(sns.violinplot).parameters
     if "density_norm" in params:   # seaborn >= 0.13
         return dict(inner="quartile", density_norm="width", color="lightgray")
     return dict(inner="quartile", scale="width", color="lightgray")
 
-# plotting helpers
-def _violin_plus_strip(ax, tall_df, y_limits):
+def _violin_plus_strip(ax, tall_df, y_limits, order: Sequence[str]):
     sns.set(style="white")
     if tall_df.empty:
         ax.text(0.5, 0.5, "No phrase durations", ha="center", va="center", fontsize=TITLE_FS-2)
         _pretty_axes(ax); ax.set_axis_off(); return
-    sns.violinplot(x="Syllable", y="Phrase Duration (ms)", data=tall_df, ax=ax, **_violin_kwargs())
-    sns.stripplot(x="Syllable", y="Phrase Duration (ms)", data=tall_df,
-                  jitter=True, size=5, color="#2E4845", alpha=0.6, ax=ax)
+    sns.violinplot(
+        x="Syllable", y="Phrase Duration (ms)",
+        data=tall_df, order=order, **_violin_kwargs(), ax=ax
+    )
+    sns.stripplot(
+        x="Syllable", y="Phrase Duration (ms)",
+        data=tall_df, order=order,
+        jitter=True, size=5, color="#2E4845", alpha=0.6, ax=ax
+    )
     ax.set_ylim(y_limits)
     ax.set_xlabel("Syllable Label")
     ax.set_ylabel("Phrase Duration (ms)")
@@ -394,6 +436,17 @@ def _stars(p: float) -> str:
 def _fmt_p(p: float) -> str:
     return f"{p:.2e}" if p < 0.001 else f"{p:.3f}"
 
+def _calc_global_ylim(datasets, labels):
+    vals = []
+    for ds in datasets:
+        t = _explode_for_plot(ds, labels)
+        if not t.empty:
+            vv = pd.to_numeric(t["Phrase Duration (ms)"], errors="coerce").dropna().to_list()
+            vals.extend(vv)
+    if not vals:
+        return (0.0, 1.0)
+    return (float(np.nanmin(vals)), float(np.nanmax(vals)))
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Main function
 # ──────────────────────────────────────────────────────────────────────────────
@@ -407,16 +460,22 @@ def run_phrase_duration_pre_vs_post_grouped(
     decoded_path = Path(decoded_database_json)
     output_dir = Path(output_dir); output_dir.mkdir(parents=True, exist_ok=True)
 
-    out = _ORGANIZE(decoded_database_json=decoded_path,
-                    only_song_present=only_song_present,
-                    compute_durations=False, add_recording_datetime=True)
+    # IMPORTANT: Call YOUR organizer (compute_durations=False so we use robust parser here)
+    out = _ORGANIZE(
+        decoded_database_json=decoded_path,
+        only_song_present=only_song_present,
+        compute_durations=False,          # we’ll compute robustly (handles flat pairs & bins)
+        add_recording_datetime=True
+    )
     df = out.organized_df.copy()
     if only_song_present and "song_present" in df.columns:
         df = df[df["song_present"] == True].copy()
 
+    # Datetime + sort
     dt = _choose_datetime_series(df)
     df = df.assign(_dt=dt).dropna(subset=["_dt"]).sort_values("_dt").reset_index(drop=True)
 
+    # Labels as STRINGS, using your organizer’s discovered labels unless user restricts
     labels = [str(x) for x in (restrict_to_labels or out.unique_syllable_labels)]
     df, spans_col = _build_durations_table(df, labels)
     print("[INFO] Using spans column:", spans_col)
@@ -454,11 +513,11 @@ def run_phrase_duration_pre_vs_post_grouped(
         y_max = float(y_max_ms)
     animal_id = _infer_animal_id(df, decoded_path)
 
-    # — per-group violin+scatter
+    # — per-group violin+scatter (fixed x-order)
     def _make_plot(ds, title, n, fname):
         tall = _explode_for_plot(ds, labels)
         fig, ax = plt.subplots(figsize=(12, 6))
-        _violin_plus_strip(ax, tall, (y_min, y_max))
+        _violin_plus_strip(ax, tall, (y_min, y_max), labels)
         ax.set_title(f"{animal_id} — {title} (N={n})", fontsize=TITLE_FS)
         fig.tight_layout()
         outp = output_dir / f"{animal_id}_{fname}_phrase_durations.png"
@@ -632,7 +691,6 @@ def run_phrase_duration_pre_vs_post_grouped(
     # ──────────────────────────────────────────────────────────────────────────
     # Variance analyses (per-syllable)
     # ──────────────────────────────────────────────────────────────────────────
-    # Build variance per syllable for each group
     var_plot = None             # DISABLED: no per-syllable variance line plot
     var_boxscatter = None
     agg3_var_pts = None         # boxes + syllable points (ylim fixed to 2.0e7)
@@ -702,15 +760,14 @@ def run_phrase_duration_pre_vs_post_grouped(
         ax_g.set_title(f"{animal_id} — Early/Late Pre vs Post (variance: boxes + syllable points)", fontsize=TITLE_FS)
         _pretty_axes(ax_g, 0)
         ax_g.legend(title="Syllable", frameon=False, bbox_to_anchor=(1.02, 1), loc="upper left")
-        ax_g.set_ylim(0, 2.0e7)  # ← fixed per request (2.0 × 10^7)
+        ax_g.set_ylim(0, 2.0e7)  # fixed per request
         fig_g.tight_layout()
         agg3_var_pts = output_dir / f"{animal_id}_aggregate_three_group_variance_syllable_points.png"
         fig_g.savefig(agg3_var_pts, dpi=300, transparent=False)
         if show_plots: plt.show()
         else: plt.close(fig_g)
 
-        # 3) NEW: Three-group variance: boxes + jitter points + STATS (ylim fixed to 2.0e7)
-        #    Treat each syllable’s variance as one observation; compare distributions across groups.
+        # 3) NEW: Three-group variance: boxes + jitter + stats (ylim fixed to 2.0e7)
         fig_s, ax_s = plt.subplots(figsize=(10, 6))
         sns.set(style="white")
         sns.boxplot(
@@ -727,7 +784,7 @@ def run_phrase_duration_pre_vs_post_grouped(
         ax_s.set_ylabel("Variance of Phrase Duration (ms²)")
         ax_s.set_title(f"{animal_id} — Early/Late Pre vs Post (variance: boxes + jitter + stats)", fontsize=TITLE_FS)
         _pretty_axes(ax_s, 0)
-        ax_s.set_ylim(0, 2.0e7)  # ← fixed per request
+        ax_s.set_ylim(0, 2.0e7)  # fixed per request
 
         # Stats on variance distributions (one value per syllable per group)
         var_arrays = {g: df_var.loc[df_var["Group"] == g, "Variance (ms^2)"].to_numpy() for g in order}
@@ -765,10 +822,10 @@ def run_phrase_duration_pre_vs_post_grouped(
         aggregate_three_box_path=agg3,
         aggregate_three_box_auto_ylim_path=agg3_auto,
         aggregate_three_box_with_syll_points_path=agg3_pts,
-        per_syllable_variance_path=var_plot,                       # None (disabled)
+        per_syllable_variance_path=None,                       # None (disabled)
         per_syllable_variance_boxscatter_path=var_boxscatter,
         aggregate_three_box_variance_with_syll_points_path=agg3_var_pts,
-        aggregate_three_box_variance_with_stats_path=agg3_var_stats,  # NEW
+        aggregate_three_box_variance_with_stats_path=agg3_var_stats,
         syllable_labels=[str(x) for x in labels],
         y_limits=(y_min, y_max),
     )
@@ -812,49 +869,21 @@ if __name__ == "__main__":
     )
 
 """
-## Option 1: set batch sizes
+# Example (locks axis to 0..25)
 from phrase_duration_pre_vs_post_grouped import run_phrase_duration_pre_vs_post_grouped
 
-# Input paths
-decoded = "/Users/mirandahulsey-vincent/Desktop/AreaX_lesion_2025/R08_RC6_Comp2_decoded_database.json"
-outdir  = "/Users/mirandahulsey-vincent/Desktop/AreaX_lesion_2025/R08"
-tdate   = "2025-05-22"
+decoded = "/Users/mirandahulsey-vincent/Desktop/AreaX_lesion_2024/USA5283_decoded_database.json"
+outdir  = "/Users/mirandahulsey-vincent/Desktop/AreaX_lesion_2024/USA5283_figures"
+tdate   = "2024-03-05"
 
-# Run the grouped phrase duration analysis
 res = run_phrase_duration_pre_vs_post_grouped(
     decoded_database_json=decoded,
     output_dir=outdir,
     treatment_date=tdate,
-    grouping_mode="explicit",       # use explicit group sizes
-    early_group_size=100,           # number of early pre-lesion songs
-    late_group_size=100,            # number of late pre-lesion songs
-    post_group_size=100,            # number of post-lesion songs
-    only_song_present=True,
-    restrict_to_labels=None,        # or e.g. ['0','1','2','3','4']
+    grouping_mode="auto_balance",
+    restrict_to_labels=[str(i) for i in range(26)],  # force 0..25 on x-axis
     y_max_ms=40000,
-    show_plots=True,                # display figures interactively
-)
-
-## Option 2: automatically set equal sized batches
-from phrase_duration_pre_vs_post_grouped import run_phrase_duration_pre_vs_post_grouped
-
-# Input paths
-decoded = "/Users/mirandahulsey-vincent/Desktop/AreaX_lesion_2025/R08_RC6_Comp2_decoded_database.json"
-outdir  = "/Users/mirandahulsey-vincent/Desktop/AreaX_lesion_2025/R08"
-tdate   = "2025-05-22"
-
-# Run the grouped phrase duration analysis (auto-balanced)
-res = run_phrase_duration_pre_vs_post_grouped(
-    decoded_database_json=decoded,
-    output_dir=outdir,
-    treatment_date=tdate,
-    grouping_mode="auto_balance",   # automatically balance group sizes
     only_song_present=True,
-    restrict_to_labels=None,        # or specify syllable labels
-    y_max_ms=40000,
     show_plots=True,
 )
-
-
 """
-
