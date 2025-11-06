@@ -305,10 +305,10 @@ if __name__ == "__main__":
 
 """
 from organized_decoded_serialTS_segments import build_organized_segments_with_durations
-from syllable_heatmap import build_daily_avg_count_table, plot_log_scaled_syllable_counts, _infer_animal_id
+from syllable_heatmap_log import build_daily_avg_count_table, plot_log_scaled_syllable_counts, _infer_animal_id
 from pathlib import Path
 
-decoded = Path("/Users/mirandahulsey-vincent/Desktop/AreaX_lesion_2025/R08_RC6_Comp2_decoded_database.json")
+decoded = Path("/Users/mirandahulsey-vincent/Desktop/USA1234_VALIDATION_Data/USA1234_decoded_database.json")
 
 # where to save the figure
 outdir = decoded.parent / "figures"

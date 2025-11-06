@@ -29,8 +29,8 @@ from matplotlib.patches import Patch
 # ============
 # User inputs
 # ============
-f = "/Volumes/my_own_ssd/2024_AreaX_lesions_NMA_and_sham/AreaXlesion_TweetyBERT_outputs/new_outputs/TweetyBERT_Pretrain_LLB_AreaX_FallSong_USA5328.npz"
-output_dir = "/Volumes/my_own_ssd/2024_AreaX_lesions_NMA_and_sham/AreaXlesion_TweetyBERT_outputs/new_outputs/USA5328_sample_spectrograms"
+f = "/Volumes/my_own_ssd/2024_AreaX_lesions_NMA_and_sham/AreaXlesion_TweetyBERT_outputs/new_outputs/TweetyBERT_Pretrain_LLB_AreaX_FallSong_USA5509.npz"
+output_dir = "/Volumes/my_own_ssd/2024_AreaX_lesions_NMA_and_sham/AreaXlesion_TweetyBERT_outputs/new_outputs/USA5509_sample_spectrograms"
 
 # Process ALL labels: set to None
 # Process a subset: provide a list, e.g. [0, 3, 15]
