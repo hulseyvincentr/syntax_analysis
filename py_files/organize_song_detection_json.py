@@ -2,19 +2,58 @@
 # -*- coding: utf-8 -*-
 from pathlib import Path
 from typing import Union, List, Dict, Any, Tuple, Optional
+import re
 import json
+from datetime import datetime, timedelta
 import pandas as pd
 
 __all__ = [
     "build_meta_dataframe",
     "filter_songs",
     "make_segments_long_table",
-    "build_detected_song_segments",   # ← main entrypoint for other files
+    "build_detected_song_segments",   # one-call wrapper → returns long table
+    "filter_flagged_segments",        # helper → returns only flagged rows
+    "print_flagged_summary",          # helper → prints counts + sample rows
 ]
- 
+
 # ──────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────
+_EXCEL_1900_EPOCH = datetime(1899, 12, 30)  # Excel "1900" date system epoch
+
+def _excel_serial_to_datetime(serial: Union[str, float, int, None]) -> Optional[datetime]:
+    """
+    Convert an Excel '1900 date system' serial number to a naive datetime.
+    Returns None if parsing fails.
+    """
+    if serial is None:
+        return None
+    try:
+        serial_f = float(serial)
+    except Exception:
+        return None
+    # Negative/NaN safety
+    if not pd.notna(serial_f) or serial_f < 0:
+        return None
+    return _EXCEL_1900_EPOCH + timedelta(days=serial_f)
+
+_FLOAT_IN_FILENAME = re.compile(r"(\d{4,}\.\d+)")  # e.g., 45765.26224434
+
+def _parse_excel_serial_from_filename(filename: Optional[str]) -> Optional[float]:
+    """
+    Extract the first long float token from filename (e.g., '45765.26224434').
+    Returns None if not found.
+    """
+    if not filename:
+        return None
+    m = _FLOAT_IN_FILENAME.search(filename)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except Exception:
+        return None
+
 def _ensure_list(obj):
     if obj is None:
         return None
@@ -53,6 +92,9 @@ def build_meta_dataframe(json_input: Union[str, Path, List[Dict[str, Any]]]) -> 
       - song_present (bool)
       - spec_parameters (dict or None)
       - segments (list of dicts or None)
+      - recording_datetime (Timestamp, from Excel serial in filename)
+      - recording_date (YYYY-MM-DD string)
+      - recording_time (HH:MM:SS.mmm string)
     """
     records = _load_records(json_input)
 
@@ -64,11 +106,27 @@ def build_meta_dataframe(json_input: Union[str, Path, List[Dict[str, Any]]]) -> 
         # tolerate accidental key 'semgents'
         segments        = rec.get("segments", rec.get("semgents"))
 
+        # Parse Excel serial from filename → datetime/date/time
+        serial = _parse_excel_serial_from_filename(filename)
+        dt = _excel_serial_to_datetime(serial)
+        if dt is not None:
+            date_str = dt.date().isoformat()
+            # Use milliseconds for precision from fractional day
+            time_str = dt.time().isoformat(timespec="milliseconds")
+            dt_ts = pd.Timestamp(dt)
+        else:
+            date_str = None
+            time_str = None
+            dt_ts = pd.NaT
+
         rows.append({
             "filename": filename,
             "song_present": song_present,
             "spec_parameters": spec_parameters,
             "segments": segments,
+            "recording_datetime": dt_ts,
+            "recording_date": date_str,
+            "recording_time": time_str,
         })
 
     return pd.DataFrame(
@@ -78,6 +136,9 @@ def build_meta_dataframe(json_input: Union[str, Path, List[Dict[str, Any]]]) -> 
             "song_present",
             "spec_parameters",
             "segments",
+            "recording_datetime",
+            "recording_date",
+            "recording_time",
         ],
     )
 
@@ -93,12 +154,14 @@ def make_segments_long_table(
     *,
     drop_no_segments: bool = True,
     flatten_spec_params: bool = True,
+    max_gap_between_song_segments: int = 1000,   # ms, flag if gap < this value
 ) -> pd.DataFrame:
     """
     Build a long-form table with one row per segment.
 
     Columns produced:
       - filename
+      - recording_datetime, recording_date, recording_time
       - song_present
       - segment_index (0-based within file)
       - onset_timebin, offset_timebin
@@ -108,7 +171,7 @@ def make_segments_long_table(
       - length_timebins (same as duration_timebins when non-negative else None)
       - length_ms (same as duration_ms when non-negative else None)
       - gap_from_prev_ms (onset_ms - previous segment's offset_ms, per filename; NaN for first)
-      - potential_split_up_song (True if gap_from_prev_ms < 1000 ms)
+      - potential_split_up_song (True if gap_from_prev_ms < max_gap_between_song_segments)
       - spec.* (flattened spec_parameters, if requested)
       - record_index (original row index in the wide table)
     """
@@ -120,6 +183,9 @@ def make_segments_long_table(
             if not drop_no_segments:
                 long_rows.append({
                     "filename": row.get("filename"),
+                    "recording_datetime": row.get("recording_datetime"),
+                    "recording_date": row.get("recording_date"),
+                    "recording_time": row.get("recording_time"),
                     "song_present": row.get("song_present"),
                     "segment_index": None,
                     "onset_timebin": None,
@@ -142,6 +208,9 @@ def make_segments_long_table(
             if not drop_no_segments:
                 long_rows.append({
                     "filename": row.get("filename"),
+                    "recording_datetime": row.get("recording_datetime"),
+                    "recording_date": row.get("recording_date"),
+                    "recording_time": row.get("recording_time"),
                     "song_present": row.get("song_present"),
                     "segment_index": None,
                     "onset_timebin": None,
@@ -176,14 +245,17 @@ def make_segments_long_table(
 
             long_rows.append({
                 "filename": row.get("filename"),
+                "recording_datetime": row.get("recording_datetime"),
+                "recording_date": row.get("recording_date"),
+                "recording_time": row.get("recording_time"),
                 "song_present": row.get("song_present"),
                 "segment_index": seg_idx,
                 "onset_timebin": on_tb,
                 "offset_timebin": off_tb,
                 "onset_ms": on_ms,
                 "offset_ms": off_ms,
-                "duration_timebins": dur_tb,
-                "duration_ms": dur_ms,
+                "duration_timebins": len_tb if len_tb is not None else None,
+                "duration_ms": len_ms if len_ms is not None else None,
                 "length_timebins": len_tb,
                 "length_ms": len_ms,
                 "spec_parameters": row.get("spec_parameters"),
@@ -199,9 +271,11 @@ def make_segments_long_table(
     prev_offset = long_df.groupby("filename", dropna=False)["offset_ms"].shift(1)
     long_df["gap_from_prev_ms"] = long_df["onset_ms"] - prev_offset  # NaN for first of each file
 
-    # Flag potential split-up songs: gap < 1000 ms
-    # (NaN comparisons yield False automatically; first segments remain False)
-    long_df["potential_split_up_song"] = long_df["gap_from_prev_ms"] < 1000
+    # Flag potential split-up songs using the configurable threshold
+    long_df["potential_split_up_song"] = (long_df["gap_from_prev_ms"] < max_gap_between_song_segments).fillna(False)
+
+    # Backward-compat alias for earlier misspelling (safe to remove later)
+    long_df["potential_split_up_sopng"] = long_df["potential_split_up_song"]
 
     # Optionally flatten spec params into columns
     if flatten_spec_params and "spec_parameters" in long_df.columns:
@@ -219,6 +293,7 @@ def build_detected_song_segments(
     songs_only: bool = True,
     drop_no_segments: bool = True,
     flatten_spec_params: bool = True,
+    max_gap_between_song_segments: int = 1000,   # ms
 ) -> pd.DataFrame:
     """
     Return ONLY the long-form table of detected song segments.
@@ -226,8 +301,47 @@ def build_detected_song_segments(
     wide_df = build_meta_dataframe(json_input)
     df_in   = filter_songs(wide_df) if songs_only else wide_df
     return make_segments_long_table(
-        df_in, drop_no_segments=drop_no_segments, flatten_spec_params=flatten_spec_params
+        df_in,
+        drop_no_segments=drop_no_segments,
+        flatten_spec_params=flatten_spec_params,
+        max_gap_between_song_segments=max_gap_between_song_segments,
     )
+
+# ──────────────────────────────────────────────────────────────
+# Helpers to get/print flagged rows
+# ──────────────────────────────────────────────────────────────
+def filter_flagged_segments(df: pd.DataFrame, *, flag_col: str = "potential_split_up_song") -> pd.DataFrame:
+    """Return only rows where the flag column is True."""
+    if flag_col not in df.columns and "potential_split_up_sopng" in df.columns:
+        flag_col = "potential_split_up_sopng"
+    return df.loc[df[flag_col].fillna(False)].copy()
+
+def print_flagged_summary(
+    df: pd.DataFrame,
+    *,
+    flag_col: str = "potential_split_up_song",
+    max_rows_per_file: int = 10,
+) -> None:
+    """Print 'n out of x' and show a few flagged rows per filename."""
+    if flag_col not in df.columns and "potential_split_up_sopng" in df.columns:
+        flag_col = "potential_split_up_sopng"
+
+    flagged = df.loc[df[flag_col].fillna(False)].copy()
+    print(f"Number of potentially split up songs: {len(flagged)} out of {len(df)} segments")
+
+    if flagged.empty:
+        return
+
+    flagged = flagged.sort_values(["filename", "segment_index"])
+    cols_to_show = [
+        "segment_index", "onset_ms", "offset_ms", "gap_from_prev_ms",
+        "length_ms", "onset_timebin", "offset_timebin", "length_timebins",
+        "recording_date", "recording_time",
+    ]
+    for fname, g in flagged.groupby("filename"):
+        print(f"\n=== {fname} — {len(g)} flagged segment(s) ===")
+        show_cols = [c for c in cols_to_show if c in g.columns]
+        print(g[show_cols].head(max_rows_per_file).to_string(index=False))
 
 # ──────────────────────────────────────────────────────────────
 # Optional: quick local run for testing (creates 'detected_song_segments')
@@ -235,65 +349,35 @@ def build_detected_song_segments(
 if __name__ == "__main__":
     example_json = Path("/Volumes/my_own_ssd/2025_areax_lesion/R08_RC6_Comp2_song_detection.json")
     detected_song_segments = build_detected_song_segments(
-        example_json, songs_only=True, flatten_spec_params=True
+        example_json,
+        songs_only=True,
+        flatten_spec_params=True,
+        max_gap_between_song_segments=500,  # tweak here
     )
     print(f"SEGMENT rows: {detected_song_segments.shape[0]}")
 
-    # Show flagged potential split-up songs (gap < 1000 ms)
-    flagged = detected_song_segments.loc[detected_song_segments["potential_split_up_song"]].copy()
-    print(f"\nFiles with potential split-up songs: {flagged['filename'].nunique()} "
-          f"(rows flagged: {len(flagged)})")
+    # Print summary + sample flagged rows
+    print_flagged_summary(detected_song_segments)
 
-    # Print filename + segment rows that were flagged
-    if not flagged.empty:
-        cols_to_show = [
-            "segment_index", "onset_ms", "offset_ms", "gap_from_prev_ms",
-            "length_ms", "onset_timebin", "offset_timebin", "length_timebins"
-        ]
-        for fname, g in flagged.groupby("filename"):
-            print(f"\n=== {fname} — {len(g)} flagged segment(s) ===")
-            show_cols = [c for c in cols_to_show if c in g.columns]
-            print(g[show_cols].to_string(index=False))
-
-    # Quick head for sanity
-    cols = [
-        "filename", "segment_index",
-        "onset_timebin", "offset_timebin",
-        "onset_ms", "offset_ms",
-        "length_timebins", "length_ms",
-        "gap_from_prev_ms", "potential_split_up_song",
-    ]
-    extra = [c for c in detected_song_segments.columns if c.startswith("spec.")]
-    show = [c for c in cols + extra if c in detected_song_segments.columns]
-    print("\nPreview:\n", detected_song_segments[show].head(12).to_string(index=False))
+    # Also expose 'flagged' in the Variable Explorer
+    flagged = filter_flagged_segments(detected_song_segments)
 
 
 
 """
-from organize_song_detection_json import build_detected_song_segments
+from organize_song_detection_json import (
+    build_detected_song_segments,
+    filter_flagged_segments,
+    print_flagged_summary,
+)
 
 detected_song_segments = build_detected_song_segments(
     "/Volumes/my_own_ssd/2025_areax_lesion/R08_RC6_Comp2_song_detection.json",
-    songs_only=True,
-    flatten_spec_params=True,
-    )
+    max_gap_between_song_segments=500,
+)
 
-# Filter just the flagged rows if you want
-flagged = detected_song_segments.loc[detected_song_segments["potential_split_up_song"]]
 print(f"Number of potentially split up songs: {int(detected_song_segments['potential_split_up_song'].fillna(False).sum())} out of {len(detected_song_segments)} segments")
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+# Work with the flagged dataframe in Variable Explorer
+flagged = filter_flagged_segments(detected_song_segments)
 """
