@@ -12,21 +12,24 @@ Then:
   2) Use organized_decoded_serialTS_segments.build_organized_segments_with_durations
      to build a per-segment annotations dataframe.
   3) For each detected row (single or merged run), append annotation segments together:
-     - Find the matching (file_name, Segment) rows in the organized annotations df.
-     - Time-shift each segment's annotation by its detected onset (ms) relative to the
-       first segment in the run.
-     - Concatenate intervals label-by-label; sort by onset.
+     - Match (filename, segment_index) to (file_name, Segment) (+ optional offset)
+     - Shift each segment's annotation by detection onset so timelines align
+     - Concatenate label intervals and sort by onset
+  4) (Optional) Coalesce adjacent repeats of the same syllable if the gap between
+     intervals is within a small threshold (e.g., < 10 ms).
 
 Outputs:
   - organized_annotations.csv (per-segment)
   - decoded_with_split_labels.csv (singles + merged annotations)
 
-Usage (CLI flags or interactive prompts):
+CLI:
   python merge_annotations_from_split_songs.py \
       --song-detection /path/to/R08_RC6_Comp2_song_detection.json \
       --annotations   /path/to/TweetyBERT_Pretrain_LLB_AreaX_FallSong_R08_RC6_Comp2_decoded_database.json \
       --max-gap-ms 500 \
-      --segment-index-offset 0
+      --segment-index-offset 0 \
+      --merge-repeats \
+      --repeat-gap-ms 10
 """
 
 from __future__ import annotations
@@ -34,7 +37,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Any, Union, Tuple, Optional
 import argparse
-import json
 
 import pandas as pd
 import numpy as np
@@ -94,6 +96,39 @@ def _sort_intervals_inplace(d: Dict[str, List[List[float]]]) -> None:
     for lab, ivals in d.items():
         ivals.sort(key=lambda ab: (ab[0], ab[1] if len(ab) > 1 else ab[0]))
 
+def _coalesce_adjacent_intervals_by_label(
+    d: Dict[str, List[List[float]]],
+    max_gap_ms: float = 10.0,
+    inclusive: bool = False,
+) -> None:
+    """
+    In-place: for each label, merge consecutive intervals if the silence/gap
+    between them is small (e.g., < 10 ms). This is helpful when detection
+    split a sustained/repeated syllable. Assumes intervals are already sorted.
+    """
+    if not isinstance(d, dict) or not d:
+        return
+
+    cmp = (lambda gap: gap <= max_gap_ms) if inclusive else (lambda gap: gap < max_gap_ms)
+
+    for lab, ivals in list(d.items()):
+        if not ivals:
+            continue
+        merged: List[List[float]] = []
+        cur_start, cur_end = float(ivals[0][0]), float(ivals[0][1])
+
+        for k in range(1, len(ivals)):
+            s, e = float(ivals[k][0]), float(ivals[k][1])
+            gap = s - cur_end
+            if cmp(gap):
+                # extend current interval
+                cur_end = max(cur_end, e)
+            else:
+                merged.append([cur_start, cur_end])
+                cur_start, cur_end = s, e
+        merged.append([cur_start, cur_end])
+        d[lab] = merged
+
 def _durations_by_label(d: Dict[str, List[List[float]]]) -> Dict[str, List[float]]:
     out: Dict[str, List[float]] = {}
     for lab, ivals in (d or {}).items():
@@ -127,6 +162,9 @@ def append_annotations_using_detection(
     detected_song_segments: pd.DataFrame,
     detected_merged_songs: pd.DataFrame,
     segment_index_offset: int = 0,
+    merge_repeated_syllables: bool = False,
+    repeat_gap_ms: float = 10.0,
+    repeat_gap_inclusive: bool = False,
 ) -> pd.DataFrame:
     """
     Build a "singles + merged" annotations dataframe using detection to decide which
@@ -136,6 +174,9 @@ def append_annotations_using_detection(
     Joins on:
       detection filename  <-> annotations 'file_name'
       detection segment_index (per part)  <-> annotations 'Segment' (+ offset if needed)
+
+    If `merge_repeated_syllables` is True, coalesces adjacent repeats of the same label
+    when the between-interval gap is within the threshold (repeat_gap_ms).
     """
     ann = annotations_df.copy()
 
@@ -166,16 +207,12 @@ def append_annotations_using_detection(
             continue
 
         # Compute baseline (first onset) from detection
-        # (if any onset missing, fall back to the minimum available)
         onsets = []
         for s in segs:
             key = (fname, s)
             if key in seg_onset_map:
                 onsets.append(seg_onset_map[key])
-        if onsets:
-            baseline = min(onsets)
-        else:
-            baseline = 0.0  # if detection didn't carry onset_ms, append with no shifts
+        baseline = min(onsets) if onsets else 0.0
 
         # Accumulate combined annotations
         combined: Dict[str, List[List[float]]] = {}
@@ -186,23 +223,20 @@ def append_annotations_using_detection(
         # Walk segments in order and append with shift
         for s in segs:
             ann_seg = s + int(segment_index_offset)
-            # Match a single annotation row for this (file, segment)
             match = ann.loc[(ann["file_name"] == fname) & (ann["_Segment_int"] == ann_seg)]
             if match.empty:
                 missing_segments.append(s)
                 continue
 
-            # If multiple rows (shouldn't typically happen), take the first by time
             mrow = match.sort_values("Recording DateTime", na_position="last").iloc[0]
             found_rows.append(mrow)
 
-            # Compute shift from detection onset
+            # shift using detection onset difference
             shift = 0.0
             key = (fname, s)
             if key in seg_onset_map:
                 shift = float(seg_onset_map[key]) - float(baseline)
 
-            # Pull the per-label intervals dict (already parsed by organizer)
             piece = mrow.get("syllable_onsets_offsets_ms_dict", {})
             _shift_and_extend(combined, piece, shift_ms=shift)
             found_any = True
@@ -210,6 +244,16 @@ def append_annotations_using_detection(
         # Finalize combined intervals
         if found_any:
             _sort_intervals_inplace(combined)
+
+            # Optional: coalesce repeated same-label intervals if tiny gap
+            if merge_repeated_syllables:
+                _coalesce_adjacent_intervals_by_label(
+                    combined,
+                    max_gap_ms=float(repeat_gap_ms),
+                    inclusive=bool(repeat_gap_inclusive),
+                )
+
+            # Rebuild helpers after potential coalescing
             syllables_present = sorted(combined.keys())
             syllable_order = _compute_syllable_order(combined)
             durs = _durations_by_label(combined)
@@ -232,19 +276,17 @@ def append_annotations_using_detection(
         rec["merged_segment_index_end"] = segs[-1]
         rec["missing_segments"] = missing_segments if missing_segments else None
 
-        # Carry over useful context if available
         for c in ["Animal ID", "Recording DateTime", "Date", "Hour", "Minute", "Second", "File Stem"]:
             if isinstance(base, pd.Series) and c in base.index:
                 rec[c] = base[c]
             else:
                 rec[c] = None
 
-        # Store merged annotation dicts + derived helpers
         rec["syllable_onsets_offsets_ms_dict"] = combined
         rec["syllables_present"] = syllables_present
         rec["syllable_order"] = syllable_order
 
-        # Also add per-label duration columns like the organizer does
+        # Per-label duration columns like the organizer
         for lab, arr in durs.items():
             rec[f"syllable_{lab}_durations"] = arr
 
@@ -271,10 +313,15 @@ def build_decoded_with_split_labels(
     flatten_spec_params: bool = True,
     max_gap_between_song_segments: int = 500,
     segment_index_offset: int = 0,
-) -> MergeAnnotationsResult:
+    merge_repeated_syllables: bool = False,
+    repeat_gap_ms: float = 10.0,
+    repeat_gap_inclusive: bool = False,
+):
     """
     Full pipeline: detection → merged groups, annotations → per-segment df,
     then append annotations across merged segments using detection timing.
+    Optionally coalesce adjacent repeats of the same syllable if the between-interval
+    gap is tiny (e.g., < 10 ms).
     """
     # 1) Detection: both the raw per-segment and the combined "singles + merged"
     det = build_detected_and_merged_songs(
@@ -295,12 +342,15 @@ def build_decoded_with_split_labels(
     )
     annotations_df = org.organized_df.copy()
 
-    # 3) Append annotations using detection groupings
+    # 3) Append annotations using detection groupings (+ optional coalescing)
     appended_df = append_annotations_using_detection(
         annotations_df=annotations_df,
         detected_song_segments=detected_song_segments,
         detected_merged_songs=detected_merged_songs,
         segment_index_offset=segment_index_offset,
+        merge_repeated_syllables=merge_repeated_syllables,
+        repeat_gap_ms=repeat_gap_ms,
+        repeat_gap_inclusive=repeat_gap_inclusive,
     )
 
     return MergeAnnotationsResult(
@@ -327,8 +377,13 @@ def main():
     p.add_argument("--max-gap-ms", type=int, default=500, help="Max gap between segments to consider 'split up'")
     p.add_argument("--segment-index-offset", type=int, default=0,
                    help="If detection segment indices are 0-based but annotations are 1-based, use 1 here (or vice versa).")
-    p.add_argument("--keep-all", action="store_true",
-                   help="(No effect on saved outputs—kept for future options)")
+    # New options for repeat coalescing
+    p.add_argument("--merge-repeats", action="store_true",
+                   help="If set, coalesce adjacent repeats of the same syllable when tiny gaps exist.")
+    p.add_argument("--repeat-gap-ms", type=float, default=10.0,
+                   help="Max silence between same-label intervals to coalesce (default 10.0 ms).")
+    p.add_argument("--repeat-gap-inclusive", action="store_true",
+                   help="Use <= repeat-gap instead of < repeat-gap.")
     args = p.parse_args()
 
     song_detection_json = _prompt_if_missing(args.song_detection, "Path to song_detection JSON: ")
@@ -342,6 +397,9 @@ def main():
         only_song_present=True,
         compute_durations=True,
         add_recording_datetime=True,
+        merge_repeated_syllables=args.merge_repeats,
+        repeat_gap_ms=args.repeat_gap_ms,
+        repeat_gap_inclusive=args.repeat_gap_inclusive,
     )
 
     # Save outputs next to the annotations JSON
@@ -363,24 +421,17 @@ def main():
 
 if __name__ == "__main__":
     main()
-
+    
 
 """
 from pathlib import Path
 import importlib
-
-# Import & reload your script so recent edits are picked up
 import merge_annotations_from_split_songs as mps
 importlib.reload(mps)
 
-# --- Edit these two paths ---
 detect  = Path("/Volumes/my_own_ssd/2025_areax_lesion/R08_RC6_Comp2_song_detection.json")
 decoded = Path("/Volumes/my_own_ssd/2025_areax_lesion/TweetyBERT_Pretrain_LLB_AreaX_FallSong_R08_RC6_Comp2_decoded_database.json")
 
-# Run the pipeline:
-# - merges split-up songs from detection
-# - organizes annotations per segment
-# - appends annotation segments across merged songs (time-shifted to align)
 res = mps.build_decoded_with_split_labels(
     decoded_database_json=decoded,
     song_detection_json=detect,
@@ -389,38 +440,14 @@ res = mps.build_decoded_with_split_labels(
     add_recording_datetime=True,
     songs_only=True,
     flatten_spec_params=True,
-    max_gap_between_song_segments=500,   # adjust if needed
-    segment_index_offset=0,              # use 1 if annotations are 1-based and detection is 0-based
+    max_gap_between_song_segments=500,
+    segment_index_offset=0,
+    merge_repeated_syllables=True,   # ← NEW: enable coalescing
+    repeat_gap_ms=10.0,              # ← NEW: < 10 ms merges
+    repeat_gap_inclusive=False,      # use True to treat <= as mergeable
 )
 
-# Handy handles
-organized_df = res.organized_annotations_df          # per-segment annotations
-detected_df  = res.detected_song_segments_df         # raw detected segments
-merged_det   = res.detected_merged_songs_df          # detection after merging
-appended_df  = res.annotations_appended_df           # singles + merged annotations (appended)
-
-# Save next to the annotation JSON
-outdir = decoded.parent
-organized_df.to_csv(outdir / "organized_annotations.csv", index=False)
-appended_df.to_csv(outdir / "decoded_with_split_labels.csv", index=False)
-
-print("Saved:")
-print(" -", outdir / "organized_annotations.csv")
-print(" -", outdir / "decoded_with_split_labels.csv")
-
-# Quick sanity checks
-print("\nCounts:")
-print("# detected segments:", len(detected_df))
-print("# detected rows (singles+merged):", len(merged_det))
-print("# annotations written (singles+merged):", len(appended_df))
-
-# Peek the specific file you mentioned (should show merged indices like [1, 2])
-fname = "R08_45765.26224434_4_18_7_17_4.wav"
-subset = appended_df.loc[appended_df["file_name"] == fname,
-                         ["file_name", "merged_segment_indices", "was_merged", "missing_segments"]]
-print("\nCheck specific file:")
-print(subset.head().to_string(index=False))
-
+res.annotations_appended_df.to_csv(decoded.parent / "decoded_with_split_labels.csv", index=False)
 
 
 """
