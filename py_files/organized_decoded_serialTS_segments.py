@@ -113,7 +113,7 @@ def parse_filename_with_excel_serial(file_field: Union[str, Path]) -> Tuple[
     """
     Parse filenames of the form:
 
-        <ANIMAL> _ <EXCEL_SERIAL> _ <MM> _ <DD> _ <HH> _ <MM> _ <SS> _ <SEG?>
+        <ANIMAL> _ <EXCEL_SERIAL> _ <M> _ <D> _ <H> _ <M> _ <S> [_<SEG>]
 
     Examples
     --------
@@ -137,8 +137,8 @@ def parse_filename_with_excel_serial(file_field: Union[str, Path]) -> Tuple[
         animal_id = parts[0]
         serial_str = parts[1]
 
-        # Detect optional trailing segment: pattern has at least 7 tokens total when no segment
-        # [ANIMAL, SERIAL, M, D, H, M, S]  -> len == 7
+        # Detect optional trailing segment:
+        # [ANIMAL, SERIAL, M, D, H, M, S]  -> len == 7 (no segment)
         # If there's one more numeric token -> segment
         segment: Optional[int] = None
         if len(parts) >= 8 and parts[-1].isdigit():
@@ -156,6 +156,7 @@ def parse_filename_with_excel_serial(file_field: Union[str, Path]) -> Tuple[
 
     except Exception:
         return None, None, None, None
+
 
 def build_organized_segments_with_durations(
     decoded_database_json: Union[str, Path],
@@ -225,11 +226,37 @@ def build_organized_segments_with_durations(
     if "file_name" not in organized.columns:
         raise KeyError("Expected column 'file_name' in decoded database JSON.")
 
+    # Process each file_name
     for i, file_field in enumerate(organized["file_name"]):
         animal_id, serial_val, segment, file_stem = parse_filename_with_excel_serial(file_field)
+
+        # Base identity fields
         organized.at[i, "Animal ID"] = animal_id
         organized.at[i, "Segment"]   = segment
         organized.at[i, "File Stem"] = file_stem
+
+        # Keep original upstream value for traceability
+        raw_name = str(file_field).split("/")[-1]
+        organized.at[i, "file_name_upstream"] = raw_name
+
+        # ── Fix upstream ".wav" removal only if needed ─────────────────────────
+        # If the base name already ends with ".wav" (case-insensitive), leave it as-is.
+        # Otherwise, reconstruct "<file_stem>.wav". If parsing failed, add ".wav" only
+        # if the base name lacks any extension.
+        if raw_name.lower().endswith(".wav"):
+            corrected_name = raw_name
+        else:
+            if file_stem:
+                corrected_name = f"{file_stem}.wav"
+            else:
+                # Fallback: append .wav only if there is no extension present
+                if "." in raw_name.rsplit("/", 1)[-1]:
+                    corrected_name = raw_name  # some other extension present; leave as-is
+                else:
+                    corrected_name = raw_name + ".wav"
+
+        # Overwrite file_name column with corrected base name
+        organized.at[i, "file_name"] = corrected_name
 
         # Build datetime exclusively from the Excel serial
         ts = excel_serial_to_timestamp(serial_val) if (serial_val is not None) else None
@@ -359,7 +386,7 @@ def build_organized_segments_with_durations(
 from pathlib import Path
 from organized_decoded_serialTS_segments import build_organized_segments_with_durations
 
-decoded = Path("/Users/mirandahulsey-vincent/Desktop/SfN_baseline_analysis/USA1234_decoded_database.json")
+decoded = Path("/Volumes/my_own_ssd/2025_areax_lesion/TweetyBERT_Pretrain_LLB_AreaX_FallSong_R08_RC6_Comp2_decoded_database.json")
 
 out = build_organized_segments_with_durations(
     decoded_database_json=decoded,
@@ -374,4 +401,8 @@ df.head()
 #   'Recording DateTime' (full timestamp)
 #   'Date' (midnight-normalized)
 #   'Hour','Minute','Second' (zero-padded strings)
+
+# The module now also:
+#   - Preserves original upstream 'file_name' in 'file_name_upstream'
+#   - Rewrites 'file_name' to '<file_stem>.wav' ONLY if it didn't already end with '.wav'
 """
