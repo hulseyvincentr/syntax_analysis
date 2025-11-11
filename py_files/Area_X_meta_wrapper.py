@@ -5,17 +5,21 @@
 Wrapper that:
   • Merges decoded annotations ONCE
   • Merges detected songs (durations) ONCE
-then runs three analyses using those merged tables:
+then runs FOUR analyses using those merged tables:
   1) Last-syllable histogram + pies  (balanced Early/Late/Post)
   2) Per-target PRECEDER & SUCCESSOR combined panels (balanced groups)
   3) Song-duration comparisons (Pre vs Post; Early-Pre vs Late-Pre vs Post with stats)
+  4) Daily syllable-usage heatmaps (linear scale), two variants:
+        A) vmax = 1.0 (fixed)
+        B) vmax = observed max (data-driven)
 
-Depends on modules present in your PYTHONPATH / same folder:
+Depends on modules in your PYTHONPATH / same folder:
   - merge_annotations_from_split_songs.py      (build_decoded_with_split_labels)
   - merge_potential_split_up_song.py           (build_detected_and_merged_songs)
-  - last_syllable_plots.py                     (helper funcs used directly)
-  - pre_and_post_syllable_plots.py             (helper funcs used directly)
-  - song_duration_comparison.py                (plot functions used directly)
+  - last_syllable_plots.py
+  - pre_and_post_syllable_plots.py
+  - song_duration_comparison.py
+  - syllable_heatmap_linear.py                 (build_daily_avg_count_table, plot_linear_scaled_syllable_counts)
 
 Typical usage (Spyder):
 
@@ -32,18 +36,18 @@ Typical usage (Spyder):
         song_detection_json=detect,
         decoded_annotations_json=decoded,
         treatment_date=tdate,
-        base_output_dir=decoded.parent / "figures",  # default: decoded.parent
+        base_output_dir=decoded.parent / "figures",
         # merge knobs (kept consistent across analyses)
-        max_gap_between_song_segments=500,   # for annotations merge
+        max_gap_between_song_segments=500,
         segment_index_offset=0,
         merge_repeated_syllables=True,
         repeat_gap_ms=10.0,
         repeat_gap_inclusive=False,
-        merged_song_gap_ms=500,              # for durations merge
+        merged_song_gap_ms=500,
         # last-syllable
         top_k_last_labels=15,
         # preceder/successor
-        target_labels=None,                  # None -> auto-select
+        target_labels=None,
         top_k_targets=8,
         top_k_preceders=12,
         top_k_successors=12,
@@ -52,6 +56,10 @@ Typical usage (Spyder):
         include_other_bin=True,
         include_other_in_hist=True,
         other_label="Other",
+        # heatmaps
+        heatmap_cmap="Greys",
+        nearest_match=True,
+        max_days_off=1,
         # show figures interactively?
         show=True,
     )
@@ -63,30 +71,15 @@ Typical usage (Spyder):
     print("Durations pre/post:", out.duration_plots.pre_post_path)
     print("Durations three-group:", out.duration_plots.three_group_path)
     print("Three-group stats:", out.duration_plots.three_group_stats)
-
-CLI example:
-
-    python Area_X_meta_wrapper.py \
-      --song-detection "/path/..._song_detection.json" \
-      --annotations   "/path/..._decoded_database.json" \
-      --treatment-date "2025-05-22" \
-      --base-out "/path/figures" \
-      --ann-gap-ms 500 \
-      --merged-song-gap-ms 500 \
-      --merge-repeats \
-      --repeat-gap-ms 10 \
-      --top-k-last 15 \
-      --top-k-targets 8 \
-      --top-k-preceders 12 \
-      --top-k-successors 12 \
-      --include-other \
-      --include-other-in-hist
+    print("Heatmap v1.0:", out.heatmaps.path_v1)
+    print("Heatmap vmax=max:", out.heatmaps.path_vmax)
+    print("Heatmap vmax_max value:", out.heatmaps.vmax_max)
 """
 
 from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Union, Any, Tuple
+from typing import Dict, List, Optional, Union, Any
 
 import numpy as np
 import pandas as pd
@@ -96,10 +89,11 @@ import matplotlib.pyplot as plt
 from merge_annotations_from_split_songs import build_decoded_with_split_labels
 from merge_potential_split_up_song import build_detected_and_merged_songs
 
-# --- Analysis modules (we will call their internal helpers / public plotters) ---
+# --- Analysis modules ---
 import last_syllable_plots as lsp
 import pre_and_post_syllable_plots as pps
 import song_duration_comparison as sdc
+import syllable_heatmap_linear as shlin  # provides build_daily_avg_count_table & plot_linear_scaled_syllable_counts
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -109,12 +103,23 @@ import song_duration_comparison as sdc
 def _as_timestamp(d) -> pd.Timestamp:
     return pd.to_datetime(str(d)).normalize()
 
-def _ensure_cols_for_datetime(df: pd.DataFrame, col_candidates: List[str]) -> Optional[str]:
-    """Return the first present datetime column name, else None."""
-    for c in col_candidates:
-        if c in df.columns:
-            return c
-    return None
+def _collect_unique_labels_sorted(df: pd.DataFrame, dict_col: str) -> List[str]:
+    """
+    Collect unique syllable labels from a dict column and return them in
+    numeric order (0,1,2,...) when possible; otherwise lexicographic.
+    """
+    labs: List[str] = []
+    for d in df[dict_col].dropna():
+        if isinstance(d, dict):
+            labs.extend(list(map(str, d.keys())))
+    labs = list(dict.fromkeys(labs))  # preserve first-seen order
+    # numeric sort when all labels are integers
+    try:
+        as_int = [int(x) for x in labs]
+        order = np.argsort(as_int)
+        return [labs[i] for i in order]
+    except Exception:
+        return sorted(labs)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -126,6 +131,12 @@ class DurationPlotsOut:
     pre_post_path: Optional[str]
     three_group_path: Optional[str]
     three_group_stats: Dict[str, Any]
+
+@dataclass
+class HeatmapOut:
+    path_v1: Optional[str]      # vmax=1.0
+    path_vmax: Optional[str]    # vmax=max observed
+    vmax_max: float
 
 @dataclass
 class AreaXMetaResult:
@@ -141,6 +152,9 @@ class AreaXMetaResult:
 
     # Duration results
     duration_plots: DurationPlotsOut
+
+    # Heatmaps
+    heatmaps: HeatmapOut
 
     # Shared/merged tables
     merged_annotations_df: pd.DataFrame
@@ -191,6 +205,13 @@ def run_area_x_meta_bundle(
     include_other_in_hist: bool = True,
     other_label: str = "Other",
 
+    # ---- heatmap knobs ----
+    heatmap_cmap: str = "Greys",
+    nearest_match: bool = True,
+    max_days_off: int = 1,
+    heatmap_v1_filename: str = "syllable_heatmap_linear_vmax1.00.png",
+    heatmap_vmax_filename: str = "syllable_heatmap_linear_vmaxMAX.png",
+
     # ---- display ----
     show: bool = True,
 ) -> AreaXMetaResult:
@@ -206,10 +227,11 @@ def run_area_x_meta_bundle(
     last_dir = base_output_dir / "last_syllable"
     pps_dir  = base_output_dir / "preceder_successor_panels"
     dur_dir  = base_output_dir / "durations"
-    for d in (last_dir, pps_dir, dur_dir):
+    hm_dir   = base_output_dir / "heatmaps"
+    for d in (last_dir, pps_dir, dur_dir, hm_dir):
         d.mkdir(parents=True, exist_ok=True)
 
-    # ── MERGE ONCE: decoded annotations (for syllable analyses) ──
+    # ── MERGE ONCE: decoded annotations (for syllable analyses & heatmaps) ──
     ann = build_decoded_with_split_labels(
         decoded_database_json=decoded_annotations_json,
         song_detection_json=song_detection_json,
@@ -237,8 +259,6 @@ def run_area_x_meta_bundle(
         merged_detected_df = det["detected_merged_songs"].copy()
         _dur_title_suffix = f"(Merged gap < {int(merged_song_gap_ms)} ms)"
     else:
-        # Fallback: use original segments table (kept flat)
-        # We call sdc._prepare_table to keep identical formatting/columns.
         merged_detected_df = sdc._prepare_table(song_detection_json, merge_gap_ms=None, songs_only=True)
         _dur_title_suffix = "(Unmerged segments)"
 
@@ -254,7 +274,6 @@ def run_area_x_meta_bundle(
         late_df  = merged_annotations_df.copy()
         post_df  = merged_annotations_df.copy()
     else:
-        # balanced split (lsp helper expects "Recording DateTime"; rename if needed)
         dfA = merged_annotations_df.copy()
         if "Recording DateTime" not in dfA.columns and "recording_datetime" in dfA.columns:
             dfA = dfA.rename(columns={"recording_datetime": "Recording DateTime"})
@@ -302,7 +321,6 @@ def run_area_x_meta_bundle(
     per_target_outputs: Dict[str, Optional[str]] = {}
 
     if not merged_annotations_df.empty:
-        # balanced groups again (pps helper allows "Recording DateTime"; ensure column)
         dfB = merged_annotations_df.copy()
         if "Recording DateTime" not in dfB.columns and "recording_datetime" in dfB.columns:
             dfB = dfB.rename(columns={"recording_datetime": "Recording DateTime"})
@@ -385,7 +403,6 @@ def run_area_x_meta_bundle(
                 output_path=out_path, show=show,
             )
             per_target_outputs[str(tgt)] = str(out_path)
-    # else: targets_used/per_target_outputs remain defaults
 
     # ──────────────────────────────────────────────────────────
     # 3) SONG-DURATION PLOTS (reuse merged_detected_df; use sdc public plotters)
@@ -424,6 +441,75 @@ def run_area_x_meta_bundle(
         three_group_stats=_plot2.get("stats", {}),
     )
 
+    # ──────────────────────────────────────────────────────────
+    # 4) HEATMAPS (reuse merged_annotations_df; no re-merge)
+    # ──────────────────────────────────────────────────────────
+    if merged_annotations_df.empty:
+        hm_v1_path = None
+        hm_vmax_path = None
+        vmax_max = float("nan")
+    else:
+        dfH = merged_annotations_df.copy()
+
+        # Ensure a simple calendar Date column
+        if "Date" not in dfH.columns:
+            dt_col = "Recording DateTime" if "Recording DateTime" in dfH.columns else "recording_datetime"
+            if dt_col not in dfH.columns:
+                raise ValueError("No datetime column found to derive 'Date' (expected 'Recording DateTime' or 'recording_datetime').")
+            dfH["Date"] = pd.to_datetime(dfH[dt_col]).dt.date
+
+        # Build label list and daily avg count table
+        label_col = "syllable_onsets_offsets_ms_dict"
+        syllable_labels = _collect_unique_labels_sorted(dfH, label_col)
+        count_table = shlin.build_daily_avg_count_table(
+            dfH,
+            label_column=label_col,
+            date_column="Date",
+            syllable_labels=syllable_labels,
+        )
+
+        # File names (animal id helper from your plotting module)
+        animal_id = (shlin._infer_animal_id(dfH, decoded_annotations_json) or decoded_annotations_json.stem or "unknown_animal")
+        hm_v1_path   = hm_dir / f"{animal_id}_{heatmap_v1_filename}"
+        hm_vmax_path = hm_dir / f"{animal_id}_{heatmap_vmax_filename}"
+
+        # vmax for Plot B
+        raw_max = float(np.nanmax(count_table.to_numpy())) if count_table.size else 1.0
+        vmax_max = raw_max if np.isfinite(raw_max) and raw_max > 0 else 1.0
+
+        # Plot A: fixed vmax=1.0
+        _ = shlin.plot_linear_scaled_syllable_counts(
+            count_table,
+            animal_id=animal_id,
+            treatment_date=tdate,
+            save_path=hm_v1_path,
+            show=show,
+            cmap=heatmap_cmap,
+            vmin=0.0,
+            vmax=1.0,
+            nearest_match=nearest_match,
+            max_days_off=max_days_off,
+        )
+
+        # Plot B: vmax = observed maximum
+        _ = shlin.plot_linear_scaled_syllable_counts(
+            count_table,
+            animal_id=animal_id,
+            treatment_date=tdate,
+            save_path=hm_vmax_path,
+            show=show,
+            cmap=heatmap_cmap,
+            vmin=0.0,
+            vmax=vmax_max,
+            nearest_match=nearest_match,
+            max_days_off=max_days_off,
+        )
+
+        hm_v1_path = str(hm_v1_path)
+        hm_vmax_path = str(hm_vmax_path)
+
+    heatmaps_out = HeatmapOut(path_v1=hm_v1_path, path_vmax=hm_vmax_path, vmax_max=float(vmax_max))
+
     # Build final result
     return AreaXMetaResult(
         last_syllable_hist_path=last_hist_path,
@@ -433,6 +519,7 @@ def run_area_x_meta_bundle(
         targets_used=targets_used,
         per_target_outputs=per_target_outputs,
         duration_plots=duration_out,
+        heatmaps=heatmaps_out,
         merged_annotations_df=merged_annotations_df,
         merged_detected_df=merged_detected_df,
         early_df=early_df,
@@ -448,7 +535,7 @@ def run_area_x_meta_bundle(
 if __name__ == "__main__":
     import argparse
 
-    p = argparse.ArgumentParser(description="Area X meta wrapper: merge once, run last-syllable, preceder/successor, and duration plots.")
+    p = argparse.ArgumentParser(description="Area X meta wrapper: merge once, run last-syllable, preceder/successor, duration, and heatmap plots.")
     p.add_argument("--song-detection", "-d", type=str, required=True, help="Path to *_song_detection.json")
     p.add_argument("--annotations", "-a", type=str, required=True, help="Path to *_decoded_database.json")
     p.add_argument("--treatment-date", "-t", type=str, required=True, help="YYYY-MM-DD")
@@ -479,6 +566,13 @@ if __name__ == "__main__":
     p.add_argument("--include-other", action="store_true")
     p.add_argument("--include-other-in-hist", action="store_true")
     p.add_argument("--other-label", type=str, default="Other")
+
+    # heatmaps
+    p.add_argument("--heatmap-cmap", type=str, default="Greys")
+    p.add_argument("--nearest-match", action="store_true")
+    p.add_argument("--max-days-off", type=int, default=1)
+    p.add_argument("--heatmap-v1-name", type=str, default="syllable_heatmap_linear_vmax1.00.png")
+    p.add_argument("--heatmap-vmax-name", type=str, default="syllable_heatmap_linear_vmaxMAX.png")
 
     p.add_argument("--no-show", action="store_true")
 
@@ -511,6 +605,12 @@ if __name__ == "__main__":
         include_other_bin=args.include_other,
         include_other_in_hist=args.include_other_in_hist,
         other_label=args.other_label,
+        # heatmaps
+        heatmap_cmap=args.heatmap_cmap,
+        nearest_match=args.nearest_match,
+        max_days_off=args.max_days_off,
+        heatmap_v1_filename=args.heatmap_v1_name,
+        heatmap_vmax_filename=args.heatmap_vmax_name,
         # display
         show=not args.no_show,
     )
@@ -522,3 +622,54 @@ if __name__ == "__main__":
     print("[OK] Durations Pre/Post:", res.duration_plots.pre_post_path)
     print("[OK] Durations Three-Group:", res.duration_plots.three_group_path)
     print("[OK] Three-Group Stats:", res.duration_plots.three_group_stats)
+    print("[OK] Heatmap v1.0:", res.heatmaps.path_v1)
+    print("[OK] Heatmap vmax=max:", res.heatmaps.path_vmax)
+    print("[OK] Heatmap vmax_max:", res.heatmaps.vmax_max)
+
+
+"""
+from pathlib import Path
+import importlib
+import Area_X_meta_wrapper as axmw
+importlib.reload(axmw)
+
+detect  = Path("/Volumes/my_own_ssd/2025_areax_lesion/R08_RC6_Comp2_song_detection.json")
+decoded = Path("/Volumes/my_own_ssd/2025_areax_lesion/TweetyBERT_Pretrain_LLB_AreaX_FallSong_R08_RC6_Comp2_decoded_database.json")
+tdate   = "2025-05-22"
+
+res = axmw.run_area_x_meta_bundle(
+    song_detection_json=detect,
+    decoded_annotations_json=decoded,
+    treatment_date=tdate,
+    base_output_dir=decoded.parent / "figures",
+    max_gap_between_song_segments=500,
+    segment_index_offset=0,
+    merge_repeated_syllables=True,
+    repeat_gap_ms=10.0,
+    repeat_gap_inclusive=False,
+    merged_song_gap_ms=500,
+    top_k_last_labels=15,
+    target_labels=None,
+    top_k_targets=8,
+    top_k_preceders=12,
+    top_k_successors=12,
+    include_start_as_preceder=False,
+    include_end_as_successor=False,
+    include_other_bin=True,
+    include_other_in_hist=True,
+    other_label="Other",
+    heatmap_cmap="Greys",
+    nearest_match=True,
+    max_days_off=1,
+    show=True,
+)
+
+print("Last-syllable hist:", res.last_syllable_hist_path)
+print("Last-syllable pies:", res.last_syllable_pies_path)
+print("Durations pre/post:", res.duration_plots.pre_post_path)
+print("Durations three-group:", res.duration_plots.three_group_path)
+print("Heatmap v1.0:", res.heatmaps.path_v1)
+print("Heatmap vmax=max:", res.heatmaps.path_vmax)
+print("vmax_max used:", res.heatmaps.vmax_max)
+
+"""
