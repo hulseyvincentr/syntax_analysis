@@ -1,467 +1,524 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Area_X_meta_wrapper.py  (single-sheet version)
-from __future__ import annotations
+# Area_X_meta_wrapper.py
+"""
+Wrapper that:
+  • Merges decoded annotations ONCE
+  • Merges detected songs (durations) ONCE
+then runs three analyses using those merged tables:
+  1) Last-syllable histogram + pies  (balanced Early/Late/Post)
+  2) Per-target PRECEDER & SUCCESSOR combined panels (balanced groups)
+  3) Song-duration comparisons (Pre vs Post; Early-Pre vs Late-Pre vs Post with stats)
 
-import argparse
-import math
-import sys
+Depends on modules present in your PYTHONPATH / same folder:
+  - merge_annotations_from_split_songs.py      (build_decoded_with_split_labels)
+  - merge_potential_split_up_song.py           (build_detected_and_merged_songs)
+  - last_syllable_plots.py                     (helper funcs used directly)
+  - pre_and_post_syllable_plots.py             (helper funcs used directly)
+  - song_duration_comparison.py                (plot functions used directly)
+
+Typical usage (Spyder):
+
+    from pathlib import Path
+    import importlib
+    import Area_X_meta_wrapper as axmw
+    importlib.reload(axmw)
+
+    detect  = Path("/Volumes/my_own_ssd/2025_areax_lesion/R08_RC6_Comp2_song_detection.json")
+    decoded = Path("/Volumes/my_own_ssd/2025_areax_lesion/TweetyBERT_Pretrain_LLB_AreaX_FallSong_R08_RC6_Comp2_decoded_database.json")
+    tdate   = "2025-05-22"
+
+    out = axmw.run_area_x_meta_bundle(
+        song_detection_json=detect,
+        decoded_annotations_json=decoded,
+        treatment_date=tdate,
+        base_output_dir=decoded.parent / "figures",  # default: decoded.parent
+        # merge knobs (kept consistent across analyses)
+        max_gap_between_song_segments=500,   # for annotations merge
+        segment_index_offset=0,
+        merge_repeated_syllables=True,
+        repeat_gap_ms=10.0,
+        repeat_gap_inclusive=False,
+        merged_song_gap_ms=500,              # for durations merge
+        # last-syllable
+        top_k_last_labels=15,
+        # preceder/successor
+        target_labels=None,                  # None -> auto-select
+        top_k_targets=8,
+        top_k_preceders=12,
+        top_k_successors=12,
+        include_start_as_preceder=False,
+        include_end_as_successor=False,
+        include_other_bin=True,
+        include_other_in_hist=True,
+        other_label="Other",
+        # show figures interactively?
+        show=True,
+    )
+
+    print("Last-syllable hist:", out.last_syllable_hist_path)
+    print("Last-syllable pies:", out.last_syllable_pies_path)
+    print("Targets used:", out.targets_used)
+    print("Per-target panels:", out.per_target_outputs)
+    print("Durations pre/post:", out.duration_plots.pre_post_path)
+    print("Durations three-group:", out.duration_plots.three_group_path)
+    print("Three-group stats:", out.duration_plots.three_group_stats)
+
+CLI example:
+
+    python Area_X_meta_wrapper.py \
+      --song-detection "/path/..._song_detection.json" \
+      --annotations   "/path/..._decoded_database.json" \
+      --treatment-date "2025-05-22" \
+      --base-out "/path/figures" \
+      --ann-gap-ms 500 \
+      --merged-song-gap-ms 500 \
+      --merge-repeats \
+      --repeat-gap-ms 10 \
+      --top-k-last 15 \
+      --top-k-targets 8 \
+      --top-k-preceders 12 \
+      --top-k-successors 12 \
+      --include-other \
+      --include-other-in-hist
+"""
+
+from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Union, Any, Tuple
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 
-from Area_X_analysis_wrapper import WrapperConfig, run_all
+# --- Core builders (merge once) ---
+from merge_annotations_from_split_songs import build_decoded_with_split_labels
+from merge_potential_split_up_song import build_detected_and_merged_songs
 
-# Optional for per-animal TTE summaries
-try:
-    import importlib, tte_by_day
-    importlib.reload(tte_by_day)
-    from tte_by_day import TTE_by_day
-    _HAVE_TTE = True
-except Exception:
-    _HAVE_TTE = False
-    print("[warn] Could not import tte_by_day; ΔTTE summaries may be limited.", file=sys.stderr)
+# --- Analysis modules (we will call their internal helpers / public plotters) ---
+import last_syllable_plots as lsp
+import pre_and_post_syllable_plots as pps
+import song_duration_comparison as sdc
 
 
-# ───────────────────────── helpers ─────────────────────────
-def _parse_yes_no(x: object) -> Optional[bool]:
-    if x is None or (isinstance(x, float) and math.isnan(x)):
-        return None
-    s = str(x).strip().lower()
-    if s in {"y", "yes", "true", "t", "1"}: return True
-    if s in {"n", "no", "false", "f", "0"}: return False
+# ──────────────────────────────────────────────────────────────────────────────
+# Small utilities
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _as_timestamp(d) -> pd.Timestamp:
+    return pd.to_datetime(str(d)).normalize()
+
+def _ensure_cols_for_datetime(df: pd.DataFrame, col_candidates: List[str]) -> Optional[str]:
+    """Return the first present datetime column name, else None."""
+    for c in col_candidates:
+        if c in df.columns:
+            return c
     return None
 
-def _safe_str(x: object) -> Optional[str]:
-    if x is None: return None
-    s = str(x).strip()
-    return s or None
 
-def resolve_decoded_path(decoded_glob_template: str, animal_id: str) -> Optional[Path]:
-    pattern = decoded_glob_template.format(animal_id=animal_id)
-    base = Path("/")
-    candidates = list(base.glob(pattern.lstrip("/"))) or list(Path(".").resolve().glob(pattern))
-    if not candidates:
-        return None
-    candidates = sorted(candidates, key=lambda p: (len(str(p)), str(p)))
-    return candidates[0]
+# ──────────────────────────────────────────────────────────────────────────────
+# Dataclasses for outputs
+# ──────────────────────────────────────────────────────────────────────────────
 
-def _bin_lesion_percent(x: Optional[float], edges: List[float]) -> Optional[str]:
-    if x is None or (isinstance(x, float) and (math.isnan(x) or x < 0 or x > 100)): return None
-    for lo, hi in zip(edges[:-1], edges[1:]):
-        if x >= lo and (x <= hi if hi == edges[-1] else x < hi):
-            return f"{int(lo)}–{int(hi)}%"
-    return None
-
-def _stripna(series: pd.Series) -> pd.Series:
-    return series.replace([np.inf, -np.inf], np.nan).dropna()
-
-
-# ───────────────────────── config ─────────────────────────
 @dataclass
-class BatchConfig:
-    metadata_xlsx: Path                # single-sheet with name "metadata" (default)
-    decoded_glob: str                  # must include {animal_id}
-    output_root: Path
-    sheet_name: str = "metadata"
+class DurationPlotsOut:
+    pre_post_path: Optional[str]
+    three_group_path: Optional[str]
+    three_group_stats: Dict[str, Any]
 
-    # forward toggles
-    skip_daily: bool = False
-    skip_heatmap: bool = False
-    skip_phrase: bool = False
-    skip_tte: bool = False
-    show_plots: bool = False
+@dataclass
+class AreaXMetaResult:
+    # Last-syllable results
+    last_syllable_hist_path: Optional[str]
+    last_syllable_pies_path: Optional[str]
+    last_syllable_label_order: List[str]
+    last_syllable_counts: Dict[str, int]
 
-    # daily-transitions
-    min_row_total: int = 0
-    movie_fps: int = 2
-    movie_figsize: Tuple[float, float] = (8.0, 7.0)
+    # Preceder/successor results
+    targets_used: List[str]
+    per_target_outputs: Dict[str, Optional[str]]  # label -> path
 
-    # phrase-duration
-    grouping_mode: str = "auto_balance"
-    early_group_size: int = 100
-    late_group_size: int = 100
-    post_group_size: int = 100
-    y_max_ms: int = 40_000
+    # Duration results
+    duration_plots: DurationPlotsOut
 
-    # TTE
-    min_songs_per_day: int = 5
-    treatment_in: str = "post"
+    # Shared/merged tables
+    merged_annotations_df: pd.DataFrame
+    merged_detected_df: pd.DataFrame
 
-    # grouping bins
-    lesion_bin_edges: Tuple[float, float, float, float, float] = (0, 25, 50, 75, 100)
+    # Balanced splits (from annotations table, for convenience)
+    early_df: pd.DataFrame
+    late_df: pd.DataFrame
+    post_df: pd.DataFrame
 
 
-# ───────────────────────── batch run ─────────────────────────
-def run_batch(cfg: BatchConfig) -> pd.DataFrame:
-    req_cols = [
-        "Animal ID", "Treatment date", "Treatment type",
-        "Percentage of Area X lesioned", "Medial Area X lesioned (Y/N)",
-        "Injection #", "Injection volume (uL)", "AP (mm)", "ML (mm)", "DV (mm)",
-    ]
-    df = pd.read_excel(cfg.metadata_xlsx, sheet_name=cfg.sheet_name)
-    missing = [c for c in req_cols if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing required columns in '{cfg.sheet_name}': {missing}")
+# ──────────────────────────────────────────────────────────────────────────────
+# Main runner (merge-once → reuse)
+# ──────────────────────────────────────────────────────────────────────────────
 
-    cfg.output_root.mkdir(parents=True, exist_ok=True)
-    group_dir = cfg.output_root / "group_comparisons"
-    group_dir.mkdir(parents=True, exist_ok=True)
+def run_area_x_meta_bundle(
+    *,
+    song_detection_json: Union[str, Path],
+    decoded_annotations_json: Union[str, Path],
+    treatment_date: Union[str, pd.Timestamp],
+    base_output_dir: Optional[Union[str, Path]] = None,
 
-    # Normalize animal-level fields once; allow multiple injection rows per animal
-    df["Animal ID"] = df["Animal ID"].astype(str).str.strip()
-    df["_tdate"] = df["Treatment date"].astype(str).str.strip()
-    # Clean lesion %
-    def _to_float(x):
-        try:
-            return float(x)
-        except Exception:
-            return np.nan
-    df["_pct_lesion"] = df["Percentage of Area X lesioned"].apply(_to_float)
-    df["_medial"] = df["Medial Area X lesioned (Y/N)"].apply(_parse_yes_no)
-    df["_ttype"] = df["Treatment type"].astype(str).str.strip()
+    # ---- annotations merge (for syllable analyses) ----
+    max_gap_between_song_segments: int = 500,
+    segment_index_offset: int = 0,
+    merge_repeated_syllables: bool = True,
+    repeat_gap_ms: float = 10.0,
+    repeat_gap_inclusive: bool = False,
 
-    # Per-animal meta (first non-null wins + warn on conflicts)
-    meta_cols = ["_tdate", "_ttype", "_pct_lesion", "_medial"]
-    animals = []
-    for animal_id, sub in df.groupby("Animal ID"):
-        meta = {c: _first_non_null(sub[c]) for c in meta_cols}
-        # Warn if conflicting entries
-        _warn_conflicts(sub, animal_id, meta)
-        animals.append({
-            "animal_id": animal_id,
-            "treatment_date": meta["_tdate"] if meta["_tdate"] not in {"", "nan", "NaT"} else None,
-            "treatment_type": meta["_ttype"] if meta["_ttype"] not in {"", "nan"} else None,
-            "pct_lesion": meta["_pct_lesion"] if not (isinstance(meta["_pct_lesion"], float) and math.isnan(meta["_pct_lesion"])) else None,
-            "medial_lesion": meta["_medial"],
-            "injection_count": int(sub["Injection #"].dropna().shape[0]) if "Injection #" in sub else 0,
-        })
-    animals_df = pd.DataFrame(animals)
+    # ---- detection merge (for duration analyses) ----
+    merged_song_gap_ms: Optional[int] = 500,   # None/0 to skip merging
 
-    summaries: List[Dict] = []
-    for _, row in animals_df.iterrows():
-        animal_id = row["animal_id"]
-        tdate = row["treatment_date"]
-        ttype = row["treatment_type"]
-        pct_lesion = row["pct_lesion"]
-        medial_yes = row["medial_lesion"]
+    # ---- last-syllable knobs ----
+    top_k_last_labels: int = 15,
+    last_hist_filename: str = "last_syllable_hist.png",
+    last_pies_filename: str = "last_syllable_pies.png",
 
-        decoded_path = resolve_decoded_path(cfg.decoded_glob, animal_id)
-        if not decoded_path or not decoded_path.exists():
-            print(f"[warn] Decoded JSON not found for {animal_id} with pattern: {cfg.decoded_glob}")
-            summaries.append(dict(
-                animal_id=animal_id, treatment_date=tdate, treatment_type=ttype,
-                pct_lesion=pct_lesion, medial_lesion=medial_yes, injection_count=row["injection_count"],
-                decoded_found=False, tte_pre_mean=np.nan, tte_post_mean=np.nan, tte_delta=np.nan,
-                tte_pvalue=np.nan, tte_test=None,
-            ))
-            continue
+    # ---- preceder/successor knobs ----
+    target_labels: Optional[List[str]] = None,  # None → auto from balanced pools
+    top_k_targets: int = 8,
+    top_k_preceders: int = 12,
+    top_k_successors: int = 12,
+    include_start_as_preceder: bool = False,
+    include_end_as_successor: bool = False,
+    start_token: str = "<START>",
+    end_token: str = "<END>",
+    include_other_bin: bool = True,
+    include_other_in_hist: bool = True,
+    other_label: str = "Other",
 
-        # Save this animal's injection rows for reference
-        animal_inj = df[df["Animal ID"] == animal_id][
-            ["Injection #", "Injection volume (uL)", "AP (mm)", "ML (mm)", "DV (mm)"]
-        ].dropna(how="all")
-        animal_dir = (cfg.output_root / animal_id).resolve()
-        animal_dir.mkdir(parents=True, exist_ok=True)
-        inj_csv = animal_dir / f"{animal_id}_injections.csv"
-        if animal_inj.shape[0] > 0:
-            animal_inj.to_csv(inj_csv, index=False)
+    # ---- display ----
+    show: bool = True,
+) -> AreaXMetaResult:
 
-        # Run per-animal analyses
-        sc = WrapperConfig(
-            decoded=decoded_path,
-            output_root=animal_dir,
-            treatment_date=tdate,
-            skip_daily=cfg.skip_daily,
-            skip_heatmap=cfg.skip_heatmap,
-            skip_phrase=cfg.skip_phrase or (tdate is None),
-            skip_tte=cfg.skip_tte,
-            restrict_to_labels=None,
-            show_plots=cfg.show_plots,
-            min_row_total=cfg.min_row_total,
-            movie_fps=cfg.movie_fps,
-            movie_figsize=cfg.movie_figsize,
-            enforce_consistent_order=True,
-            reload_modules=True,
-            grouping_mode=cfg.grouping_mode,
-            early_group_size=cfg.early_group_size,
-            late_group_size=cfg.late_group_size,
-            post_group_size=cfg.post_group_size,
-            y_max_ms=cfg.y_max_ms,
-            min_songs_per_day=cfg.min_songs_per_day,
-            treatment_in=cfg.treatment_in,
+    song_detection_json = Path(song_detection_json)
+    decoded_annotations_json = Path(decoded_annotations_json)
+    tdate = _as_timestamp(treatment_date)
+
+    # Base outdir default
+    if base_output_dir is None:
+        base_output_dir = decoded_annotations_json.parent
+    base_output_dir = Path(base_output_dir)
+    last_dir = base_output_dir / "last_syllable"
+    pps_dir  = base_output_dir / "preceder_successor_panels"
+    dur_dir  = base_output_dir / "durations"
+    for d in (last_dir, pps_dir, dur_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+    # ── MERGE ONCE: decoded annotations (for syllable analyses) ──
+    ann = build_decoded_with_split_labels(
+        decoded_database_json=decoded_annotations_json,
+        song_detection_json=song_detection_json,
+        only_song_present=True,
+        compute_durations=True,
+        add_recording_datetime=True,
+        songs_only=True,
+        flatten_spec_params=True,
+        max_gap_between_song_segments=max_gap_between_song_segments,
+        segment_index_offset=segment_index_offset,
+        merge_repeated_syllables=merge_repeated_syllables,
+        repeat_gap_ms=repeat_gap_ms,
+        repeat_gap_inclusive=repeat_gap_inclusive,
+    )
+    merged_annotations_df = ann.annotations_appended_df.copy()
+
+    # ── MERGE ONCE: detected songs (for duration analyses) ──
+    if merged_song_gap_ms and int(merged_song_gap_ms) > 0:
+        det = build_detected_and_merged_songs(
+            song_detection_json,
+            songs_only=True,
+            flatten_spec_params=True,
+            max_gap_between_song_segments=int(merged_song_gap_ms),
         )
-        run_all(sc)
-
-        # Optional TTE summary (pre/post means, delta, p-value)
-        tte_pre_mean = np.nan
-        tte_post_mean = np.nan
-        tte_delta = np.nan
-        tte_pvalue = np.nan
-        tte_test = None
-        if _HAVE_TTE and tdate:
-            try:
-                res = TTE_by_day(
-                    decoded_database_json=str(decoded_path),
-                    creation_metadata_json=None,
-                    only_song_present=True,
-                    fig_dir=str(animal_dir / "tte_by_day"),
-                    show=False,
-                    min_songs_per_day=cfg.min_songs_per_day,
-                    treatment_date=tdate,
-                    treatment_in=cfg.treatment_in,
-                )
-                pre_vals = getattr(res, "pre_values", None)
-                post_vals = getattr(res, "post_values", None)
-                if pre_vals is not None and len(pre_vals) > 0:
-                    tte_pre_mean = float(np.nanmean(pre_vals))
-                if post_vals is not None and len(post_vals) > 0:
-                    tte_post_mean = float(np.nanmean(post_vals))
-                if not (np.isnan(tte_pre_mean) or np.isnan(tte_post_mean)):
-                    tte_delta = float(tte_post_mean - tte_pre_mean)
-                tte_pvalue = getattr(res, "prepost_p_value", np.nan)
-                tte_test = getattr(res, "prepost_test", None)
-            except Exception as e:
-                print(f"[warn] TTE_by_day failed for {animal_id}: {e}")
-
-        summaries.append(dict(
-            animal_id=animal_id,
-            treatment_date=tdate,
-            treatment_type=ttype,
-            pct_lesion=pct_lesion,
-            medial_lesion=medial_yes,
-            injection_count=row["injection_count"],
-            decoded_found=True,
-            tte_pre_mean=tte_pre_mean,
-            tte_post_mean=tte_post_mean,
-            tte_delta=tte_delta,
-            tte_pvalue=tte_pvalue,
-            tte_test=tte_test,
-        ))
-
-    # Save per-animal summary & group plots
-    summary_df = pd.DataFrame(summaries)
-    summary_csv = cfg.output_root / "summary_per_animal.csv"
-    summary_df.to_csv(summary_csv, index=False)
-    print(f"[summary] Wrote {summary_csv}")
-
-    _make_group_plots(summary_df, group_dir, cfg)
-
-    return summary_df
-
-
-def _first_non_null(series: pd.Series):
-    for v in series:
-        if pd.notna(v) and str(v).strip() != "":
-            return v
-    return np.nan
-
-def _warn_conflicts(sub: pd.DataFrame, animal_id: str, meta: Dict[str, object]) -> None:
-    # If multiple distinct non-null values exist for a field, warn once
-    for col, label in [("_tdate", "Treatment date"), ("_ttype", "Treatment type"),
-                       ("_pct_lesion", "Percentage of Area X lesioned"), ("_medial", "Medial Area X lesioned (Y/N)")]:
-        vals = set([str(v).strip() for v in sub[col].dropna().astype(str) if str(v).strip() != ""])
-        if len(vals) > 1:
-            print(f"[warn] Conflicting {label} for {animal_id}: {sorted(vals)}. Using first non-null: {meta[col]}.")
-
-
-# ────────────────── group comparisons (ΔTTE) ──────────────────
-def _box_scatter(ax, data_by_group: Dict[str, np.ndarray], title: str, ylabel: str) -> None:
-    groups = list(data_by_group.keys())
-    arrays = [data_by_group[g] for g in groups]
-    bp = ax.boxplot(arrays, labels=groups, showfliers=False)
-    for i, arr in enumerate(arrays, start=1):
-        x = np.random.normal(loc=i, scale=0.06, size=len(arr))
-        ax.scatter(x, arr, alpha=0.8, s=28)
-    ax.axhline(0.0, linestyle="--", linewidth=1.0, color="gray")
-    ax.set_title(title)
-    ax.set_ylabel(ylabel)
-    ax.grid(True, axis="y", alpha=0.25)
-
-def _make_group_plots(summary_df: pd.DataFrame, group_dir: Path, cfg: BatchConfig) -> None:
-    if "tte_delta" not in summary_df.columns:
-        print("[groups] No tte_delta in summary; skipping group plots.")
-        return
-
-    # 1) By Treatment type
-    if "treatment_type" not in summary_df.columns:
-        df = summary_df.rename(columns={"Treatment type": "treatment_type"})
+        merged_detected_df = det["detected_merged_songs"].copy()
+        _dur_title_suffix = f"(Merged gap < {int(merged_song_gap_ms)} ms)"
     else:
-        df = summary_df.copy()
+        # Fallback: use original segments table (kept flat)
+        # We call sdc._prepare_table to keep identical formatting/columns.
+        merged_detected_df = sdc._prepare_table(song_detection_json, merge_gap_ms=None, songs_only=True)
+        _dur_title_suffix = "(Unmerged segments)"
 
-    by_type: Dict[str, np.ndarray] = {}
-    for name, sub in df.groupby(df.get("treatment_type", pd.Series(["Unknown"]*len(df)))):
-        vals = _stripna(sub["tte_delta"])
-        if len(vals) > 0:
-            by_type[str(name)] = vals.to_numpy(dtype=float)
-    if len(by_type) >= 1:
-        fig, ax = plt.subplots(figsize=(7, 5))
-        _box_scatter(ax, by_type, "ΔTTE (post–pre) by Treatment type", "ΔTTE (post–pre)")
-        out = group_dir / "delta_tte_by_treatment_type.png"
-        fig.tight_layout(); fig.savefig(out, dpi=200); plt.close(fig)
-        print(f"[groups] Saved {out}")
+    # ──────────────────────────────────────────────────────────
+    # 1) LAST-SYLLABLE PLOTS (using lsp helpers on merged_annotations_df)
+    # ──────────────────────────────────────────────────────────
+    if merged_annotations_df.empty:
+        last_hist_path = None
+        last_pies_path = None
+        last_label_order: List[str] = []
+        last_counts = {"balanced_n": 0, "early_n": 0, "late_n": 0, "post_n": 0}
+        early_df = merged_annotations_df.copy()
+        late_df  = merged_annotations_df.copy()
+        post_df  = merged_annotations_df.copy()
+    else:
+        # balanced split (lsp helper expects "Recording DateTime"; rename if needed)
+        dfA = merged_annotations_df.copy()
+        if "Recording DateTime" not in dfA.columns and "recording_datetime" in dfA.columns:
+            dfA = dfA.rename(columns={"recording_datetime": "Recording DateTime"})
 
-    # 2) By Medial lesion (Y/N)
-    if "medial_lesion" in df.columns:
-        by_medial: Dict[str, np.ndarray] = {}
-        for flag, sub in df.groupby(df["medial_lesion"].map({True: "Y", False: "N", None: "NA"})):
-            vals = _stripna(sub["tte_delta"])
-            if len(vals) > 0:
-                by_medial[str(flag)] = vals.to_numpy(dtype=float)
-        if len(by_medial) >= 1:
-            fig, ax = plt.subplots(figsize=(6, 5))
-            _box_scatter(ax, by_medial, "ΔTTE (post–pre) by Medial Area X lesioned", "ΔTTE (post–pre)")
-            out = group_dir / "delta_tte_by_medial_lesion.png"
-            fig.tight_layout(); fig.savefig(out, dpi=200); plt.close(fig)
-            print(f"[groups] Saved {out}")
+        early_df, late_df, post_df, n_bal = lsp._split_pre_post_balanced(dfA, tdate)
 
-    # 3) By lesion percentage bins
-    if "pct_lesion" in df.columns and len(df["pct_lesion"].dropna()) > 0:
-        edges = list(cfg.lesion_bin_edges)
-        df["lesion_bin"] = df["pct_lesion"].apply(lambda v: _bin_lesion_percent(v, edges))
-        by_bin: Dict[str, np.ndarray] = {}
-        for b, sub in df.groupby(df["lesion_bin"].fillna("NA")):
-            vals = _stripna(sub["tte_delta"])
-            if len(vals) > 0:
-                by_bin[str(b)] = vals.to_numpy(dtype=float)
-        if len(by_bin) >= 1:
-            fig, ax = plt.subplots(figsize=(7, 5))
-            _box_scatter(ax, by_bin, "ΔTTE (post–pre) by Lesion % bin", "ΔTTE (post–pre)")
-            out = group_dir / "delta_tte_by_lesion_bin.png"
-            fig.tight_layout(); fig.savefig(out, dpi=200); plt.close(fig)
-            print(f"[groups] Saved {out}")
+        last_early = lsp._extract_last_syllables(early_df)
+        last_late  = lsp._extract_last_syllables(late_df)
+        last_post  = lsp._extract_last_syllables(post_df)
 
+        counts_by_group, label_order = lsp._counts_by_group(last_early, last_late, last_post, top_k=top_k_last_labels)
+        n_by_group = {
+            "Early Pre": int(last_early.shape[0]),
+            "Late Pre":  int(last_late.shape[0]),
+            "Post":      int(last_post.shape[0]),
+        }
 
-# ───────────────────────── CLI ─────────────────────────
-def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description="Batch wrapper (single-sheet metadata): run per-animal analyses and group comparisons."
+        title_base = f"Last syllables per song (balanced groups; Treatment {tdate.date()})"
+        hist_title = title_base + f"\n(Top {top_k_last_labels} labels)"
+        pies_title = "Last syllables: Early-Pre / Late-Pre / Post"
+
+        last_hist_path = (last_dir / last_hist_filename)
+        last_pies_path = (last_dir / last_pies_filename)
+
+        _ = lsp._plot_histogram(
+            counts_by_group, label_order, hist_title,
+            n_by_group=n_by_group, output_path=last_hist_path, show=show
+        )
+        _ = lsp._plot_pies(
+            counts_by_group, label_order, pies_title,
+            n_by_group=n_by_group, output_path=last_pies_path, show=show
+        )
+
+        last_label_order = list(label_order)
+        last_counts = {"balanced_n": int(n_bal),
+                       "early_n": n_by_group["Early Pre"], "late_n": n_by_group["Late Pre"], "post_n": n_by_group["Post"]}
+
+        last_hist_path = str(last_hist_path)
+        last_pies_path = str(last_pies_path)
+
+    # ──────────────────────────────────────────────────────────
+    # 2) PRECEDER + SUCCESSOR PANELS (pps helpers on merged_annotations_df)
+    # ──────────────────────────────────────────────────────────
+    targets_used: List[str] = []
+    per_target_outputs: Dict[str, Optional[str]] = {}
+
+    if not merged_annotations_df.empty:
+        # balanced groups again (pps helper allows "Recording DateTime"; ensure column)
+        dfB = merged_annotations_df.copy()
+        if "Recording DateTime" not in dfB.columns and "recording_datetime" in dfB.columns:
+            dfB = dfB.rename(columns={"recording_datetime": "Recording DateTime"})
+        e_df, l_df, p_df, _ = pps._balanced_split_by_treatment(dfB, tdate)
+
+        # choose targets
+        if target_labels is None:
+            cat_df = pd.concat([e_df, l_df, p_df], ignore_index=True)
+            targets = pps._select_target_labels_auto(cat_df, top_k_targets=top_k_targets)
+        else:
+            targets = [str(t) for t in target_labels]
+        targets_used = list(targets)
+
+        groups = ["Early Pre", "Late Pre", "Post"]
+        title_suffix = f"(balanced Early-Pre / Late-Pre / Post; Treatment {tdate.date()})"
+
+        for tgt in targets:
+            # preceders
+            e_pre_raw = pps._preceder_counts_for_target(e_df, tgt, include_start=include_start_as_preceder, start_token=start_token)
+            l_pre_raw = pps._preceder_counts_for_target(l_df, tgt, include_start=include_start_as_preceder, start_token=start_token)
+            p_pre_raw = pps._preceder_counts_for_target(p_df, tgt, include_start=include_start_as_preceder, start_token=start_token)
+            order_pre = pps._unified_order(top_k_preceders, e_pre_raw, l_pre_raw, p_pre_raw)
+
+            # successors
+            e_suc_raw = pps._successor_counts_for_target(e_df, tgt, include_end=include_end_as_successor, end_token=end_token)
+            l_suc_raw = pps._successor_counts_for_target(l_df, tgt, include_end=include_end_as_successor, end_token=end_token)
+            p_suc_raw = pps._successor_counts_for_target(p_df, tgt, include_end=include_end_as_successor, end_token=end_token)
+            order_suc = pps._unified_order(top_k_successors, e_suc_raw, l_suc_raw, p_suc_raw)
+
+            # optional "Other"
+            order_pre_hist = pps._order_with_optional_other(order_pre, [e_pre_raw, l_pre_raw, p_pre_raw],
+                                                            include_other=include_other_in_hist, other_label=other_label)
+            order_pre_pie  = pps._order_with_optional_other(order_pre, [e_pre_raw, l_pre_raw, p_pre_raw],
+                                                            include_other=True, other_label=other_label)
+            order_suc_hist = pps._order_with_optional_other(order_suc, [e_suc_raw, l_suc_raw, p_suc_raw],
+                                                            include_other=include_other_in_hist, other_label=other_label)
+            order_suc_pie  = pps._order_with_optional_other(order_suc, [e_suc_raw, l_suc_raw, p_suc_raw],
+                                                            include_other=True, other_label=other_label)
+
+            def _prep_counts(raw_s: pd.Series, order_for_hist: List[str], order_for_pie: List[str]):
+                s_hist = pps._apply_other_bin(raw_s, order_for_hist, include_other=(include_other_in_hist), other_label=other_label)
+                s_pie  = pps._apply_other_bin(raw_s, order_for_pie,  include_other=True,                  other_label=other_label)
+                return s_hist, s_pie
+
+            e_pre_hist, e_pre_pie = _prep_counts(e_pre_raw, order_pre_hist, order_pre_pie)
+            l_pre_hist, l_pre_pie = _prep_counts(l_pre_raw, order_pre_hist, order_pre_pie)
+            p_pre_hist, p_pre_pie = _prep_counts(p_pre_raw, order_pre_hist, order_pre_pie)
+
+            e_suc_hist, e_suc_pie = _prep_counts(e_suc_raw, order_suc_hist, order_suc_pie)
+            l_suc_hist, l_suc_pie = _prep_counts(l_suc_raw, order_suc_hist, order_suc_pie)
+            p_suc_hist, p_suc_pie = _prep_counts(p_suc_raw, order_suc_hist, order_suc_pie)
+
+            counts_pre_by_group_pie  = {"Early Pre": e_pre_pie,  "Late Pre": l_pre_pie,  "Post": p_pre_pie}
+            counts_suc_by_group_pie  = {"Early Pre": e_suc_pie,  "Late Pre": l_suc_pie,  "Post": p_suc_pie}
+
+            n_pre_by_group = {g: int(counts_pre_by_group_pie[g].sum()) for g in groups}
+            n_suc_by_group = {g: int(counts_suc_by_group_pie[g].sum()) for g in groups}
+
+            # pick histogram orders actually present
+            def _pick_order(d: Dict[str, pd.Series]) -> List[str]:
+                for g in groups:
+                    if len(d[g].index) > 0:
+                        return list(d[g].index)
+                return []
+            order_pre_used_hist = _pick_order({"Early Pre": e_pre_hist, "Late Pre": l_pre_hist, "Post": p_pre_hist})
+            order_suc_used_hist = _pick_order({"Early Pre": e_suc_hist, "Late Pre": l_suc_hist, "Post": p_suc_hist})
+
+            out_path = pps_dir / f"preceder_successor_target_{tgt}.png"
+            _ = pps._plot_pre_suc_panel(
+                target_label=str(tgt),
+                title_suffix=title_suffix,
+                counts_pre_by_group=counts_pre_by_group_pie,
+                order_pre=order_pre_used_hist,
+                n_pre_by_group=n_pre_by_group,
+                counts_suc_by_group=counts_suc_by_group_pie,
+                order_suc=order_suc_used_hist,
+                n_suc_by_group=n_suc_by_group,
+                include_other_in_hist=include_other_in_hist,
+                other_label=other_label,
+                output_path=out_path, show=show,
+            )
+            per_target_outputs[str(tgt)] = str(out_path)
+    # else: targets_used/per_target_outputs remain defaults
+
+    # ──────────────────────────────────────────────────────────
+    # 3) SONG-DURATION PLOTS (reuse merged_detected_df; use sdc public plotters)
+    # ──────────────────────────────────────────────────────────
+    pre_df, post_df = sdc._split_pre_post(merged_detected_df, treatment_date=tdate)
+    pre_s  = sdc._durations_seconds(pre_df)
+    post_s = sdc._durations_seconds(post_df)
+
+    dur_prepost_path = dur_dir / "song_duration_pre_post.png"
+    _plot1 = sdc.plot_pre_post_boxplot(
+        pre_s, post_s,
+        treatment_date=tdate,
+        merge_gap_ms=merged_song_gap_ms,
+        output_path=dur_prepost_path,
+        show=show,
+        title=f"Song durations Pre vs Post (Treatment: {tdate.date()})\n{_dur_title_suffix}",
     )
-    p.add_argument("--metadata_xlsx", type=str, required=True,
-                   help="Path to XLSX with a single 'metadata' sheet.")
-    p.add_argument("--decoded_glob", type=str, required=True,
-                   help="Glob with {animal_id}, e.g. '/Users/you/**/{animal_id}*decoded_database.json'")
-    p.add_argument("--output_root", type=str, required=True,
-                   help="Folder for per-animal outputs and group plots.")
-    p.add_argument("--sheet_name", type=str, default="metadata")
 
-    # forward
-    p.add_argument("--skip_daily", action="store_true")
-    p.add_argument("--skip_heatmap", action="store_true")
-    p.add_argument("--skip_phrase", action="store_true")
-    p.add_argument("--skip_tte", action="store_true")
-    p.add_argument("--show_plots", action="store_true")
+    e3, l3, p3, _n = sdc._split_three_groups_balanced(pre_df, post_df)
+    eS, lS, pS = sdc._durations_seconds(e3), sdc._durations_seconds(l3), sdc._durations_seconds(p3)
 
-    # daily-transitions
-    p.add_argument("--min_row_total", type=int, default=0)
-    p.add_argument("--movie_fps", type=int, default=2)
-    p.add_argument("--movie_figsize", type=float, nargs=2, default=[8.0, 7.0])
-
-    # phrase-duration
-    p.add_argument("--grouping_mode", type=str, choices=["auto_balance", "explicit"], default="auto_balance")
-    p.add_argument("--early_group_size", type=int, default=100)
-    p.add_argument("--late_group_size", type=int, default=100)
-    p.add_argument("--post_group_size", type=int, default=100)
-    p.add_argument("--y_max_ms", type=int, default=40000)
-
-    # TTE
-    p.add_argument("--min_songs_per_day", type=int, default=5)
-    p.add_argument("--treatment_in", type=str, choices=["pre", "post"], default="post")
-
-    # lesion bin edges
-    p.add_argument("--lesion_bin_edges", type=float, nargs="+", default=[0, 25, 50, 75, 100])
-    return p
-
-
-def main(argv: Optional[Sequence[str]] = None) -> None:
-    args = _build_parser().parse_args(argv)
-    cfg = BatchConfig(
-        metadata_xlsx=Path(args.metadata_xlsx).expanduser().resolve(),
-        decoded_glob=args.decoded_glob,
-        output_root=Path(args.output_root).expanduser().resolve(),
-        sheet_name=args.sheet_name,
-        skip_daily=args.skip_daily,
-        skip_heatmap=args.skip_heatmap,
-        skip_phrase=args.skip_phrase,
-        skip_tte=args.skip_tte,
-        show_plots=args.show_plots,
-        min_row_total=args.min_row_total,
-        movie_fps=args.movie_fps,
-        movie_figsize=(float(args.movie_figsize[0]), float(args.movie_figsize[1])),
-        grouping_mode=args.grouping_mode,
-        early_group_size=args.early_group_size,
-        late_group_size=args.late_group_size,
-        post_group_size=args.post_group_size,
-        y_max_ms=args.y_max_ms,
-        min_songs_per_day=args.min_songs_per_day,
-        treatment_in=args.treatment_in,
-        lesion_bin_edges=tuple(args.lesion_bin_edges),
+    dur_three_path = dur_dir / "song_duration_three_group.png"
+    _plot2 = sdc.plot_three_group_boxplot(
+        eS, lS, pS,
+        treatment_date=tdate,
+        merge_gap_ms=merged_song_gap_ms,
+        output_path=dur_three_path,
+        show=show,
+        title=f"Song durations: Early Pre / Late Pre / Post (Treatment: {tdate.date()})\n{_dur_title_suffix}",
+        do_stats=True,
     )
-    print("============================================================")
-    print("Area X Meta Batch Wrapper (single-sheet)")
-    print("Metadata XLSX  :", cfg.metadata_xlsx)
-    print("Sheet name     :", cfg.sheet_name)
-    print("Decoded glob   :", cfg.decoded_glob)
-    print("Output root    :", cfg.output_root)
-    print("============================================================")
-    _ = run_batch(cfg)
-    print("============================================================")
-    print("Done. See outputs in:", cfg.output_root)
-    print(" - summary_per_animal.csv")
-    print(" - group_comparisons/*.png")
-    print("Per-animal outputs live under subfolders per Animal ID.")
-    print("============================================================")
 
+    duration_out = DurationPlotsOut(
+        pre_post_path=str(dur_prepost_path),
+        three_group_path=str(dur_three_path),
+        three_group_stats=_plot2.get("stats", {}),
+    )
+
+    # Build final result
+    return AreaXMetaResult(
+        last_syllable_hist_path=last_hist_path,
+        last_syllable_pies_path=last_pies_path,
+        last_syllable_label_order=last_label_order,
+        last_syllable_counts=last_counts,
+        targets_used=targets_used,
+        per_target_outputs=per_target_outputs,
+        duration_plots=duration_out,
+        merged_annotations_df=merged_annotations_df,
+        merged_detected_df=merged_detected_df,
+        early_df=early_df,
+        late_df=late_df,
+        post_df=post_df,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CLI
+# ──────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    main()
+    import argparse
 
-"""
-from pathlib import Path
-from Area_X_analysis_wrapper import run_all, WrapperConfig
+    p = argparse.ArgumentParser(description="Area X meta wrapper: merge once, run last-syllable, preceder/successor, and duration plots.")
+    p.add_argument("--song-detection", "-d", type=str, required=True, help="Path to *_song_detection.json")
+    p.add_argument("--annotations", "-a", type=str, required=True, help="Path to *_decoded_database.json")
+    p.add_argument("--treatment-date", "-t", type=str, required=True, help="YYYY-MM-DD")
+    p.add_argument("--base-out", type=str, default=None, help="Base output directory (default: annotations.parent)")
 
-decoded = Path("/Users/mirandahulsey-vincent/Desktop/AreaX_lesion_2024/USA5443_decoded_database.json")
-outdir  = Path("/Users/mirandahulsey-vincent/Desktop/AreaX_lesion_2024/USA5443_figures")
-tdate   = "2024-04-30"                 # or None
+    # annotations merge
+    p.add_argument("--ann-gap-ms", type=int, default=500)
+    p.add_argument("--seg-offset", type=int, default=0)
+    p.add_argument("--merge-repeats", action="store_true")
+    p.add_argument("--repeat-gap-ms", type=float, default=10.0)
+    p.add_argument("--repeat-gap-inclusive", action="store_true")
 
-cfg = WrapperConfig(
-    decoded=decoded,
-    output_root=outdir,
-    treatment_date=tdate,
+    # detection merge (durations)
+    p.add_argument("--merged-song-gap-ms", type=int, default=500, help="Set 0/None to disable merging durations.")
 
-    # toggle steps (False = run; True = skip)
-    skip_daily=False,
-    skip_heatmap=False,
-    skip_phrase=False,
-    skip_tte=False,
+    # last-syllable
+    p.add_argument("--top-k-last", type=int, default=15)
+    p.add_argument("--last-hist-name", type=str, default="last_syllable_hist.png")
+    p.add_argument("--last-pies-name", type=str, default="last_syllable_pies.png")
 
-    # labels (None = use all)
-    restrict_to_labels=None,  # e.g. ['0','1','2','3']
+    # preceder/successor
+    p.add_argument("--targets", nargs="*", default=None, help="Explicit target labels; omit to auto-select.")
+    p.add_argument("--top-k-targets", type=int, default=8)
+    p.add_argument("--top-k-preceders", type=int, default=12)
+    p.add_argument("--top-k-successors", type=int, default=12)
+    p.add_argument("--include-start", action="store_true")
+    p.add_argument("--include-end", action="store_true")
+    p.add_argument("--include-other", action="store_true")
+    p.add_argument("--include-other-in-hist", action="store_true")
+    p.add_argument("--other-label", type=str, default="Other")
 
-    # daily transitions movie
-    movie_fps=2,
-    movie_figsize=(8, 7),
-    min_row_total=0,
+    p.add_argument("--no-show", action="store_true")
 
-    # phrase duration
-    grouping_mode="auto_balance",  # or "explicit"
-    early_group_size=100,
-    late_group_size=100,
-    post_group_size=100,
-    y_max_ms=40000,
+    args = p.parse_args()
 
-    # TTE
-    min_songs_per_day=5,
-    treatment_in="post",
+    res = run_area_x_meta_bundle(
+        song_detection_json=args.song_detection,
+        decoded_annotations_json=args.annotations,
+        treatment_date=args.treatment_date,
+        base_output_dir=args.base_out,
+        # annotations merge
+        max_gap_between_song_segments=args.ann_gap_ms,
+        segment_index_offset=args.seg_offset,
+        merge_repeated_syllables=args.merge_repeats,
+        repeat_gap_ms=args.repeat_gap_ms,
+        repeat_gap_inclusive=args.repeat_gap_inclusive,
+        # detection merge
+        merged_song_gap_ms=args.merged_song_gap_ms,
+        # last-syllable
+        top_k_last_labels=args.top_k_last,
+        last_hist_filename=args.last_hist_name,
+        last_pies_filename=args.last_pies_name,
+        # preceder/successor
+        target_labels=args.targets,
+        top_k_targets=args.top_k_targets,
+        top_k_preceders=args.top_k_preceders,
+        top_k_successors=args.top_k_successors,
+        include_start_as_preceder=args.include_start,
+        include_end_as_successor=args.include_end,
+        include_other_bin=args.include_other,
+        include_other_in_hist=args.include_other_in_hist,
+        other_label=args.other_label,
+        # display
+        show=not args.no_show,
+    )
 
-    # visuals
-    show_plots=True,
-)
-
-run_all(cfg)
-
-
-"""
+    print("[OK] Last-syllable hist:", res.last_syllable_hist_path)
+    print("[OK] Last-syllable pies:", res.last_syllable_pies_path)
+    print("[OK] Targets used:", res.targets_used)
+    print("[OK] Per-target panels:", len(res.per_target_outputs))
+    print("[OK] Durations Pre/Post:", res.duration_plots.pre_post_path)
+    print("[OK] Durations Three-Group:", res.duration_plots.three_group_path)
+    print("[OK] Three-Group Stats:", res.duration_plots.three_group_stats)

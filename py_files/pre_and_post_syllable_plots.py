@@ -35,7 +35,7 @@ Quick example (Spyder):
         repeat_gap_ms=10.0,
         repeat_gap_inclusive=False,
         target_labels=None,            # None -> auto-select top_k_targets
-        top_k_targets=8,
+        top_k_targets=None,
         top_k_preceders=12,
         top_k_successors=12,
         include_start_as_preceder=False,
