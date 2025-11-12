@@ -8,46 +8,19 @@ annotations from merge_annotations_from_split_songs.py.
 Per target, produces one combined figure:
   • Left column  = PRECEDERS   (histogram + pies)
   • Right column = SUCCESSORS  (histogram + pies)
-  • A SINGLE SHARED legend for all pies (preceder+successor), with consistent colors
+  • SINGLE shared legend for all pies (preceder+successor), with consistent colors
+  • Each pie title shows: "<Group>\\n(n songs = ...)"
 
-Low-frequency categories not in Top-K are aggregated into an "Other" bin
-(configurable; applies to pies and, optionally, histograms).
+Low-frequency categories not in Top-K are aggregated into an "Other" bin (configurable).
 
-Quick example (Spyder):
+Color policy (matches your HDBSCAN/UMAP script):
+  - Integer labels → 60-color qualitative palette (tab20 + tab20b + tab20c)
+  - -1 (noise)     → fixed gray
+  - <START>, <END> → fixed colors
+  - "Other"        → fixed light gray
 
-    from pathlib import Path
-    import importlib
-    import pre_and_post_syllable_plots as pps
-    import merge_annotations_from_split_songs as mps
-    importlib.reload(pps); importlib.reload(mps)
-
-    detect  = Path("/Volumes/my_own_ssd/2025_areax_lesion/R08_RC6_Comp2_song_detection.json")
-    decoded = Path("/Volumes/my_own_ssd/2025_areax_lesion/TweetyBERT_Pretrain_LLB_AreaX_FallSong_R08_RC6_Comp2_decoded_database.json")
-    tdate   = "2025-05-22"
-
-    out = pps.run_pre_and_post_syllable_plots(
-        song_detection_json=detect,
-        decoded_annotations_json=decoded,
-        treatment_date=tdate,
-        max_gap_between_song_segments=500,
-        segment_index_offset=0,
-        merge_repeated_syllables=True,
-        repeat_gap_ms=10.0,
-        repeat_gap_inclusive=False,
-        target_labels=None,            # None -> auto-select top_k_targets
-        top_k_targets=None,
-        top_k_preceders=12,
-        top_k_successors=12,
-        include_start_as_preceder=False,
-        include_end_as_successor=False,
-        start_token="<START>",
-        end_token="<END>",
-        include_other_bin=True,        # aggregate non-TopK into "Other"
-        include_other_in_hist=True,    # also show "Other" in histograms
-        other_label="Other",
-        combined_output_dir=decoded.parent / "preceder_successor_panels",
-        show=True,
-    )
+REQUESTED CHANGE: Histogram bars are drawn in distinct SHADES OF GRAY per group
+(Early/Late/Post), while pie wedges use the HDBSCAN label colors.
 """
 
 from __future__ import annotations
@@ -77,8 +50,8 @@ def _as_timestamp(d) -> pd.Timestamp:
 
 def _sequence_from_dict(label_to_intervals: dict) -> List[str]:
     """
-    Flatten a dict {label: [[on,off], ...]} into a single sequence of labels
-    ordered by interval onset time. Repeats are preserved.
+    Flatten {label: [[on,off], ...]} → chronological sequence of labels (strings).
+    Repeats are preserved.
     """
     if not isinstance(label_to_intervals, dict) or not label_to_intervals:
         return []
@@ -148,9 +121,7 @@ def _preceder_counts_for_target(
                 C[prev_lab] += 1
         if include_start and len(seq) and seq[0] == str(target_label):
             C[start_token] += 1
-    s = pd.Series(C, dtype=int)
-    s = s.sort_values(ascending=False)
-    return s
+    return pd.Series(C, dtype=int).sort_values(ascending=False)
 
 def _successor_counts_for_target(
     df: pd.DataFrame,
@@ -168,20 +139,14 @@ def _successor_counts_for_target(
                 C[next_lab] += 1
         if include_end and len(seq) and seq[-1] == str(target_label):
             C[end_token] += 1
-    s = pd.Series(C, dtype=int)
-    s = s.sort_values(ascending=False)
-    return s
+    return pd.Series(C, dtype=int).sort_values(ascending=False)
 
-def _select_target_labels_auto(
-    merged_df: pd.DataFrame,
-    top_k_targets: int = 8,
-) -> List[str]:
+def _select_target_labels_auto(merged_df: pd.DataFrame, top_k_targets: int = 8) -> List[str]:
     from collections import Counter
     C = Counter()
     for _, row in merged_df.iterrows():
         seq = _sequence_from_dict(row.get("syllable_onsets_offsets_ms_dict", {}))
-        # count appearances excluding first to bias toward ones that have preceders
-        for i in range(1, len(seq)):
+        for i in range(1, len(seq)):  # exclude first position
             C[seq[i]] += 1
     if not C:
         return []
@@ -197,29 +162,77 @@ def _unified_order(top_k: int, *series: pd.Series) -> List[str]:
     return total.sort_values(ascending=False).head(top_k).index.astype(str).tolist()
 
 
-# ----- palette -----
+# ──────────────────────────────────────────────────────────────────────────────
+# HDBSCAN-style palette + robust Label→Color LUT
+# ──────────────────────────────────────────────────────────────────────────────
 
-def _stacked_palette(n: int) -> List[tuple]:
+def _get_tab60_palette() -> List[str]:
+    """tab20 + tab20b + tab20c → 60 hex colors."""
+    tab20  = plt.get_cmap("tab20").colors
+    tab20b = plt.get_cmap("tab20b").colors
+    tab20c = plt.get_cmap("tab20c").colors
+    return [mpl.colors.to_hex(c) for c in (*tab20, *tab20b, *tab20c)]
+
+def _collect_numeric_labels_from_df(df: pd.DataFrame) -> List[int]:
+    """Collect integer-like labels present as keys in syllable dicts."""
+    labs = set()
+    for _, row in df.iterrows():
+        d = row.get("syllable_onsets_offsets_ms_dict", {})
+        if isinstance(d, dict):
+            for k in d.keys():
+                try:
+                    labs.add(int(k))
+                except Exception:
+                    pass
+    return sorted(labs)
+
+def _normalize_label_key(raw: Union[str, int, float],
+                         start_token: str,
+                         end_token: str,
+                         other_label: str) -> str:
     """
-    Build a long list of distinct colors by stacking tab20, tab20b, tab20c.
+    Normalize labels so color lookups don't fail:
+     - strip whitespace
+     - map numeric-like strings/floats to canonical integer string (e.g., '5.0' -> '5')
+     - pass through tokens and 'Other'
     """
-    cmaps = ["tab20", "tab20b", "tab20c"]
-    cols: List[tuple] = []
-    for name in cmaps:
-        cmap = mpl.cm.get_cmap(name)
-        cols.extend([cmap(i) for i in range(cmap.N)])
-    if n <= len(cols):
-        return cols[:n]
-    k = int(np.ceil(n / len(cols)))
-    cols = (cols * k)[:n]
-    return cols
+    s = str(raw).strip()
+    if s in {str(start_token), str(end_token), str(other_label), str(-1)}:
+        return s
+    try:
+        f = float(s)
+        if f.is_integer():
+            return str(int(f))
+        return s
+    except Exception:
+        return s
 
-def _unique(seq):
-    """Deduplicate while preserving order."""
-    return list(dict.fromkeys(seq))
+def _build_label_color_lut_from_df(
+    df: pd.DataFrame,
+    *,
+    start_token: str,
+    end_token: str,
+    other_label: str,
+    noise_color: str = "#7f7f7f",
+) -> Dict[str, str]:
+    """
+    Mirror the HDBSCAN plotting code and ensure robust keys.
+    """
+    palette = _get_tab60_palette()
+    int_labels = _collect_numeric_labels_from_df(df)
+
+    lut: Dict[str, str] = {str(-1): noise_color}
+    for i, lab in enumerate(int_labels):
+        lut[str(lab)] = palette[i % len(palette)]
+
+    # Tokens/aggregates: fixed, readable colors
+    lut[str(start_token)] = "#000000"  # black
+    lut[str(end_token)]   = "#FFD54F"  # amber
+    lut[str(other_label)] = "#BDBDBD"  # light gray (distinct from noise gray)
+    return lut
 
 
-# ----- "Other" bin helpers (fixed to avoid duplicate labels) -----
+# ----- "Other" bin helpers -----
 
 def _apply_other_bin(
     s: pd.Series,
@@ -233,11 +246,7 @@ def _apply_other_bin(
     If 'Other' already exists, we add to it (no duplicate index).
     """
     s = s.copy().astype(float)
-
-    # values in the requested order (fill missing with 0)
     main = s.reindex(label_order, fill_value=0.0)
-
-    # anything not in label_order is leftover → goes into 'Other'
     leftover = s.drop(labels=label_order, errors="ignore").sum()
 
     if include_other and leftover > 0:
@@ -246,7 +255,6 @@ def _apply_other_bin(
         else:
             main = pd.concat([main, pd.Series({other_label: float(leftover)})])
 
-    # collapse any accidental duplicates by index
     if not main.index.is_unique:
         main = main.groupby(level=0).sum()
 
@@ -272,6 +280,42 @@ def _order_with_optional_other(
     return label_order
 
 
+# ----- Legend sorting (numeric first, then tokens, then others) -----
+
+def _sort_legend_labels(labels: List[str],
+                        start_token: str,
+                        end_token: str,
+                        other_label: str) -> List[str]:
+    """
+    Sort legend labels:
+      - numeric (incl. negatives like -1) → ascending integer order
+      - then tokens in this order: <START>, <END>, Other
+      - then any remaining non-numeric labels → lexicographic
+    Expects already-normalized strings.
+    """
+    def _unique(seq): return list(dict.fromkeys(seq))
+
+    nums: List[int] = []
+    nonnums: List[str] = []
+    for lab in labels:
+        try:
+            f = float(lab)
+            if f.is_integer():
+                nums.append(int(f))
+            else:
+                nonnums.append(lab)
+        except Exception:
+            nonnums.append(lab)
+
+    nums = sorted(_unique(nums))
+    numeric_sorted = [str(n) for n in nums]
+
+    remainder = [x for x in _unique(nonnums) if x not in {start_token, end_token, other_label}]
+    tokens = [tok for tok in (start_token, end_token, other_label) if tok in nonnums]
+
+    return numeric_sorted + tokens + sorted(remainder)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Combined plot: PRECEDER (left) + SUCCESSOR (right) for one target label
 # ──────────────────────────────────────────────────────────────────────────────
@@ -288,23 +332,34 @@ def _plot_pre_suc_panel(
     counts_suc_by_group: Dict[str, pd.Series],
     order_suc: List[str],                 # hist order
     n_suc_by_group: Dict[str, int],
+    # NEW: number of songs per group (Early/Late/Post)
+    n_songs_by_group: Optional[Dict[str, int]] = None,
     # shared legend + "Other" behavior
-    include_other_in_hist: bool,
-    other_label: str,
+    include_other_in_hist: bool = True,
+    other_label: str = "Other",
     output_path: Optional[Union[str, Path]] = None,
     show: bool = True,
+    # NEW: LUT + tokens to ensure robust lookup
+    color_lut: Optional[Dict[str, str]] = None,
+    start_token: str = "<START>",
+    end_token: str = "<END>",
 ):
     """
     Make a single figure with two columns:
       left  = PRECEDER (hist + pies)
       right = SUCCESSOR (hist + pies)
 
-    A single SHARED pie-legend is built over the union of labels that actually
-    appear in any pie (both columns). Colors are consistent across both pie columns.
+    Pie colors are looked up through `color_lut` using normalized keys (so '5',
+    '5.0', 5 match). Histogram bars are shaded greys by group (Early/Late/Post).
     """
     groups = ["Early Pre", "Late Pre", "Post"]
+    color_lut = color_lut or {}
 
-    # Build a single shared legend over ALL labels that actually appear in pies
+    def _lab_color(lab: Union[str, int, float]) -> str:
+        key = _normalize_label_key(lab, start_token, end_token, other_label)
+        return color_lut.get(key, "#808080")  # mid-gray fallback (should be rare)
+
+    # Build union of labels actually appearing in pies (normalize for legend)
     pie_series_list = [
         counts_pre_by_group.get("Early Pre",  pd.Series(dtype=float)),
         counts_pre_by_group.get("Late Pre",   pd.Series(dtype=float)),
@@ -316,33 +371,36 @@ def _plot_pre_suc_panel(
     union_labels: List[str] = []
     for s in pie_series_list:
         for lab in getattr(s, "index", []):
-            if lab not in union_labels:
-                union_labels.append(str(lab))
-
-    # Build a single color map across union labels
-    palette = _stacked_palette(max(1, len(union_labels)))
-    color_map = {lab: palette[i % len(palette)] for i, lab in enumerate(union_labels)}
+            key = _normalize_label_key(lab, start_token, end_token, other_label)
+            if key not in union_labels:
+                union_labels.append(key)
+    union_labels_sorted = _sort_legend_labels(union_labels, start_token, end_token, other_label)
 
     # Layout
     fig = plt.figure(figsize=(16, 8.8))
-    gs = fig.add_gridspec(2, 2, height_ratios=[1.0, 1.25], wspace=0.28, hspace=0.36)
+    gs = fig.add_gridspec(2, 2, height_ratios=[1.0, 1.3], wspace=0.28, hspace=0.38)
     fig.suptitle(f"Syllable {target_label}: Preceders & Successors {title_suffix}", fontsize=14)
+
+    # Predefine grey shades for histograms (Early / Late / Post)
+    GREYS = ["#4a4a4a", "#8c8c8c", "#cfcfcf"]
 
     # --------- PRECEDER column ---------
     ax_hist_pre = fig.add_subplot(gs[0, 0])
-    gs_pies_pre = gs[1, 0].subgridspec(1, 3, wspace=0.02)
+    gs_pies_pre = gs[1, 0].subgridspec(1, 3, wspace=0.06)
     ax_pie_pre = [fig.add_subplot(gs_pies_pre[0, i]) for i in range(3)]
 
     x_pre = np.arange(len(order_pre), dtype=float)
     width = 0.8 / max(1, len(groups))
 
-    # PRECEDER histogram (%)
+    # PRECEDER histogram (%), GREY bars
     for i, g in enumerate(groups):
         s = counts_pre_by_group.get(g, pd.Series(dtype=float)).reindex(order_pre, fill_value=0.0)
         denom = s.sum()
         y = (s / denom * 100.0) if denom > 0 else np.zeros_like(s.values)
         ax_hist_pre.bar(x_pre + (i - (len(groups)-1)/2)*width, y, width=width,
-                        label=f"{g} (n={n_pre_by_group.get(g, 0)})", zorder=2)
+                        label=f"{g} (n={n_pre_by_group.get(g, 0)})",
+                        color=GREYS[i % len(GREYS)], edgecolor="#333333", linewidth=0.6,
+                        zorder=2)
     ax_hist_pre.set_title("Preceders (percent)")
     ax_hist_pre.set_xticks(x_pre)
     ax_hist_pre.set_xticklabels(order_pre, rotation=45, ha="right")
@@ -351,36 +409,41 @@ def _plot_pre_suc_panel(
     ax_hist_pre.yaxis.grid(True, linestyle=":", linewidth=0.8, alpha=0.6, zorder=1)
     ax_hist_pre.legend(loc="upper center", bbox_to_anchor=(0.5, -0.22), ncol=3, frameon=False)
 
-    # PRECEDER pies
+    # PRECEDER pies (HDBSCAN colors)
     for ax, g in zip(ax_pie_pre, groups):
         s = counts_pre_by_group.get(g, pd.Series(dtype=float))
         s = s[s > 0]
-        n_here = n_pre_by_group.get(g, 0)
+        n_here_edges = n_pre_by_group.get(g, 0)
+        n_songs_txt = (n_songs_by_group or {}).get(g, n_here_edges)
         if len(s) == 0:
-            ax.text(0.5, 0.5, f"No data\n({g} • n={n_here})", ha="center", va="center")
+            ax.text(0.5, 0.55, f"No data\n{g}\n(n songs = {n_songs_txt})",
+                    ha="center", va="center")
             ax.axis("off"); continue
         vals = s.values.astype(float)
-        labs = list(s.index)
-        cols = [color_map[lab] for lab in labs]
+        labs_raw = list(s.index)
+        labs_norm = [_normalize_label_key(l, start_token, end_token, other_label) for l in labs_raw]
+        cols = [_lab_color(l) for l in labs_norm]
         ax.pie(vals, labels=None, startangle=90, colors=cols,
                wedgeprops={"linewidth": 0.5, "edgecolor": "white"})
-        ax.set_title(f"{g} (n={n_here})")
+        ax.set_title(f"{g}\n(n songs = {n_songs_txt})", y=1.06, fontsize=11)
         _style_ax(ax)
 
     # --------- SUCCESSOR column ---------
     ax_hist_suc = fig.add_subplot(gs[0, 1])
-    gs_pies_suc = gs[1, 1].subgridspec(1, 3, wspace=0.02)
+    gs_pies_suc = gs[1, 1].subgridspec(1, 3, wspace=0.06)
     ax_pie_suc = [fig.add_subplot(gs_pies_suc[0, i]) for i in range(3)]
 
     x_suc = np.arange(len(order_suc), dtype=float)
 
-    # SUCCESSOR histogram (%)
+    # SUCCESSOR histogram (%), GREY bars
     for i, g in enumerate(groups):
         s = counts_suc_by_group.get(g, pd.Series(dtype=float)).reindex(order_suc, fill_value=0.0)
         denom = s.sum()
         y = (s / denom * 100.0) if denom > 0 else np.zeros_like(s.values)
         ax_hist_suc.bar(x_suc + (i - (len(groups)-1)/2)*width, y, width=width,
-                        label=f"{g} (n={n_suc_by_group.get(g, 0)})", zorder=2)
+                        label=f"{g} (n={n_suc_by_group.get(g, 0)})",
+                        color=GREYS[i % len(GREYS)], edgecolor="#333333", linewidth=0.6,
+                        zorder=2)
     ax_hist_suc.set_title("Successors (percent)")
     ax_hist_suc.set_xticks(x_suc)
     ax_hist_suc.set_xticklabels(order_suc, rotation=45, ha="right")
@@ -389,29 +452,33 @@ def _plot_pre_suc_panel(
     ax_hist_suc.yaxis.grid(True, linestyle=":", linewidth=0.8, alpha=0.6, zorder=1)
     ax_hist_suc.legend(loc="upper center", bbox_to_anchor=(0.5, -0.22), ncol=3, frameon=False)
 
-    # SUCCESSOR pies
+    # SUCCESSOR pies (HDBSCAN colors)
     for ax, g in zip(ax_pie_suc, groups):
         s = counts_suc_by_group.get(g, pd.Series(dtype=float))
         s = s[s > 0]
-        n_here = n_suc_by_group.get(g, 0)
+        n_here_edges = n_suc_by_group.get(g, 0)
+        n_songs_txt = (n_songs_by_group or {}).get(g, n_here_edges)
         if len(s) == 0:
-            ax.text(0.5, 0.5, f"No data\n({g} • n={n_here})", ha="center", va="center")
+            ax.text(0.5, 0.55, f"No data\n{g}\n(n songs = {n_songs_txt})",
+                    ha="center", va="center")
             ax.axis("off"); continue
         vals = s.values.astype(float)
-        labs = list(s.index)
-        cols = [color_map[lab] for lab in labs]
+        labs_raw = list(s.index)
+        labs_norm = [_normalize_label_key(l, start_token, end_token, other_label) for l in labs_raw]
+        cols = [_lab_color(l) for l in labs_norm]
         ax.pie(vals, labels=None, startangle=90, colors=cols,
                wedgeprops={"linewidth": 0.5, "edgecolor": "white"})
-        ax.set_title(f"{g} (n={n_here})")
+        ax.set_title(f"{g}\n(n songs = {n_songs_txt})", y=1.06, fontsize=11)
         _style_ax(ax)
 
-    # SINGLE shared legend for ALL pie labels (preceder + successor union)
+    # SINGLE shared legend (preceder + successor union), sorted numerically
     handles = [plt.Line2D([0], [0], marker="o", linestyle="None",
-                          color=color_map[lab], markerfacecolor=color_map[lab],
-                          markersize=7, label=lab) for lab in union_labels]
+                          color=_lab_color(lab), markerfacecolor=_lab_color(lab),
+                          markersize=7, label=lab) for lab in union_labels_sorted]
     if handles:
-        fig.legend(handles=handles, loc="lower center", ncol=min(10, len(handles)),
-                   frameon=False, bbox_to_anchor=(0.5, 0.01))
+        fig.legend(handles=handles, loc="lower center",
+                   ncol=min(10, len(handles)), frameon=False,
+                   bbox_to_anchor=(0.5, 0.01))
 
     saved = None
     if output_path:
@@ -451,22 +518,27 @@ def run_pre_and_post_syllable_plots(
     repeat_gap_inclusive: bool = False,
     # selection + plotting
     target_labels: Optional[List[str]] = None,   # if None → auto-select top_k_targets
-    top_k_targets: int = 8,
+    top_k_targets: Optional[int] = 8,
     top_k_preceders: int = 12,
     top_k_successors: int = 12,
     include_start_as_preceder: bool = False,
     include_end_as_successor: bool = False,
     start_token: str = "<START>",
     end_token: str = "<END>",
-    include_other_bin: bool = True,
-    include_other_in_hist: bool = True,
+    include_other_bin: bool = True,      # controls pies' "Other"
+    include_other_in_hist: bool = True,  # controls hist "Other"
     other_label: str = "Other",
     combined_output_dir: Optional[Union[str, Path]] = None,
     show: bool = True,
+    # allow passing an external LUT from your HDBSCAN script
+    label_color_lut: Optional[Dict[Union[int, str], str]] = None,
 ) -> Dict[str, object]:
     """
     Build merged annotations, split balanced groups, then for each target syllable
     produce a single figure with PRECEDER and SUCCESSOR distributions.
+
+    - Pie colors match the HDBSCAN palette (either built from data or provided via LUT).
+    - Histogram bars are rendered as distinct shades of grey per group.
     """
     # 1) Merge songs + annotations (time-aligned; optional repeat coalescing)
     res = build_decoded_with_split_labels(
@@ -495,12 +567,42 @@ def run_pre_and_post_syllable_plots(
     # 2) Balanced groups
     early_df, late_df, post_df, _ = _balanced_split_by_treatment(merged_df, treatment_date)
 
+    # Song counts (shown above pies)
+    n_songs_by_group = {
+        "Early Pre": int(early_df.shape[0]),
+        "Late Pre":  int(late_df.shape[0]),
+        "Post":      int(post_df.shape[0]),
+    }
+
     # 3) Choose targets
     if target_labels is None:
         cat_df = pd.concat([early_df, late_df, post_df], ignore_index=True)
+        if top_k_targets is None:
+            top_k_targets = 8
         targets = _select_target_labels_auto(cat_df, top_k_targets=top_k_targets)
     else:
         targets = [str(t) for t in target_labels]
+
+    # 4) Build or adopt label→color LUT
+    if label_color_lut is None:
+        label_color_lut = _build_label_color_lut_from_df(
+            merged_df,
+            start_token=start_token,
+            end_token=end_token,
+            other_label=other_label,
+        )
+    else:
+        # Normalize incoming LUT keys to strings ("5"), keeping values as given.
+        normalized_lut: Dict[str, str] = {}
+        for k, v in label_color_lut.items():
+            key = _normalize_label_key(k, start_token, end_token, other_label)
+            normalized_lut[str(key)] = v
+        # Ensure tokens/Other exist with fixed colors (if omitted externally).
+        normalized_lut.setdefault(str(start_token), "#000000")
+        normalized_lut.setdefault(str(end_token), "#FFD54F")
+        normalized_lut.setdefault(str(other_label), "#BDBDBD")
+        normalized_lut.setdefault(str(-1), "#7f7f7f")
+        label_color_lut = normalized_lut
 
     outputs: Dict[str, str] = {}
     if combined_output_dir:
@@ -526,17 +628,17 @@ def run_pre_and_post_syllable_plots(
         order_pre_hist = _order_with_optional_other(order_pre, [e_pre_raw, l_pre_raw, p_pre_raw],
                                                     include_other=include_other_in_hist, other_label=other_label)
         order_pre_pie  = _order_with_optional_other(order_pre, [e_pre_raw, l_pre_raw, p_pre_raw],
-                                                    include_other=True, other_label=other_label)
+                                                    include_other=include_other_bin, other_label=other_label)
 
         order_suc_hist = _order_with_optional_other(order_suc, [e_suc_raw, l_suc_raw, p_suc_raw],
                                                     include_other=include_other_in_hist, other_label=other_label)
         order_suc_pie  = _order_with_optional_other(order_suc, [e_suc_raw, l_suc_raw, p_suc_raw],
-                                                    include_other=True, other_label=other_label)
+                                                    include_other=include_other_bin, other_label=other_label)
 
         # Build SERIES with "Other" applied for pies (and optionally hists)
         def _prep_counts(raw_s: pd.Series, order_for_hist: List[str], order_for_pie: List[str]):
             s_hist = _apply_other_bin(raw_s, order_for_hist, include_other=(include_other_in_hist), other_label=other_label)
-            s_pie  = _apply_other_bin(raw_s, order_for_pie,  include_other=True,                  other_label=other_label)
+            s_pie  = _apply_other_bin(raw_s, order_for_pie,  include_other=(include_other_bin),   other_label=other_label)
             return s_hist, s_pie
 
         e_pre_hist, e_pre_pie = _prep_counts(e_pre_raw, order_pre_hist, order_pre_pie)
@@ -572,15 +674,18 @@ def run_pre_and_post_syllable_plots(
         _ = _plot_pre_suc_panel(
             target_label=str(tgt),
             title_suffix=title_suffix,
-            counts_pre_by_group=counts_pre_by_group_pie,   # pies use these; hist uses orders below
+            counts_pre_by_group=counts_pre_by_group_pie,   # pies use these
             order_pre=order_pre_used_hist,
             n_pre_by_group=n_pre_by_group,
             counts_suc_by_group=counts_suc_by_group_pie,
             order_suc=order_suc_used_hist,
             n_suc_by_group=n_suc_by_group,
+            n_songs_by_group=n_songs_by_group,
             include_other_in_hist=include_other_in_hist,
             other_label=other_label,
             output_path=out_path, show=show,
+            color_lut=label_color_lut,              # HDBSCAN-style LUT for pies
+            start_token=start_token, end_token=end_token,
         )
         outputs[str(tgt)] = str(out_path) if combined_output_dir else None
 
@@ -598,7 +703,7 @@ def run_pre_and_post_syllable_plots(
 
 if __name__ == "__main__":
     import argparse
-    p = argparse.ArgumentParser(description="Per-target PRECEDER+SUCCESSOR panels for balanced Early/Late/Post groups (with shared pie legend and 'Other').")
+    p = argparse.ArgumentParser(description="Per-target PRECEDER+SUCCESSOR panels for balanced Early/Late/Post groups (shared pie legend, robust HDBSCAN colors; grey histogram bars).")
     p.add_argument("--song-detection", "-d", type=str, required=True)
     p.add_argument("--annotations", "-a", type=str, required=True)
     p.add_argument("--treatment-date", "-t", type=str, required=True)
@@ -613,8 +718,10 @@ if __name__ == "__main__":
     p.add_argument("--top-k-successors", type=int, default=12)
     p.add_argument("--include-start", action="store_true", help="Count <START> as a preceder when target is first.")
     p.add_argument("--include-end", action="store_true", help="Count <END> as a successor when target is last.")
-    p.add_argument("--no-other", action="store_true", help="Disable 'Other' bin aggregation.")
-    p.add_argument("--no-other-in-hist", action="store_true", help="Do not show 'Other' in histograms (still in pies).")
+    p.add_argument("--start-token", type=str, default="<START>")
+    p.add_argument("--end-token", type=str, default="<END>")
+    p.add_argument("--no-other", action="store_true", help="Disable 'Other' bin aggregation in pies.")
+    p.add_argument("--no-other-in-hist", action="store_true", help="Do not show 'Other' in histograms (still in pies if enabled).")
     p.add_argument("--other-label", type=str, default="Other")
     p.add_argument("--outdir", type=str, default=None, help="Directory to save combined panels.")
     p.add_argument("--no-show", action="store_true")
@@ -642,6 +749,31 @@ if __name__ == "__main__":
         other_label=args.other_label,
         combined_output_dir=args.outdir,
         show=not args.no_show,
+        # label_color_lut can be provided programmatically (not via CLI) if desired.
     )
     print("Targets used:", res["targets_used"])
     print("Per-target outputs:", res["per_target_outputs"])
+
+
+
+"""
+# --- Sample usage: make pies use the exact HDBSCAN colors ---
+
+from pathlib import Path
+import pre_and_post_syllable_plots as pps
+
+detect  = Path("/Volumes/my_own_ssd/2024_AreaX_lesions_NMA_and_sham/AreaXlesion_TweetyBERT_outputs/new_outputs/USA5443_song_detection.json")
+decoded = Path("/Volumes/my_own_ssd/2024_AreaX_lesions_NMA_and_sham/AreaXlesion_TweetyBERT_outputs/new_outputs/TweetyBERT_Pretrain_LLB_AreaX_FallSong_USA5443_decoded_database.json")
+tdate   = "2024-04-30"
+
+res = pps.run_pre_and_post_syllable_plots(
+    song_detection_json=detect,
+    decoded_annotations_json=decoded,
+    treatment_date=tdate,
+    combined_output_dir=decoded.parent / "preceder_successor_panels",
+    # no label_color_lut provided → colors are auto-built from merged annotations
+)
+
+
+
+"""

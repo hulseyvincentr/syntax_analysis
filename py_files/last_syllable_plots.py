@@ -4,18 +4,25 @@
 Make last-syllable plots (histogram + pies) for Early-Pre, Late-Pre, Post
 balanced groups, using merged songs/annotations.
 
-Depends on:
-  - merge_annotations_from_split_songs.py  (provides build_decoded_with_split_labels)
+Changes requested:
+  • Histograms use GREY bars (distinct shades for Early/Late/Post).
+  • Pie wedges use the HDBSCAN-style 60-color palette (tab20+tab20b+tab20c).
+  • Legend for pies is sorted numerically (e.g., -1, 0, 1, 2, ...).
 
-Example (Spyder console):
+Optional:
+  • Provide an external label_color_lut={int/str->hex} to force exact colors
+    used elsewhere (e.g., from your .npz/UMAP script). If omitted, a LUT is
+    built from labels found in the merged annotations.
+
+Example (Spyder):
     from pathlib import Path
     import importlib
     import last_syllable_plots as lsp
     importlib.reload(lsp)
 
-    detect  = Path("/Volumes/my_own_ssd/2025_areax_lesion/R08_RC6_Comp2_song_detection.json")
-    decoded = Path("/Volumes/my_own_ssd/2025_areax_lesion/TweetyBERT_Pretrain_LLB_AreaX_FallSong_R08_RC6_Comp2_decoded_database.json")
-    tdate   = "2025-05-22"
+    detect  = Path("/Volumes/my_own_ssd/2024_AreaX_lesions_NMA_and_sham/AreaXlesion_TweetyBERT_outputs/new_outputs/USA5443_song_detection.json")
+    decoded = Path("/Volumes/my_own_ssd/2024_AreaX_lesions_NMA_and_sham/AreaXlesion_TweetyBERT_outputs/new_outputs/TweetyBERT_Pretrain_LLB_AreaX_FallSong_USA5443_decoded_database.json")
+    tdate   = "2024-04-30"
 
     res = lsp.run_last_syllable_plots(
         song_detection_json=detect,
@@ -30,6 +37,7 @@ Example (Spyder console):
         hist_output_path=decoded.parent / "last_syllable_hist.png",
         pies_output_path=decoded.parent / "last_syllable_pies.png",
         show=True,
+        # label_color_lut=external_lut,  # (optional) pass your exact HDBSCAN LUT here
     )
     print(res["counts_three"])
     print(res["label_order"])
@@ -43,12 +51,13 @@ from typing import Dict, List, Tuple, Optional, Union
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib as mpl
 
 from merge_annotations_from_split_songs import build_decoded_with_split_labels
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Helpers
+# Styling / Utilities
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _style_ax(ax):
@@ -58,6 +67,81 @@ def _style_ax(ax):
 
 def _as_timestamp(d) -> pd.Timestamp:
     return pd.to_datetime(str(d)).normalize()
+
+def _normalize_label_key(raw: Union[str, int, float]) -> str:
+    """
+    Normalize labels for LUT lookup:
+      - Trim whitespace
+      - Convert int-like strings/floats to canonical integer strings ('5.0'->'5')
+    """
+    s = str(raw).strip()
+    try:
+        f = float(s)
+        if f.is_integer():
+            return str(int(f))
+        return s
+    except Exception:
+        return s
+
+def _sort_numeric_strings(labels: List[str]) -> List[str]:
+    """Return labels sorted numerically when possible, otherwise lexicographically."""
+    nums: List[int] = []
+    nonnums: List[str] = []
+    for lab in labels:
+        try:
+            f = float(lab)
+            if f.is_integer():
+                nums.append(int(f))
+            else:
+                nonnums.append(lab)
+        except Exception:
+            nonnums.append(lab)
+    # dedupe preserving order
+    def _unique(seq): return list(dict.fromkeys(seq))
+    nums = sorted(_unique(nums))
+    return [str(n) for n in nums] + sorted(_unique(nonnums))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# HDBSCAN-style palette & LUT (tab20 + tab20b + tab20c)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _get_tab60_palette() -> List[str]:
+    tab20  = plt.get_cmap("tab20").colors
+    tab20b = plt.get_cmap("tab20b").colors
+    tab20c = plt.get_cmap("tab20c").colors
+    return [mpl.colors.to_hex(c) for c in (*tab20, *tab20b, *tab20c)]  # 60 colors
+
+def _collect_numeric_labels_from_df(df: pd.DataFrame) -> List[int]:
+    """Collect integer-like labels present as keys in syllable dicts."""
+    labs = set()
+    for _, row in df.iterrows():
+        d = row.get("syllable_onsets_offsets_ms_dict", {})
+        if isinstance(d, dict):
+            for k in d.keys():
+                try:
+                    labs.add(int(k))
+                except Exception:
+                    pass
+    return sorted(labs)
+
+def _build_label_color_lut_from_df(df: pd.DataFrame) -> Dict[str, str]:
+    """
+    Build a label→hex LUT:
+      - numeric labels map to tab60 colors (repeats if >60)
+      - -1 (noise) fixed to mid-gray
+    """
+    palette = _get_tab60_palette()
+    int_labels = _collect_numeric_labels_from_df(df)
+    lut: Dict[str, str] = {str(-1): "#7f7f7f"}  # fixed grey for noise
+    for i, lab in enumerate(int_labels):
+        lut[str(lab)] = palette[i % len(palette)]
+    return lut
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Core helpers
+# ──────────────────────────────────────────────────────────────────────────────
 
 def _last_syllable_from_dict(label_to_intervals: dict) -> Optional[str]:
     """
@@ -141,8 +225,10 @@ def _counts_by_group(
     total = (groups["Early Pre"].add(groups["Late Pre"], fill_value=0)
                            .add(groups["Post"],      fill_value=0))
     top_labels = total.sort_values(ascending=False).head(top_k).index.tolist()
-    label_order = top_labels
-    counts = {g: s.reindex(label_order, fill_value=0).astype(int) for g, s in groups.items()}
+    # Normalize label strings consistently
+    label_order = [_normalize_label_key(l) for l in top_labels]
+    counts = {g: s.rename(index=_normalize_label_key).reindex(label_order, fill_value=0).astype(int)
+              for g, s in groups.items()}
     return counts, label_order
 
 
@@ -159,27 +245,32 @@ def _plot_histogram(
     show: bool = True,
 ):
     """
-    Grouped bar chart: x = label, y = count, colors = groups.
-    Legend now shows: "<Group> (n=<count>)".
+    Grouped bar chart in GREYSCALE: x = label, y = count.
+    Each group (Early/Late/Post) uses a distinct grey shade.
+    Legend shows "<Group> (n=<count>)" and sits to the right.
     """
     groups = list(counts.keys())
     x = np.arange(len(label_order), dtype=float)
     width = 0.8 / max(1, len(groups))
 
     fig, ax = plt.subplots(figsize=(max(9, 0.5*len(label_order)+4), 6))
-    fig.subplots_adjust(right=0.80)  # leave room for legend on right
+    fig.subplots_adjust(right=0.80)  # space for legend
+
+    # Distinct grey shades for groups
+    GREYS = ["#4a4a4a", "#8c8c8c", "#cfcfcf"]
 
     for i, g in enumerate(groups):
         y = counts[g].reindex(label_order, fill_value=0).to_numpy(dtype=float)
         label = f"{g} (n={n_by_group.get(g, 0)})"
-        ax.bar(x + (i - (len(groups)-1)/2)*width, y, width=width, label=label, zorder=2)
+        ax.bar(x + (i - (len(groups)-1)/2)*width, y, width=width,
+               label=label, color=GREYS[i % len(GREYS)],
+               edgecolor="#333333", linewidth=0.6, zorder=2)
 
     ax.set_xticks(x)
     ax.set_xticklabels(label_order, rotation=45, ha="right")
     ax.set_ylabel("Count")
     ax.set_title(title)
     _style_ax(ax)
-
     ax.yaxis.grid(True, linestyle=":", linewidth=0.8, alpha=0.6, zorder=1)
 
     # legend outside with n's
@@ -203,12 +294,13 @@ def _plot_pies(
     label_order: List[str],
     title: str,
     n_by_group: Dict[str, int],
+    color_lut: Dict[str, str],
     output_path: Optional[Union[str, Path]] = None,
     show: bool = True,
 ):
     """
-    1×3 pies (Early Pre, Late Pre, Post) with shared label order.
-    Titles now include n, e.g., "Early Pre (n=37)".
+    1×3 pies (Early Pre, Late Pre, Post) using HDBSCAN colors via color_lut.
+    Legend is sorted numerically and placed at the bottom.
     """
     groups = list(counts.keys())
     n = len(groups)
@@ -218,17 +310,22 @@ def _plot_pies(
     fig.suptitle(title)
     fig.subplots_adjust(bottom=0.18)
 
-    import matplotlib as mpl
-    cmap = mpl.cm.get_cmap("tab20", max(20, len(label_order)))
-    colors = [cmap(i % cmap.N) for i in range(len(label_order))]
-    label_to_color = {lab: colors[i] for i, lab in enumerate(label_order)}
+    # Build union label list from label_order (top-k) and any group leftovers
+    union_labels = set(label_order)
+    for g in groups:
+        union_labels.update([_normalize_label_key(l) for l in counts[g].index.tolist()])
+    union_labels = _sort_numeric_strings(list(union_labels))
 
-    legend_handles = []
-    for lab in label_order:
-        patch = plt.Line2D([0], [0], marker="o", linestyle="None",
-                           color=label_to_color[lab], markerfacecolor=label_to_color[lab],
-                           markersize=8, label=lab)
-        legend_handles.append(patch)
+    # Legend handles use LUT colors (fallback mid-grey if missing)
+    def _lab_color(lab: str) -> str:
+        return color_lut.get(lab, "#808080")
+
+    legend_handles = [
+        plt.Line2D([0], [0], marker="o", linestyle="None",
+                   color=_lab_color(lab), markerfacecolor=_lab_color(lab),
+                   markersize=8, label=lab)
+        for lab in union_labels
+    ]
 
     for ax, g in zip(axes, groups):
         s = counts[g].reindex(label_order, fill_value=0)
@@ -241,16 +338,18 @@ def _plot_pies(
             continue
 
         vals = s.values.astype(float)
-        labs = list(s.index)
-        cols = [label_to_color[lab] for lab in labs]
+        labs = [_normalize_label_key(l) for l in s.index.tolist()]
+        cols = [_lab_color(l) for l in labs]
 
         ax.pie(vals, labels=None, startangle=90, colors=cols,
                wedgeprops={"linewidth": 0.5, "edgecolor": "white"})
         ax.set_title(f"{g} (n={n_here})")
         _style_ax(ax)
 
-    fig.legend(handles=legend_handles, loc="lower center",
-               ncol=min(6, len(label_order)), frameon=False)
+    if legend_handles:
+        fig.legend(handles=legend_handles, loc="lower center",
+                   ncol=min(10, len(legend_handles)),
+                   frameon=False)
 
     saved = None
     if output_path:
@@ -299,10 +398,13 @@ def run_last_syllable_plots(
     hist_output_path: Optional[Union[str, Path]] = None,
     pies_output_path: Optional[Union[str, Path]] = None,
     show: bool = True,
+    # optional external LUT (e.g., from your .npz/UMAP code)
+    label_color_lut: Optional[Dict[Union[int, str], str]] = None,
 ) -> Dict[str, object]:
     """
     Build merged annotations, split balanced groups, plot histogram & pies of last syllables.
-    Returns dict with intermediate data and saved paths.
+    - Histograms: grey bars per group.
+    - Pies: HDBSCAN colors via LUT (auto-built from data unless externally provided).
     """
     res = build_decoded_with_split_labels(
         decoded_database_json=decoded_annotations_json,
@@ -339,26 +441,37 @@ def run_last_syllable_plots(
     last_late  = _extract_last_syllables(late_df)
     last_post  = _extract_last_syllables(post_df)
 
-    # Counts + unified label order
+    # Counts + unified label order (normalize keys)
     counts_by_group, label_order = _counts_by_group(last_early, last_late, last_post, top_k=top_k_labels)
 
-    # --- NEW: n shown in legend/titles (use last_* sizes to reflect plotted data) ---
+    # Build or adopt LUT
+    if label_color_lut is None:
+        lut = _build_label_color_lut_from_df(merged_df)
+    else:
+        # normalize incoming LUT keys to strings
+        lut = {}
+        for k, v in label_color_lut.items():
+            lut[_normalize_label_key(k)] = v
+        lut.setdefault(str(-1), "#7f7f7f")
+
+    # n per plotted group (after last-syllable extraction)
     n_by_group = {
         "Early Pre": int(last_early.shape[0]),
         "Late Pre":  int(last_late.shape[0]),
         "Post":      int(last_post.shape[0]),
     }
 
-    # Plots
+    # Titles
     title_base = f"Last syllables per song (balanced groups; Treatment {pd.to_datetime(str(treatment_date)).date()})"
     hist_title = title_base + f"\n(Top {top_k_labels} labels)"
     pies_title = "Last syllables: Early-Pre / Late-Pre / Post"
 
+    # Plots
     hist_res = _plot_histogram(counts_by_group, label_order, hist_title,
                                n_by_group=n_by_group,
                                output_path=hist_output_path, show=show)
     pies_res = _plot_pies(counts_by_group, label_order, pies_title,
-                          n_by_group=n_by_group,
+                          n_by_group=n_by_group, color_lut=lut,
                           output_path=pies_output_path, show=show)
 
     return {
@@ -379,7 +492,7 @@ def run_last_syllable_plots(
 
 if __name__ == "__main__":
     import argparse
-    p = argparse.ArgumentParser(description="Last-syllable histogram and pies for balanced Early/Late/Post groups.")
+    p = argparse.ArgumentParser(description="Last-syllable histogram (grey) and pies (HDBSCAN colors) for balanced Early/Late/Post groups.")
     p.add_argument("--song-detection", "-d", type=str, required=True)
     p.add_argument("--annotations", "-a", type=str, required=True)
     p.add_argument("--treatment-date", "-t", type=str, required=True)
@@ -407,6 +520,7 @@ if __name__ == "__main__":
         hist_output_path=args.hist_out,
         pies_output_path=args.pies_out,
         show=not args.no_show,
+        # label_color_lut can be provided programmatically if desired.
     )
     print("Counts (balanced):", out["counts_three"])
     print("Saved histogram:", out["hist_saved_path"])

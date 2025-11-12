@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# phrase_duration_pre_vs_post_grouped.py
+# phrase_duration_pre_vs_post_grouped.py  (standalone; auto-merge if no premerged DF provided)
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -17,6 +17,16 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+
+# ──────────────────────────────────────────────────────────────────────────────
+# External merge builder (required to auto-merge)
+# ──────────────────────────────────────────────────────────────────────────────
+try:
+    # Must be in your PYTHONPATH / same folder
+    from merge_annotations_from_split_songs import build_decoded_with_split_labels
+except Exception as e:
+    build_decoded_with_split_labels = None
+    _MERGE_IMPORT_ERR = e
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Styling
@@ -44,21 +54,6 @@ plt.rcParams.update({
 })
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Organizer import (prefer YOUR file name)
-# ──────────────────────────────────────────────────────────────────────────────
-_ORGANIZE = None
-try:
-    # Your module/file:
-    from organize_decoded_serialTS_segments import (  # type: ignore
-        build_organized_segments_with_durations as _ORGANIZE
-    )
-except Exception:
-    # Fallback alternate filename:
-    from organized_decoded_serialTS_segments import (  # type: ignore
-        build_organized_segments_with_durations as _ORGANIZE
-    )
-
-# ──────────────────────────────────────────────────────────────────────────────
 # Dataclass result
 # ──────────────────────────────────────────────────────────────────────────────
 @dataclass
@@ -69,36 +64,33 @@ class GroupedPlotsResult:
     aggregate_path: Optional[Path]                          # per-day box+scatter
     aggregate_three_box_path: Optional[Path]                # 3 boxes + dashed connectors (medians)
     aggregate_three_box_auto_ylim_path: Optional[Path]      # same but auto y-limits
-    # 3 boxes with *per-syllable duration points* (one dot per syllable per group)
     aggregate_three_box_with_syll_points_path: Optional[Path]
-    # Variance figures by syllable on x-axis
-    per_syllable_variance_path: Optional[Path]              # (DISABLED; will be None)
-    per_syllable_variance_boxscatter_path: Optional[Path]   # variance box + scatter (x = syllable)
-    # 3-group variance: boxes + syllable points (ylim fixed to 2.0e7)
+    per_syllable_variance_path: Optional[Path]              # (kept for API; None)
+    per_syllable_variance_boxscatter_path: Optional[Path]
     aggregate_three_box_variance_with_syll_points_path: Optional[Path]
-    # NEW: 3-group variance: boxes + jitter points + stats (ylim fixed to 2.0e7)
     aggregate_three_box_variance_with_stats_path: Optional[Path]
     syllable_labels: List[str]
     y_limits: Tuple[float, float]
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Utilities: dates, parsing, table building
+# Utilities: dates, parsing, labels, durations extraction
 # ──────────────────────────────────────────────────────────────────────────────
 def _parse_date_like(s: Union[str, pd.Timestamp, None]) -> Union[pd.Timestamp, pd.NaT]:
     if s is None:
         return pd.NaT
     if isinstance(s, pd.Timestamp):
         return s
-    s2 = str(s).replace(".", "-")
+    s2 = str(s).replace(".", "-").replace("/", "-")
     return pd.to_datetime(s2, errors="coerce")
 
 def _choose_datetime_series(df: pd.DataFrame) -> pd.Series:
-    # Prefer your organizer’s column
     dt = df.get("Recording DateTime", pd.Series([pd.NaT]*len(df), index=df.index)).copy()
-    if "creation_date" in df.columns:
-        need = dt.isna()
-        if need.any():
-            dt.loc[need] = pd.to_datetime(df.loc[need, "creation_date"], errors="coerce")
+    # fallbacks
+    for cand in ("recording_datetime", "creation_date"):
+        if cand in df.columns:
+            need = dt.isna()
+            if need.any():
+                dt.loc[need] = pd.to_datetime(df.loc[need, cand], errors="coerce")
     if "Date" in df.columns and "Time" in df.columns:
         need = dt.isna()
         if need.any():
@@ -110,15 +102,25 @@ def _choose_datetime_series(df: pd.DataFrame) -> pd.Series:
             dt.loc[need] = combo
     return dt
 
-def _infer_animal_id(df: pd.DataFrame, decoded_path: Path) -> str:
-    for col in ["animal_id", "Animal", "Animal ID"]:
-        if col in df.columns and pd.notna(df[col]).any():
-            val = str(df[col].dropna().iloc[0]).strip()
-            if val:
-                return val
-    stem = decoded_path.stem
-    tok  = stem.split("_")[0]
-    return tok if tok else "unknown_animal"
+def _infer_animal_id(df: Optional[pd.DataFrame], decoded_path: Optional[Path]) -> str:
+    if df is not None:
+        for col in ["animal_id", "Animal", "Animal ID"]:
+            if col in df.columns and pd.notna(df[col]).any():
+                val = str(df[col].dropna().iloc[0]).strip()
+                if val:
+                    return val
+        # Try to parse from a file_name column (common in your tables)
+        if "file_name" in df.columns and df["file_name"].notna().any():
+            import re
+            for s in df["file_name"].astype(str):
+                m = re.search(r'(usa\d{4,6})', s, flags=re.IGNORECASE)
+                if m:
+                    return m.group(1).upper()
+    if decoded_path is not None:
+        tok = decoded_path.stem.split("_")[0]
+        if tok:
+            return tok
+    return "unknown_animal"
 
 def _maybe_parse_dict(obj):
     if isinstance(obj, dict):
@@ -147,26 +149,14 @@ def _is_timebin_col(colname: str) -> bool:
     return "timebin" in c or c.endswith("_bins") or "bin" in c
 
 def _extract_durations_from_spans(spans, *, ms_per_bin: float | None, treat_as_bins: bool) -> List[float]:
-    """
-    Accepts:
-      • [[on, off], ...]
-      • [on, off]  (single flat pair)
-      • [{"onset_ms":..., "offset_ms":...}, ...]
-      • [{"onset_bin":..., "offset_bin":...}, ...]
-    Converts from bins→ms if treat_as_bins and ms_per_bin is provided.
-    """
     out: List[float] = []
     if spans is None:
         return out
 
-    # If it's a single flat pair [on, off], wrap it
     if isinstance(spans, (list, tuple)) and len(spans) == 2 and all(isinstance(x, (int, float)) for x in spans):
         spans = [spans]
-
-    # If it's a dict describing one interval, wrap it
     if isinstance(spans, dict):
         spans = [spans]
-
     if not isinstance(spans, (list, tuple)):
         return out
 
@@ -185,9 +175,8 @@ def _extract_durations_from_spans(spans, *, ms_per_bin: float | None, treat_as_b
 
         elif isinstance(item, (list, tuple)) and len(item) >= 2:
             on, off = item[:2]
-            using_bins = False  # unless treat_as_bins tells us otherwise
+            using_bins = False
 
-        # Convert to duration
         try:
             dur = float(off) - float(on)
             if dur < 0:
@@ -196,7 +185,6 @@ def _extract_durations_from_spans(spans, *, ms_per_bin: float | None, treat_as_b
                 if ms_per_bin:
                     dur *= float(ms_per_bin)
                 else:
-                    # No conversion available; skip to avoid mixing units
                     continue
             out.append(dur)
         except Exception:
@@ -210,7 +198,6 @@ def _collect_phrase_durations_per_song(row: pd.Series, spans_col: str) -> Dict[s
     if raw is None or (isinstance(raw, float) and math.isnan(raw)):
         return out
 
-    # If the column is already a dict of label -> intervals
     d = _maybe_parse_dict(raw) if not isinstance(raw, dict) else raw
     if not isinstance(d, dict):
         return out
@@ -225,25 +212,37 @@ def _collect_phrase_durations_per_song(row: pd.Series, spans_col: str) -> Dict[s
     return out
 
 def _find_best_spans_column(df: pd.DataFrame) -> str | None:
-    # Prefer ms, then timebins, then anything *_dict-like
-    for c in [
-        "syllable_onsets_offsets_ms_dict",
-        "syllable_onsets_offsets_ms",
-        "onsets_offsets_ms_dict",
-    ]:
+    for c in ["syllable_onsets_offsets_ms_dict", "syllable_onsets_offsets_ms", "onsets_offsets_ms_dict"]:
         if c in df.columns:
             return c
-    for c in [
-        "syllable_onsets_offsets_timebins",
-        "syllable_onsets_offsets_timebins_dict",
-    ]:
+    for c in ["syllable_onsets_offsets_timebins", "syllable_onsets_offsets_timebins_dict"]:
         if c in df.columns:
             return c
+    # Heuristic: any *_dict with content
     for c in df.columns:
         lc = c.lower()
         if lc.endswith("_dict") and df[c].notna().any():
             return c
     return None
+
+def _collect_unique_labels_sorted(df: pd.DataFrame, dict_col: str) -> List[str]:
+    labs: List[str] = []
+    for d in df[dict_col].dropna():
+        if isinstance(d, dict):
+            labs.extend(list(map(str, d.keys())))
+        else:
+            dd = _maybe_parse_dict(d)
+            if isinstance(dd, dict):
+                labs.extend(list(map(str, dd.keys())))
+    # preserve first-seen order
+    labs = list(dict.fromkeys(labs))
+    # numeric sort when possible
+    try:
+        as_int = [int(x) for x in labs]
+        order = np.argsort(as_int)
+        return [labs[i] for i in order]
+    except Exception:
+        return sorted(labs)
 
 def _build_durations_table(df: pd.DataFrame, labels: Sequence[str]) -> tuple[pd.DataFrame, str | None]:
     col = _find_best_spans_column(df)
@@ -252,40 +251,32 @@ def _build_durations_table(df: pd.DataFrame, labels: Sequence[str]) -> tuple[pd.
 
     per_song = df.apply(lambda r: _collect_phrase_durations_per_song(r, col), axis=1)
     out = df.copy()
-    for lbl in labels:  # labels are strings
+    for lbl in labels:
         out[f"syllable_{lbl}_durations"] = per_song.apply(lambda d: d.get(str(lbl), []))
     return out, col
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Label handling + plotting helpers (fixed x-order, labels as strings)
+# Plot helpers
 # ──────────────────────────────────────────────────────────────────────────────
 def _explode_for_plot(dataset: pd.DataFrame, labels: Sequence[str]) -> pd.DataFrame:
-    """
-    Tall DF: ['Syllable','Phrase Duration (ms)'] with Syllable categorical set to full order.
-    """
     order = [str(x) for x in labels]
     parts = []
-
     for lbl in order:
         col = f"syllable_{lbl}_durations"
         if col not in dataset.columns:
             parts.append(pd.DataFrame({"Syllable": [lbl], "Phrase Duration (ms)": [np.nan]}))
             continue
-
         e = dataset[[col]].explode(col)
         if e.empty:
             parts.append(pd.DataFrame({"Syllable": [lbl], "Phrase Duration (ms)": [np.nan]}))
             continue
-
         e["Phrase Duration (ms)"] = pd.to_numeric(e[col], errors="coerce")
         e = e.dropna(subset=["Phrase Duration (ms)"])
         if e.empty:
             parts.append(pd.DataFrame({"Syllable": [lbl], "Phrase Duration (ms)": [np.nan]}))
             continue
-
         e["Syllable"] = lbl
         parts.append(e[["Syllable", "Phrase Duration (ms)"]])
-
     tall = pd.concat(parts, ignore_index=True)
     tall["Syllable"] = pd.Categorical(tall["Syllable"], categories=order, ordered=True)
     return tall
@@ -367,14 +358,13 @@ def _per_syllable_medians(df_subset: pd.DataFrame, labels: Sequence[str]) -> Dic
     return out
 
 def _per_syllable_variances(df_subset: pd.DataFrame, labels: Sequence[str]) -> Dict[str, float]:
-    """Return {label -> variance of phrase duration (ms^2)} for a subset."""
     out = {}
     for lbl in labels:
         col = f"syllable_{lbl}_durations"
         if col in df_subset.columns:
             s = pd.to_numeric(df_subset[col].explode(), errors="coerce").dropna()
             if s.size > 1:
-                out[str(lbl)] = float(np.var(s.to_numpy(), ddof=1))  # sample variance
+                out[str(lbl)] = float(np.var(s.to_numpy(), ddof=1))
             elif s.size == 1:
                 out[str(lbl)] = 0.0
     return out
@@ -448,41 +438,124 @@ def _calc_global_ylim(datasets, labels):
     return (float(np.nanmin(vals)), float(np.nanmax(vals)))
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Main function
+# Main function (auto-merge if no premerged DF/path is provided)
 # ──────────────────────────────────────────────────────────────────────────────
 def run_phrase_duration_pre_vs_post_grouped(
-    decoded_database_json, output_dir, treatment_date,
-    grouping_mode="explicit", early_group_size=100, late_group_size=100, post_group_size=100,
-    only_song_present=True, restrict_to_labels=None, y_max_ms=None,
-    show_plots=True, make_aggregate_plot=True,
+    *,
+    # If you already have a merged DF/path, pass one of these:
+    premerged_annotations_df: Optional[pd.DataFrame] = None,
+    premerged_annotations_path: Optional[Union[str, Path]] = None,
+
+    # Otherwise we will auto-merge using these:
+    decoded_database_json: Optional[Union[str, Path]] = None,
+    song_detection_json: Optional[Union[str, Path]] = None,
+    max_gap_between_song_segments: int = 500,
+    segment_index_offset: int = 0,
+    merge_repeated_syllables: bool = True,
+    repeat_gap_ms: float = 10.0,
+    repeat_gap_inclusive: bool = False,
+
+    # Plotting / grouping
+    output_dir: Optional[Union[str, Path]] = None,
+    treatment_date: Union[str, pd.Timestamp] = None,
+    grouping_mode: str = "explicit",      # "explicit" or "auto_balance"
+    early_group_size: int = 100,
+    late_group_size: int = 100,
+    post_group_size: int = 100,
+    restrict_to_labels: Optional[Sequence[Union[str, int]]] = None,
+    y_max_ms: Optional[float] = None,
+    show_plots: bool = True,
+
+    # Optional override for titles/filenames
+    animal_id_override: Optional[str] = None,
 ) -> GroupedPlotsResult:
 
-    decoded_path = Path(decoded_database_json)
-    output_dir = Path(output_dir); output_dir.mkdir(parents=True, exist_ok=True)
+    # 1) Decide source DF
+    df = None
+    if premerged_annotations_df is not None:
+        df = premerged_annotations_df.copy()
 
-    # IMPORTANT: Call YOUR organizer (compute_durations=False so we use robust parser here)
-    out = _ORGANIZE(
-        decoded_database_json=decoded_path,
-        only_song_present=only_song_present,
-        compute_durations=False,          # we’ll compute robustly (handles flat pairs & bins)
-        add_recording_datetime=True
-    )
-    df = out.organized_df.copy()
-    if only_song_present and "song_present" in df.columns:
-        df = df[df["song_present"] == True].copy()
+    elif premerged_annotations_path is not None:
+        p = Path(premerged_annotations_path)
+        if not p.exists():
+            raise FileNotFoundError(f"premerged_annotations_path not found: {p}")
+        if p.suffix.lower() == ".csv":
+            df = pd.read_csv(p)
+        elif p.suffix.lower() in {".json", ".ndjson"}:
+            try:
+                df = pd.read_json(p)
+            except ValueError:
+                df = pd.read_json(p, lines=True)
+        else:
+            raise ValueError(f"Unsupported file type for premerged_annotations_path: {p.suffix}")
 
-    # Datetime + sort
+    else:
+        # Auto-merge path
+        if build_decoded_with_split_labels is None:
+            raise ImportError(
+                "merge_annotations_from_split_songs.build_decoded_with_split_labels could not be imported.\n"
+                f"Original import error: {_MERGE_IMPORT_ERR}"
+            )
+        if decoded_database_json is None or song_detection_json is None:
+            raise ValueError(
+                "To auto-merge, you must provide both decoded_database_json and song_detection_json."
+            )
+        decoded_database_json = Path(decoded_database_json)
+        song_detection_json  = Path(song_detection_json)
+
+        ann = build_decoded_with_split_labels(
+            decoded_database_json=decoded_database_json,
+            song_detection_json=song_detection_json,
+            only_song_present=True,
+            compute_durations=True,
+            add_recording_datetime=True,
+            songs_only=True,
+            flatten_spec_params=True,
+            max_gap_between_song_segments=max_gap_between_song_segments,
+            segment_index_offset=segment_index_offset,
+            merge_repeated_syllables=merge_repeated_syllables,
+            repeat_gap_ms=repeat_gap_ms,
+            repeat_gap_inclusive=repeat_gap_inclusive,
+        )
+        df = ann.annotations_appended_df.copy()
+
+    if df is None or df.empty:
+        raise ValueError("No data available after reading/merging annotations.")
+
+    # 2) Output dir and animal id
+    decoded_path = Path(decoded_database_json) if decoded_database_json else None
+    if output_dir is None:
+        base = (decoded_path.parent if decoded_path is not None else Path.cwd())
+        output_dir = base / "phrase_durations"
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    animal_id = animal_id_override or _infer_animal_id(df, decoded_path)
+
+    # 3) Datetime + sort
     dt = _choose_datetime_series(df)
     df = df.assign(_dt=dt).dropna(subset=["_dt"]).sort_values("_dt").reset_index(drop=True)
 
-    # Labels as STRINGS, using your organizer’s discovered labels unless user restricts
-    labels = [str(x) for x in (restrict_to_labels or out.unique_syllable_labels)]
+    # 4) Labels
+    if restrict_to_labels is None:
+        col_hint = _find_best_spans_column(df)
+        if col_hint is None:
+            raise ValueError("Could not locate a syllable spans column (e.g., 'syllable_onsets_offsets_ms_dict').")
+        labels = _collect_unique_labels_sorted(df, col_hint)
+    else:
+        labels = [str(x) for x in restrict_to_labels]
+
+    # 5) Build per-syllable duration lists
     df, spans_col = _build_durations_table(df, labels)
     print("[INFO] Using spans column:", spans_col)
 
+    # 6) Split by treatment date
     t_date = _parse_date_like(treatment_date)
+    if pd.isna(t_date):
+        raise ValueError("Valid treatment_date is required (e.g., '2025-05-22').")
     pre, post = df[df["_dt"] < t_date].copy(), df[df["_dt"] >= t_date].copy()
 
+    # 7) Balanced groups
     if grouping_mode == "explicit":
         early_n, late_n, post_n = map(int, [early_group_size, late_group_size, post_group_size])
         late_pre = pre.tail(late_n)
@@ -491,7 +564,6 @@ def run_phrase_duration_pre_vs_post_grouped(
         print(f"[INFO] explicit sizes → early={len(early_pre)}, late={len(late_pre)}, post={len(post_g)} "
               f"(requested early={early_n}, late={late_n}, post={post_n})")
     else:
-        # auto-balance rule: n = min( len(pre)//2, len(post) )
         n = min(len(pre) // 2, len(post))
         if n <= 0:
             late_pre  = pre.iloc[0:0]
@@ -511,7 +583,6 @@ def run_phrase_duration_pre_vs_post_grouped(
     y_min, y_max = _calc_global_ylim([early_pre, late_pre, post_g], labels)
     if y_max_ms:
         y_max = float(y_max_ms)
-    animal_id = _infer_animal_id(df, decoded_path)
 
     # — per-group violin+scatter (fixed x-order)
     def _make_plot(ds, title, n, fname):
@@ -533,42 +604,38 @@ def run_phrase_duration_pre_vs_post_grouped(
 
     # — per-day aggregate (no stats)
     agg = None
-    if make_aggregate_plot:
-        daily = _build_daily_aggregate(df, labels, df["_dt"])
-        if not daily.empty:
-            daily["DateStr"] = daily["Date"].dt.strftime("%Y-%m-%d")
-            date_order = sorted(daily["DateStr"].unique())
+    daily = _build_daily_aggregate(df, labels, df["_dt"])
+    if not daily.empty:
+        daily["DateStr"] = daily["Date"].dt.strftime("%Y-%m-%d")
+        date_order = sorted(daily["DateStr"].unique())
 
-            fig, ax = plt.subplots(figsize=(16, 6))
-            sns.set(style="white")
-            sns.boxplot(x="DateStr", y="Phrase Duration (ms)", data=daily,
-                        order=date_order, color="lightgray", fliersize=0, ax=ax)
-            sns.stripplot(x="DateStr", y="Phrase Duration (ms)", data=daily,
-                          order=date_order, jitter=0.25, size=3, alpha=0.6, ax=ax, color="#2E4845")
+        fig, ax = plt.subplots(figsize=(16, 6))
+        sns.set(style="white")
+        sns.boxplot(x="DateStr", y="Phrase Duration (ms)", data=daily,
+                    order=date_order, color="lightgray", fliersize=0, ax=ax)
+        sns.stripplot(x="DateStr", y="Phrase Duration (ms)", data=daily,
+                      order=date_order, jitter=0.25, size=3, alpha=0.6, ax=ax, color="#2E4845")
 
-            t_str = t_date.strftime("%Y-%m-%d")
-            if t_str in date_order:
-                idx = date_order.index(t_str)
-                ax.axvline(idx, color="red", ls="--", lw=1.2)
+        t_str = t_date.strftime("%Y-%m-%d")
+        if t_str in date_order:
+            idx = date_order.index(t_str)
+            ax.axvline(idx, color="red", ls="--", lw=1.2)
 
-            ax.set_xlabel("Recording Date"); ax.set_ylabel("Phrase Duration (ms)")
-            _pretty_axes(ax, 90)
-            if y_max_ms: ax.set_ylim(0, float(y_max_ms))
-            ax.set_title(f"{animal_id} — Pre/Post Aggregate (per-day box + scatter)", fontsize=TITLE_FS)
+        ax.set_xlabel("Recording Date"); ax.set_ylabel("Phrase Duration (ms)")
+        _pretty_axes(ax, 90)
+        if y_max_ms: ax.set_ylim(0, float(y_max_ms))
+        ax.set_title(f"{animal_id} — Pre/Post Aggregate (per-day box + scatter)", fontsize=TITLE_FS)
 
-            fig.tight_layout()
-            agg = output_dir / f"{animal_id}_aggregate_pre_post_phrase_durations.png"
-            fig.savefig(agg, dpi=300, transparent=False)
-            if show_plots: plt.show()
-            else: plt.close(fig)
-        else:
-            print("[WARN] Aggregate: no durations found to plot.")
+        fig.tight_layout()
+        agg = output_dir / f"{animal_id}_aggregate_pre_post_phrase_durations.png"
+        fig.savefig(agg, dpi=300, transparent=False)
+        if show_plots: plt.show()
+        else: plt.close(fig)
+    else:
+        print("[WARN] Aggregate: no durations found to plot.")
 
-    # — three-group aggregate with per-syllable median dots + stats (DURATION)
-    agg3 = None
-    agg3_auto = None
-    agg3_pts = None
-
+    # — three-group aggregate with per-syllable median dots + stats (duration)
+    agg3 = agg3_auto = agg3_pts = None
     three_groups = []
     group_defs = [(early_pre, "Early Pre"), (late_pre, "Late Pre"), (post_g, "Post")]
     for part, label in group_defs:
@@ -576,22 +643,14 @@ def run_phrase_duration_pre_vs_post_grouped(
             vals = _collect_all_durations(part, labels)
             if vals.size:
                 three_groups.append(pd.DataFrame({"Group": label, "Phrase Duration (ms)": vals}))
-
     if three_groups:
         tall3 = pd.concat(three_groups, ignore_index=True)
         order = ["Early Pre", "Late Pre", "Post"]
         xpos = {g: i for i, g in enumerate(order)}
-
-        # per-syllable medians for each group (duration)
         med_map = {glabel: _per_syllable_medians(gdf, labels) for gdf, glabel in group_defs}
-
-        # arrays per group for stats
         group_arrays = {g: tall3.loc[tall3["Group"] == g, "Phrase Duration (ms)"].to_numpy() for g in order}
-
-        # omnibus Kruskal–Wallis
         kw_stat, kw_p = _try_kruskal([group_arrays[g] for g in order])
 
-        # pairwise Mann–Whitney + BH adjust
         pairs = list(combinations(order, 2))
         raw_p = []
         for a, b in pairs:
@@ -611,7 +670,6 @@ def run_phrase_duration_pre_vs_post_grouped(
                 order=order, color="lightgray",
                 whis=(0, 100), showfliers=False, ax=ax
             )
-            # overlay per-syllable medians with dashed connectors
             for lbl in [str(x) for x in labels]:
                 xs, ys = [], []
                 for g in order:
@@ -634,7 +692,6 @@ def run_phrase_duration_pre_vs_post_grouped(
                 bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="0.7", alpha=0.9)
             )
 
-        # Figure 1: with ylim (if provided)
         fig1, ax1 = plt.subplots(figsize=(10, 6))
         _draw_three_box(ax1, set_ylim=True, title=f"{animal_id} — Early/Late Pre vs Post (Syllable medians + boxes)")
         fig1.tight_layout()
@@ -643,7 +700,6 @@ def run_phrase_duration_pre_vs_post_grouped(
         if show_plots: plt.show()
         else: plt.close(fig1)
 
-        # Figure 2: auto y-limits
         fig2, ax2 = plt.subplots(figsize=(10, 6))
         _draw_three_box(ax2, set_ylim=False, title=f"{animal_id} — Early/Late Pre vs Post (auto y-limits)")
         fig2.tight_layout()
@@ -652,7 +708,6 @@ def run_phrase_duration_pre_vs_post_grouped(
         if show_plots: plt.show()
         else: plt.close(fig2)
 
-        # Figure 3: boxes + one *point per syllable* per group (duration)
         rows_pts = []
         for g in order:
             m = med_map.get(g, {})
@@ -691,10 +746,10 @@ def run_phrase_duration_pre_vs_post_grouped(
     # ──────────────────────────────────────────────────────────────────────────
     # Variance analyses (per-syllable)
     # ──────────────────────────────────────────────────────────────────────────
-    var_plot = None             # DISABLED: no per-syllable variance line plot
+    var_plot = None             # kept for API
     var_boxscatter = None
-    agg3_var_pts = None         # boxes + syllable points (ylim fixed to 2.0e7)
-    agg3_var_stats = None       # NEW: boxes + jitter + stats (ylim fixed to 2.0e7)
+    agg3_var_pts = None
+    agg3_var_stats = None
 
     var_maps: Dict[str, Dict[str, float]] = {
         "Early Pre": _per_syllable_variances(early_pre, labels) if len(early_pre) else {},
@@ -741,7 +796,7 @@ def run_phrase_duration_pre_vs_post_grouped(
         if show_plots: plt.show()
         else: plt.close(fig_b)
 
-        # 2) Three-group variance: boxes + syllable points (ylim fixed to 2.0e7)
+        # 2) Three-group variance: boxes + syllable points (ylim fixed)
         order = ["Early Pre", "Late Pre", "Post"]
         fig_g, ax_g = plt.subplots(figsize=(10, 6))
         sns.set(style="white")
@@ -760,14 +815,14 @@ def run_phrase_duration_pre_vs_post_grouped(
         ax_g.set_title(f"{animal_id} — Early/Late Pre vs Post (variance: boxes + syllable points)", fontsize=TITLE_FS)
         _pretty_axes(ax_g, 0)
         ax_g.legend(title="Syllable", frameon=False, bbox_to_anchor=(1.02, 1), loc="upper left")
-        ax_g.set_ylim(0, 2.0e7)  # fixed per request
+        ax_g.set_ylim(0, 2.0e7)
         fig_g.tight_layout()
         agg3_var_pts = output_dir / f"{animal_id}_aggregate_three_group_variance_syllable_points.png"
         fig_g.savefig(agg3_var_pts, dpi=300, transparent=False)
         if show_plots: plt.show()
         else: plt.close(fig_g)
 
-        # 3) NEW: Three-group variance: boxes + jitter + stats (ylim fixed to 2.0e7)
+        # 3) Three-group variance: boxes + jitter + stats (ylim fixed)
         fig_s, ax_s = plt.subplots(figsize=(10, 6))
         sns.set(style="white")
         sns.boxplot(
@@ -784,9 +839,8 @@ def run_phrase_duration_pre_vs_post_grouped(
         ax_s.set_ylabel("Variance of Phrase Duration (ms²)")
         ax_s.set_title(f"{animal_id} — Early/Late Pre vs Post (variance: boxes + jitter + stats)", fontsize=TITLE_FS)
         _pretty_axes(ax_s, 0)
-        ax_s.set_ylim(0, 2.0e7)  # fixed per request
+        ax_s.set_ylim(0, 2.0e7)
 
-        # Stats on variance distributions (one value per syllable per group)
         var_arrays = {g: df_var.loc[df_var["Group"] == g, "Variance (ms^2)"].to_numpy() for g in order}
         kw_stat_v, kw_p_v = _try_kruskal([var_arrays[g] for g in order])
         pairs = list(combinations(order, 2))
@@ -822,7 +876,7 @@ def run_phrase_duration_pre_vs_post_grouped(
         aggregate_three_box_path=agg3,
         aggregate_three_box_auto_ylim_path=agg3_auto,
         aggregate_three_box_with_syll_points_path=agg3_pts,
-        per_syllable_variance_path=None,                       # None (disabled)
+        per_syllable_variance_path=None,
         per_syllable_variance_boxscatter_path=var_boxscatter,
         aggregate_three_box_variance_with_syll_points_path=agg3_var_pts,
         aggregate_three_box_variance_with_stats_path=agg3_var_stats,
@@ -833,57 +887,118 @@ def run_phrase_duration_pre_vs_post_grouped(
 # ──────────────────────────────────────────────────────────────────────────────
 # CLI
 # ──────────────────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
+def _build_arg_parser():
     import argparse
-    p = argparse.ArgumentParser(description="Pre/Post grouped phrase-duration plots per syllable + aggregate.")
-    p.add_argument("decoded_database_json", type=str)
-    p.add_argument("output_dir", type=str)
-    p.add_argument("treatment_date", type=str, help='e.g., "2025-03-04" or "2025.03.04"')
-    p.add_argument("--grouping_mode", type=str, default="explicit",
-                   choices=["explicit", "auto_balance"],
-                   help="explicit: use the provided sizes; "
-                        "auto_balance: n = min(len(pre)//2, len(post)) for equal-sized groups")
+    p = argparse.ArgumentParser(
+        description=("Phrase-duration grouped plots using merged annotations.\n"
+                     "If --premerged is not provided, the script will MERGE automatically "
+                     "using --annotations and --detect (via build_decoded_with_split_labels).")
+    )
+    # Option A: premerged file
+    p.add_argument("--premerged", type=str, default=None,
+                   help="Path to pre-merged annotations table (CSV or JSON).")
+
+    # Option B: auto-merge inputs
+    p.add_argument("--annotations", type=str, default=None,
+                   help="Path to *_decoded_database.json (required if not using --premerged).")
+    p.add_argument("--detect", type=str, default=None,
+                   help="Path to *_song_detection.json (required if not using --premerged).")
+
+    # Merge knobs (used only when auto-merging)
+    p.add_argument("--ann-gap-ms", type=int, default=500)
+    p.add_argument("--seg-offset", type=int, default=0)
+    p.add_argument("--merge-repeats", action="store_true")
+    p.add_argument("--repeat-gap-ms", type=float, default=10.0)
+    p.add_argument("--repeat-gap-inclusive", action="store_true")
+
+    # Outputs / plotting
+    p.add_argument("--outdir", type=str, default=None,
+                   help="Output directory (default: <annotations>.parent/phrase_durations or CWD/phrase_durations)")
+    p.add_argument("--treatment-date", type=str, required=True)
+    p.add_argument("--grouping_mode", type=str, default="auto_balance",
+                   choices=["explicit", "auto_balance"])
     p.add_argument("--early_group_size", type=int, default=100)
     p.add_argument("--late_group_size", type=int, default=100)
     p.add_argument("--post_group_size", type=int, default=100)
-    p.add_argument("--only_song_present", action="store_true", default=True)
+    p.add_argument("--labels", type=str, nargs="*", default=None,
+                   help="Restrict to these labels (e.g., 0 1 2 ...). If omitted, inferred from data.")
     p.add_argument("--y_max_ms", type=float, default=None)
-    p.add_argument("--labels", type=str, nargs="*", default=None, help="Restrict to these labels (e.g., 0 1 2 ...)")
-    p.add_argument("--no_show", action="store_true", help="Disable plt.show()")
-    p.add_argument("--no_aggregate", action="store_true", help="(legacy; ignored—aggregate stays on)")
+    p.add_argument("--animal-id", type=str, default=None)
+    p.add_argument("--no-show", action="store_true")
+    return p
+
+def main():
+    p = _build_arg_parser()
     args = p.parse_args()
 
-    _ = run_phrase_duration_pre_vs_post_grouped(
-        decoded_database_json=args.decoded_database_json,
-        output_dir=args.output_dir,
+    # Resolve label list
+    restrict = [str(x) for x in args.labels] if args.labels else None
+
+    res = run_phrase_duration_pre_vs_post_grouped(
+        premerged_annotations_df=None,
+        premerged_annotations_path=args.premerged,
+
+        decoded_database_json=args.annotations,
+        song_detection_json=args.detect,
+        max_gap_between_song_segments=args.ann_gap_ms,
+        segment_index_offset=args.seg_offset,
+        merge_repeated_syllables=args.merge_repeats,
+        repeat_gap_ms=args.repeat_gap_ms,
+        repeat_gap_inclusive=args.repeat_gap_inclusive,
+
+        output_dir=args.outdir,
         treatment_date=args.treatment_date,
         grouping_mode=args.grouping_mode,
         early_group_size=args.early_group_size,
         late_group_size=args.late_group_size,
         post_group_size=args.post_group_size,
-        only_song_present=args.only_song_present,
-        restrict_to_labels=args.labels,
+        restrict_to_labels=restrict,
         y_max_ms=args.y_max_ms,
         show_plots=not args.no_show,
-        make_aggregate_plot=True,
+        animal_id_override=args.animal_id,
     )
 
+    print("\n[OK] Plots saved:")
+    print("  early_pre:", res.early_pre_path)
+    print("  late_pre :", res.late_pre_path)
+    print("  post     :", res.post_path)
+    print("  aggregate:", res.aggregate_path)
+    print("  3-group  :", res.aggregate_three_box_path)
+    print("  3-group (auto y):", res.aggregate_three_box_auto_ylim_path)
+    print("  3-group + syll pts:", res.aggregate_three_box_with_syll_points_path)
+    print("  variance box+scatter:", res.per_syllable_variance_boxscatter_path)
+    print("  variance 3-group pts :", res.aggregate_three_box_variance_with_syll_points_path)
+    print("  variance 3-group stats:", res.aggregate_three_box_variance_with_stats_path)
+
+if __name__ == "__main__":
+    main()
+
+
 """
-# Example (locks axis to 0..25)
-from phrase_duration_pre_vs_post_grouped import run_phrase_duration_pre_vs_post_grouped
+from pathlib import Path
+import phrase_duration_pre_vs_post_grouped as pdpg
 
-decoded = "/Users/mirandahulsey-vincent/Desktop/AreaX_lesion_2024/USA5283_decoded_database.json"
-outdir  = "/Users/mirandahulsey-vincent/Desktop/AreaX_lesion_2024/USA5283_figures"
-tdate   = "2024-03-05"
+decoded = Path("/Volumes/my_own_ssd/2025_areax_lesion/TweetyBERT_Pretrain_LLB_AreaX_FallSong_R08_RC6_Comp2_decoded_database.json")
+detect  = Path("/Volumes/my_own_ssd/2025_areax_lesion/R08_RC6_Comp2_song_detection.json")
 
-res = run_phrase_duration_pre_vs_post_grouped(
-    decoded_database_json=decoded,
+outdir = decoded.parent / "figures" / "phrase_durations"
+outdir.mkdir(parents=True, exist_ok=True)
+
+res = pdpg.run_phrase_duration_pre_vs_post_grouped(
+    decoded_database_json=decoded,       # <-- decoded DB here
+    song_detection_json=detect,          # <-- detection JSON here
+    max_gap_between_song_segments=500,
+    segment_index_offset=0,
+    merge_repeated_syllables=True,
+    repeat_gap_ms=10.0,
+    repeat_gap_inclusive=False,
     output_dir=outdir,
-    treatment_date=tdate,
+    treatment_date="2025-05-22",
     grouping_mode="auto_balance",
-    restrict_to_labels=[str(i) for i in range(26)],  # force 0..25 on x-axis
+    restrict_to_labels=[str(i) for i in range(26)],
     y_max_ms=40000,
-    only_song_present=True,
     show_plots=True,
 )
+print(res)
+
 """
