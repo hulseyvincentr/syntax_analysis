@@ -5,13 +5,14 @@
 Wrapper that:
   • Merges decoded annotations ONCE
   • Merges detected songs (durations) ONCE
-then runs FOUR analyses using those merged tables:
+then runs FIVE analyses using those merged tables:
   1) Last-syllable histogram + pies  (balanced Early/Late/Post)
   2) Per-target PRECEDER & SUCCESSOR combined panels (balanced groups)
   3) Song-duration comparisons (Pre vs Post; Early-Pre vs Late-Pre vs Post with stats)
   4) Daily syllable-usage heatmaps (linear scale), two variants:
         A) vmax = 1.0 (fixed)
         B) vmax = observed max (data-driven)
+  5) Total Transition Entropy (TTE) by day + balanced per-song 3-group plots
 
 Depends on modules in your PYTHONPATH / same folder:
   - merge_annotations_from_split_songs.py      (build_decoded_with_split_labels)
@@ -20,60 +21,7 @@ Depends on modules in your PYTHONPATH / same folder:
   - pre_and_post_syllable_plots.py
   - song_duration_comparison.py
   - syllable_heatmap_linear.py                 (build_daily_avg_count_table, plot_linear_scaled_syllable_counts)
-
-Typical usage (Spyder):
-
-    from pathlib import Path
-    import importlib
-    import Area_X_meta_wrapper as axmw
-    importlib.reload(axmw)
-
-    detect  = Path("/Volumes/my_own_ssd/2025_areax_lesion/R08_RC6_Comp2_song_detection.json")
-    decoded = Path("/Volumes/my_own_ssd/2025_areax_lesion/TweetyBERT_Pretrain_LLB_AreaX_FallSong_R08_RC6_Comp2_decoded_database.json")
-    tdate   = "2025-05-22"
-
-    out = axmw.run_area_x_meta_bundle(
-        song_detection_json=detect,
-        decoded_annotations_json=decoded,
-        treatment_date=tdate,
-        base_output_dir=decoded.parent / "figures",
-        # merge knobs (kept consistent across analyses)
-        max_gap_between_song_segments=500,
-        segment_index_offset=0,
-        merge_repeated_syllables=True,
-        repeat_gap_ms=10.0,
-        repeat_gap_inclusive=False,
-        merged_song_gap_ms=500,
-        # last-syllable
-        top_k_last_labels=15,
-        # preceder/successor
-        target_labels=None,
-        top_k_targets=8,
-        top_k_preceders=12,
-        top_k_successors=12,
-        include_start_as_preceder=False,
-        include_end_as_successor=False,
-        include_other_bin=True,
-        include_other_in_hist=True,
-        other_label="Other",
-        # heatmaps
-        heatmap_cmap="Greys",
-        nearest_match=True,
-        max_days_off=1,
-        # show figures interactively?
-        show=True,
-    )
-
-    print("Last-syllable hist:", out.last_syllable_hist_path)
-    print("Last-syllable pies:", out.last_syllable_pies_path)
-    print("Targets used:", out.targets_used)
-    print("Per-target panels:", out.per_target_outputs)
-    print("Durations pre/post:", out.duration_plots.pre_post_path)
-    print("Durations three-group:", out.duration_plots.three_group_path)
-    print("Three-group stats:", out.duration_plots.three_group_stats)
-    print("Heatmap v1.0:", out.heatmaps.path_v1)
-    print("Heatmap vmax=max:", out.heatmaps.path_vmax)
-    print("Heatmap vmax_max value:", out.heatmaps.vmax_max)
+  - tte_by_day.py                              (TTE_by_day)
 """
 
 from __future__ import annotations
@@ -94,7 +42,7 @@ import last_syllable_plots as lsp
 import pre_and_post_syllable_plots as pps
 import song_duration_comparison as sdc
 import syllable_heatmap_linear as shlin  # provides build_daily_avg_count_table & plot_linear_scaled_syllable_counts
-
+import tte_by_day as tte
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Small utilities
@@ -121,7 +69,6 @@ def _collect_unique_labels_sorted(df: pd.DataFrame, dict_col: str) -> List[str]:
     except Exception:
         return sorted(labs)
 
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Dataclasses for outputs
 # ──────────────────────────────────────────────────────────────────────────────
@@ -137,6 +84,14 @@ class HeatmapOut:
     path_v1: Optional[str]      # vmax=1.0
     path_vmax: Optional[str]    # vmax=max observed
     vmax_max: float
+
+@dataclass
+class TTEPlotsOut:
+    timecourse_path: Optional[str]
+    three_group_path: Optional[str]         # clean (no stats panel)
+    three_group_stats_path: Optional[str]   # right-hand stats panel
+    prepost_p_value: Optional[float]
+    prepost_test: Optional[str]
 
 @dataclass
 class AreaXMetaResult:
@@ -156,6 +111,9 @@ class AreaXMetaResult:
     # Heatmaps
     heatmaps: HeatmapOut
 
+    # TTE
+    tte_plots: TTEPlotsOut
+
     # Shared/merged tables
     merged_annotations_df: pd.DataFrame
     merged_detected_df: pd.DataFrame
@@ -164,7 +122,6 @@ class AreaXMetaResult:
     early_df: pd.DataFrame
     late_df: pd.DataFrame
     post_df: pd.DataFrame
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Main runner (merge-once → reuse)
@@ -212,6 +169,10 @@ def run_area_x_meta_bundle(
     heatmap_v1_filename: str = "syllable_heatmap_linear_vmax1.00.png",
     heatmap_vmax_filename: str = "syllable_heatmap_linear_vmaxMAX.png",
 
+    # ---- TTE knobs ----
+    tte_min_songs_per_day: int = 1,
+    tte_treatment_in: str = "post",  # "post", "pre", or "exclude"
+
     # ---- display ----
     show: bool = True,
 ) -> AreaXMetaResult:
@@ -228,7 +189,8 @@ def run_area_x_meta_bundle(
     pps_dir  = base_output_dir / "preceder_successor_panels"
     dur_dir  = base_output_dir / "durations"
     hm_dir   = base_output_dir / "heatmaps"
-    for d in (last_dir, pps_dir, dur_dir, hm_dir):
+    tte_dir  = base_output_dir / "tte"
+    for d in (last_dir, pps_dir, dur_dir, hm_dir, tte_dir):
         d.mkdir(parents=True, exist_ok=True)
 
     # ── MERGE ONCE: decoded annotations (for syllable analyses & heatmaps) ──
@@ -261,6 +223,10 @@ def run_area_x_meta_bundle(
     else:
         merged_detected_df = sdc._prepare_table(song_detection_json, merge_gap_ms=None, songs_only=True)
         _dur_title_suffix = "(Unmerged segments)"
+
+    # Infer animal ID once for consistent naming across analyses
+    _animal_id = (shlin._infer_animal_id(merged_annotations_df, decoded_annotations_json)
+                  or decoded_annotations_json.stem or "unknown_animal")
 
     # ──────────────────────────────────────────────────────────
     # 1) LAST-SYLLABLE PLOTS (using lsp helpers on merged_annotations_df)
@@ -469,9 +435,8 @@ def run_area_x_meta_bundle(
         )
 
         # File names (animal id helper from your plotting module)
-        animal_id = (shlin._infer_animal_id(dfH, decoded_annotations_json) or decoded_annotations_json.stem or "unknown_animal")
-        hm_v1_path   = hm_dir / f"{animal_id}_{heatmap_v1_filename}"
-        hm_vmax_path = hm_dir / f"{animal_id}_{heatmap_vmax_filename}"
+        hm_v1_path   = hm_dir / f"{_animal_id}_{heatmap_v1_filename}"
+        hm_vmax_path = hm_dir / f"{_animal_id}_{heatmap_vmax_filename}"
 
         # vmax for Plot B
         raw_max = float(np.nanmax(count_table.to_numpy())) if count_table.size else 1.0
@@ -480,7 +445,7 @@ def run_area_x_meta_bundle(
         # Plot A: fixed vmax=1.0
         _ = shlin.plot_linear_scaled_syllable_counts(
             count_table,
-            animal_id=animal_id,
+            animal_id=_animal_id,
             treatment_date=tdate,
             save_path=hm_v1_path,
             show=show,
@@ -494,7 +459,7 @@ def run_area_x_meta_bundle(
         # Plot B: vmax = observed maximum
         _ = shlin.plot_linear_scaled_syllable_counts(
             count_table,
-            animal_id=animal_id,
+            animal_id=_animal_id,
             treatment_date=tdate,
             save_path=hm_vmax_path,
             show=show,
@@ -510,6 +475,32 @@ def run_area_x_meta_bundle(
 
     heatmaps_out = HeatmapOut(path_v1=hm_v1_path, path_vmax=hm_vmax_path, vmax_max=float(vmax_max))
 
+    # ──────────────────────────────────────────────────────────
+    # 5) TTE (delegate to tte_by_day; figures go to base_output_dir / "tte")
+    # ──────────────────────────────────────────────────────────
+    tte_res = tte.TTE_by_day(
+        decoded_database_json=decoded_annotations_json,
+        creation_metadata_json=None,
+        only_song_present=True,
+        compute_durations=False,
+        fig_dir=tte_dir,
+        show=show,
+        organize_builder=None,          # use tte_by_day's default organizer
+        min_songs_per_day=tte_min_songs_per_day,
+        treatment_date=tdate,
+        treatment_in=tte_treatment_in,
+    )
+
+    # We also know the filename of the "stats panel" figure from our earlier TTE code patch:
+    stats_panel_path = tte_dir / f"{_animal_id}_TTE_pre_vs_post_balanced_3group_box_stats_merged.png"
+    tte_out = TTEPlotsOut(
+        timecourse_path=(None if tte_res.figure_path_timecourse is None else str(tte_res.figure_path_timecourse)),
+        three_group_path=(None if tte_res.figure_path_prepost_box is None else str(tte_res.figure_path_prepost_box)),
+        three_group_stats_path=str(stats_panel_path),
+        prepost_p_value=tte_res.prepost_p_value,
+        prepost_test=tte_res.prepost_test,
+    )
+
     # Build final result
     return AreaXMetaResult(
         last_syllable_hist_path=last_hist_path,
@@ -520,13 +511,13 @@ def run_area_x_meta_bundle(
         per_target_outputs=per_target_outputs,
         duration_plots=duration_out,
         heatmaps=heatmaps_out,
+        tte_plots=tte_out,
         merged_annotations_df=merged_annotations_df,
         merged_detected_df=merged_detected_df,
         early_df=early_df,
         late_df=late_df,
         post_df=post_df,
     )
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CLI
@@ -535,7 +526,7 @@ def run_area_x_meta_bundle(
 if __name__ == "__main__":
     import argparse
 
-    p = argparse.ArgumentParser(description="Area X meta wrapper: merge once, run last-syllable, preceder/successor, duration, and heatmap plots.")
+    p = argparse.ArgumentParser(description="Area X meta wrapper: merge once, run last-syllable, preceder/successor, duration, heatmap, and TTE plots.")
     p.add_argument("--song-detection", "-d", type=str, required=True, help="Path to *_song_detection.json")
     p.add_argument("--annotations", "-a", type=str, required=True, help="Path to *_decoded_database.json")
     p.add_argument("--treatment-date", "-t", type=str, required=True, help="YYYY-MM-DD")
@@ -574,6 +565,10 @@ if __name__ == "__main__":
     p.add_argument("--heatmap-v1-name", type=str, default="syllable_heatmap_linear_vmax1.00.png")
     p.add_argument("--heatmap-vmax-name", type=str, default="syllable_heatmap_linear_vmaxMAX.png")
 
+    # TTE
+    p.add_argument("--tte-min-songs-per-day", type=int, default=1)
+    p.add_argument("--tte-treatment-in", type=str, default="post", choices=["post", "pre", "exclude"])
+
     p.add_argument("--no-show", action="store_true")
 
     args = p.parse_args()
@@ -611,6 +606,9 @@ if __name__ == "__main__":
         max_days_off=args.max_days_off,
         heatmap_v1_filename=args.heatmap_v1_name,
         heatmap_vmax_filename=args.heatmap_vmax_name,
+        # TTE
+        tte_min_songs_per_day=args.tte_min_songs_per_day,
+        tte_treatment_in=args.tte_treatment_in,
         # display
         show=not args.no_show,
     )
@@ -625,6 +623,10 @@ if __name__ == "__main__":
     print("[OK] Heatmap v1.0:", res.heatmaps.path_v1)
     print("[OK] Heatmap vmax=max:", res.heatmaps.path_vmax)
     print("[OK] Heatmap vmax_max:", res.heatmaps.vmax_max)
+    print("[OK] TTE time-course:", res.tte_plots.timecourse_path)
+    print("[OK] TTE 3-group (clean):", res.tte_plots.three_group_path)
+    print("[OK] TTE 3-group (stats):", res.tte_plots.three_group_stats_path)
+    print("[OK] TTE pre/post p-value:", res.tte_plots.prepost_p_value, res.tte_plots.prepost_test)
 
 
 """
@@ -642,12 +644,14 @@ res = axmw.run_area_x_meta_bundle(
     decoded_annotations_json=decoded,
     treatment_date=tdate,
     base_output_dir=decoded.parent / "figures",
+    # merge consistency
     max_gap_between_song_segments=500,
     segment_index_offset=0,
     merge_repeated_syllables=True,
     repeat_gap_ms=10.0,
     repeat_gap_inclusive=False,
     merged_song_gap_ms=500,
+    # last syllable / preceder-successor
     top_k_last_labels=15,
     target_labels=None,
     top_k_targets=8,
@@ -658,9 +662,14 @@ res = axmw.run_area_x_meta_bundle(
     include_other_bin=True,
     include_other_in_hist=True,
     other_label="Other",
+    # heatmaps
     heatmap_cmap="Greys",
     nearest_match=True,
     max_days_off=1,
+    # TTE
+    tte_min_songs_per_day=1,
+    tte_treatment_in="post",
+    # show figures?
     show=True,
 )
 
@@ -670,6 +679,9 @@ print("Durations pre/post:", res.duration_plots.pre_post_path)
 print("Durations three-group:", res.duration_plots.three_group_path)
 print("Heatmap v1.0:", res.heatmaps.path_v1)
 print("Heatmap vmax=max:", res.heatmaps.path_vmax)
-print("vmax_max used:", res.heatmaps.vmax_max)
+print("TTE time-course:", res.tte_plots.timecourse_path)
+print("TTE 3-group (clean):", res.tte_plots.three_group_path)
+print("TTE 3-group (stats):", res.tte_plots.three_group_stats_path)
+
 
 """
