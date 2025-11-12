@@ -15,13 +15,13 @@ Batch runner for Area X analyses using a metadata Excel sheet.
   Area_X_wrapper.run_area_x_meta_bundle(...) once per animal.
 
 Example (Python):
-
+    from pathlib import Path
     from Area_X_meta_wrapper import Area_X_meta_wrapper
 
     results = Area_X_meta_wrapper(
-        metadata_excel="/path/to/metadata.xlsx",
-        json_root_dir="/path/to/all_jsons_root",
-        output_root="/path/to/figures_root",   # optional; per-animal subfolders will be made
+        metadata_excel=Path("/Volumes/my_own_ssd/2024_2025_Area_X_jsons_npzs/Area_X_lesion_metadata.xlsx"),
+        json_root_dir=Path("/Volumes/my_own_ssd/2024_2025_Area_X_jsons_npzs"),
+        #output_root="/path/to/figures_root",   # optional; per-animal subfolders will be made
         # (optional) override column names if your sheet uses different headers:
         animal_id_col="Animal ID",
         treatment_date_col="Treatment date",
