@@ -1,28 +1,29 @@
 # -*- coding: utf-8 -*-
-# tte_by_day.py
+# tte_by_day.py  (merged-aware; plain + stats 3-group plots)
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 import argparse
-import inspect
 import re
+import inspect
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# Optional SciPy for stats (kept for future extensions; not used in 3-group plot)
+# Optional SciPy for omnibus + MWU
 try:
     from scipy import stats as _scipy_stats  # type: ignore
     _HAVE_SCIPY = True
 except Exception:
     _HAVE_SCIPY = False
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Organizer import strategy (prefer Excel-serial-based builder)
-# ──────────────────────────────────────────────────────────────────────────────
+from merge_annotations_from_split_songs import build_decoded_with_split_labels
+from merge_potential_split_up_song import build_detected_and_merged_songs
+
+# Fallback organizer (legacy mode if --detect omitted)
 _ORGANIZE_DEFAULT: Optional[Callable] = None
 try:
     from organized_decoded_serialTS_segments import (
@@ -41,7 +42,6 @@ except Exception:
         except Exception:
             _ORGANIZE_DEFAULT = None
 
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Small helpers
 # ──────────────────────────────────────────────────────────────────────────────
@@ -49,9 +49,6 @@ def _safe_pad(s: Optional[str]) -> str:
     if s is None or (isinstance(s, float) and pd.isna(s)) or s == "":
         return "00"
     return str(s).zfill(2)
-
-def _date_str(d) -> str:
-    return pd.to_datetime(d).strftime("%Y-%m-%d")
 
 def _most_common(strings: Iterable[str]) -> Optional[str]:
     from collections import Counter
@@ -67,13 +64,13 @@ def _extract_id_from_text(text: str) -> Optional[str]:
         return m.group(1)
     return None
 
-def _infer_animal_id_from_df(organized_df: pd.DataFrame) -> Optional[str]:
+def _infer_animal_id_from_df(df: pd.DataFrame) -> Optional[str]:
     for col in ["animal_id", "Animal_ID", "animalID"]:
-        if col in organized_df.columns and organized_df[col].notna().any():
-            return _most_common(organized_df[col].dropna().astype(str))
-    if "file_name" in organized_df.columns:
+        if col in df.columns and df[col].notna().any():
+            return _most_common(df[col].dropna().astype(str))
+    if "file_name" in df.columns:
         matches = []
-        for fn in organized_df["file_name"].dropna().astype(str):
+        for fn in df["file_name"].dropna().astype(str):
             mid = _extract_id_from_text(fn)
             if mid:
                 matches.append(mid)
@@ -82,7 +79,7 @@ def _infer_animal_id_from_df(organized_df: pd.DataFrame) -> Optional[str]:
 
 def _infer_animal_id(decoded_path: Path,
                      metadata_path: Optional[Path] = None,
-                     organized_df: Optional[pd.DataFrame] = None,
+                     df: Optional[pd.DataFrame] = None,
                      od: Optional[object] = None) -> str:
     if od is not None:
         for attr in ["animal_id", "animalID", "Animal_ID"]:
@@ -90,8 +87,8 @@ def _infer_animal_id(decoded_path: Path,
                 val = getattr(od, attr)
                 if isinstance(val, str) and val.strip():
                     return val.strip()
-    if organized_df is not None:
-        guess = _infer_animal_id_from_df(organized_df)
+    if df is not None:
+        guess = _infer_animal_id_from_df(df)
         if guess:
             return guess
     texts: List[str] = [str(decoded_path), decoded_path.stem]
@@ -122,9 +119,8 @@ def _parse_treatment_date(treatment_date: Optional[Union[str, pd.Timestamp]]) ->
     except Exception:
         return None
 
-
 # ──────────────────────────────────────────────────────────────────────────────
-# Syllable sequence → bigram counts → TTE
+# Sequence → bigrams → entropy
 # ──────────────────────────────────────────────────────────────────────────────
 def _derive_order_from_row(row: pd.Series) -> List[str]:
     dct = row.get("syllable_onsets_offsets_ms_dict") or row.get("syllable_onsets_offsets_ms")
@@ -192,36 +188,7 @@ def _total_transition_entropy(counts_mat: np.ndarray, syllable_types: List[str],
     probs = row_sums / total
     return float(sum(probs[i] * ent_by_syll.get(lab, 0.0) for i, lab in enumerate(syllable_types)))
 
-def _aggregated_tte_for_subset(subdf: pd.DataFrame, syllable_types: List[str]) -> float:
-    if subdf.empty:
-        return float("nan")
-    pooled: Dict[Tuple[str, str], int] = {}
-    for freq in subdf["transition_frequencies"]:
-        for tr, cnt in freq.items():
-            pooled[tr] = pooled.get(tr, 0) + cnt
-    if not pooled:
-        return float("nan")
-    tr_list = list(pooled.keys())
-    tr_counts = list(pooled.values())
-    norm_mat, counts_mat = _generate_normalized_transition_matrix(tr_list, tr_counts, syllable_types)
-    ent_by = _transition_entropy_per_row(norm_mat, syllable_types)
-    return _total_transition_entropy(counts_mat, syllable_types, ent_by)
-
-def _per_file_ttes(subdf: pd.DataFrame, syllable_types: List[str]) -> List[float]:
-    vals: List[float] = []
-    for freq in subdf["transition_frequencies"]:
-        if not freq:
-            vals.append(0.0)
-            continue
-        tr_list = list(freq.keys())
-        tr_counts = list(freq.values())
-        norm_mat, counts_mat = _generate_normalized_transition_matrix(tr_list, tr_counts, syllable_types)
-        ent_by = _transition_entropy_per_row(norm_mat, syllable_types)
-        vals.append(_total_transition_entropy(counts_mat, syllable_types, ent_by))
-    return vals
-
-def _tte_from_freq(freq: Dict[Tuple[str, str], int], syllable_types: List[str]) -> float:
-    """Compute TTE for a single file/segment given its transition_frequencies dict."""
+def _per_file_tte_from_freq(freq: Dict[Tuple[str, str], int], syllable_types: List[str]) -> float:
     if not freq:
         return 0.0
     tr_list = list(freq.keys())
@@ -239,96 +206,89 @@ def _mean_sem(x: List[float]) -> Tuple[float, Optional[float], int]:
     arr = np.asarray(x, dtype=float)
     return float(np.mean(arr)), float(np.std(arr, ddof=1) / np.sqrt(n)), n
 
-
 # ──────────────────────────────────────────────────────────────────────────────
-# Stats helpers (kept; not used in the new 3-group figure by default)
+# Stats helpers (Kruskal + MWU Holm; Cliff's delta; formatting/plotting)
 # ──────────────────────────────────────────────────────────────────────────────
 def _p_to_stars(p: float) -> str:
     return "***" if p < 1e-3 else ("**" if p < 1e-2 else ("*" if p < 0.05 else "ns"))
 
-def _prepost_pvalue(pre_vals: List[float], post_vals: List[float]) -> Tuple[Optional[float], str]:
-    pre = np.asarray(pre_vals, dtype=float)
-    post = np.asarray(post_vals, dtype=float)
-    if pre.size == 0 or post.size == 0:
-        return None, "insufficient"
+def _holm_bonferroni(pvals: List[float]) -> List[float]:
+    m = len(pvals)
+    order = np.argsort(pvals)
+    adj = [None]*m
+    running = 0.0
+    for rank, idx in enumerate(order):
+        factor = m - rank
+        val = pvals[idx] * factor
+        running = max(running, val)  # step-up
+        adj[idx] = min(1.0, running)
+    return [float(v) for v in adj]  # type: ignore
 
+def _cliffs_delta(a: List[float], b: List[float]) -> float:
+    a = list(a); b = list(b)
+    if len(a) == 0 or len(b) == 0:
+        return float("nan")
+    wins = 0; losses = 0
+    for x in a:
+        for y in b:
+            if x > y: wins += 1
+            elif x < y: losses += 1
+    denom = len(a) * len(b)
+    return (wins - losses) / denom if denom else float("nan")
+
+def _pairwise_mwu(a: List[float], b: List[float]) -> float:
     if _HAVE_SCIPY:
-        try:
-            u = _scipy_stats.mannwhitneyu(pre, post, alternative="two-sided", method="auto")
-            return float(u.pvalue), "mannwhitneyu"
-        except Exception:
-            pass
-
+        return float(_scipy_stats.mannwhitneyu(a, b, alternative="two-sided", method="auto").pvalue)
+    # permutation fallback (mean diff)
     rng = np.random.default_rng(0)
-    pooled = np.concatenate([pre, post])
-    n1 = pre.size
-    obs = abs(pre.mean() - post.mean())
+    pooled = np.asarray(a + b, dtype=float)
+    n1 = len(a)
+    obs = abs(np.mean(a) - np.mean(b))
     iters = 20000 if pooled.size <= 200 else 5000
     count = 0
     for _ in range(iters):
         rng.shuffle(pooled)
-        a = pooled[:n1]
-        b = pooled[n1:]
-        if abs(a.mean() - b.mean()) >= obs - 1e-12:
+        if abs(pooled[:n1].mean() - pooled[n1:].mean()) >= obs - 1e-12:
             count += 1
-    pval = (count + 1) / (iters + 1)
-    return float(pval), "perm_mean_diff"
+    return float((count + 1) / (iters + 1))
 
+def _draw_sig_bracket(ax, x1: float, x2: float, y: float, h: float, label: str):
+    """Draw a significance bracket from x1 to x2 at height y."""
+    ax.plot([x1, x1, x2, x2], [y, y+h, y+h, y], lw=1.5, c="k")
+    ax.text((x1 + x2) / 2, y + h + (0.01*(ax.get_ylim()[1]-ax.get_ylim()[0])), label,
+            ha="center", va="bottom", fontsize=11)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Build per-file (per-segment) table with datetime + bigram counts
+# Per-song table from MERGED ANNOTATIONS
 # ──────────────────────────────────────────────────────────────────────────────
-def _build_per_file_table(organized_df: pd.DataFrame) -> pd.DataFrame:
-    df = organized_df.copy()
-
-    if "file_name" in df.columns:
-        seg_extracted = df["file_name"].astype(str).str.extract(r'_(\d+)(?:\.\w+)?$', expand=False)
-        if "Segment" not in df.columns:
-            df["Segment"] = pd.to_numeric(seg_extracted, errors="coerce").fillna(0).astype(int)
-        if "File Stem" not in df.columns:
-            df["File Stem"] = df["file_name"].astype(str).str.replace(r'_(\d+)(?:\.\w+)?$', "", regex=True)
-
-    dt = None
-    for cand in ["creation_date", "Recording DateTime", "recording_datetime", "date_time"]:
+def _build_per_song_from_merged_annotations(merged_ann_df: pd.DataFrame) -> pd.DataFrame:
+    df = merged_ann_df.copy()
+    dt_col = None
+    for cand in ["Recording DateTime", "recording_datetime", "creation_date", "date_time"]:
         if cand in df.columns:
-            dt = pd.to_datetime(df[cand], errors="coerce")
+            dt_col = cand
             break
-    if dt is None:
-        for c in ["Date", "Hour", "Minute", "Second"]:
-            if c not in df.columns:
-                df[c] = None
-        dstr = pd.to_datetime(df["Date"], errors="coerce")
-        hh = df["Hour"].apply(_safe_pad) if "Hour" in df.columns else "00"
-        mm = df["Minute"].apply(_safe_pad) if "Minute" in df.columns else "00"
-        ss = df["Second"].apply(_safe_pad) if "Second" in df.columns else "00"
-        dt = pd.to_datetime(
-            dstr.dt.strftime("%Y-%m-%d") + " " + hh.astype(str) + ":" + mm.astype(str) + ":" + ss.astype(str),
-            errors="coerce"
-        )
-
-    df["date_time"] = dt
+    if dt_col is None:
+        raise ValueError("Merged annotations missing a datetime column.")
+    df["date_time"] = pd.to_datetime(df[dt_col], errors="coerce")
     df["day"] = df["date_time"].dt.date
+
+    if "file_name" in df.columns and "File Stem" not in df.columns:
+        df["File Stem"] = df["file_name"].astype(str)
 
     if "syllable_order" not in df.columns:
         df["syllable_order"] = df.apply(_derive_order_from_row, axis=1)
     else:
-        def _coerce(x):
-            if isinstance(x, (list, tuple)):
-                return [str(v) for v in x]
-            return []
-        df["syllable_order"] = df["syllable_order"].apply(_coerce)
-
+        df["syllable_order"] = df["syllable_order"].apply(
+            lambda x: [str(v) for v in x] if isinstance(x, (list, tuple)) else []
+        )
     df["transition_frequencies"] = df["syllable_order"].apply(_bigram_counts_from_seq)
-
     ok = (~df["date_time"].isna()) & (df["transition_frequencies"].apply(lambda d: isinstance(d, dict) and len(d) > 0))
-
     keep = ["date_time", "day", "transition_frequencies"]
     for name in ["file_name", "File Stem", "Segment", "segment"]:
         if name in df.columns:
             keep.append(name)
-
     return df.loc[ok, keep].reset_index(drop=True)
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Public API
@@ -337,75 +297,148 @@ def _build_per_file_table(organized_df: pd.DataFrame) -> pd.DataFrame:
 class TTEByDayResult:
     results_df: pd.DataFrame
     figure_path_timecourse: Optional[Path]
-    figure_path_prepost_box: Optional[Path]  # now points to the 3-group matched plot when treatment_date is given
+    figure_path_prepost_box_plain: Optional[Path]   # NEW
+    figure_path_prepost_box_stats: Optional[Path]   # NEW
+    # For backward compatibility (points to stats plot if present, else plain)
+    figure_path_prepost_box: Optional[Path]
     prepost_p_value: Optional[float]
     prepost_test: Optional[str]
+    merged_durations_df: Optional[pd.DataFrame]
+    three_group_stats: Optional[Dict[str, object]]
 
 __all__ = ["TTEByDayResult", "TTE_by_day", "main"]
 
 def TTE_by_day(
     *,
     decoded_database_json: Union[str, Path],
+    song_detection_json: Optional[Union[str, Path]] = None,
+
+    # annotations merge knobs
+    max_gap_between_song_segments: int = 500,
+    segment_index_offset: int = 0,
+    merge_repeated_syllables: bool = True,
+    repeat_gap_ms: float = 10.0,
+    repeat_gap_inclusive: bool = False,
+
+    # durations merge knob
+    merged_song_gap_ms: Optional[int] = 500,
+
+    # general
+    fig_dir: Optional[Union[str, Path]] = None,
+    show: bool = True,
+    min_songs_per_day: int = 1,
+    treatment_date: Optional[Union[str, pd.Timestamp]] = None,
+    treatment_in: str = "post",
+
+    # legacy fallbacks (if detect omitted)
     creation_metadata_json: Optional[Union[str, Path]] = None,
     only_song_present: bool = True,
     compute_durations: bool = False,
-    fig_dir: Optional[Union[str, Path]] = None,
-    show: bool = True,
     organize_builder: Optional[Callable] = _ORGANIZE_DEFAULT,
-    min_songs_per_day: int = 1,
-    treatment_date: Optional[Union[str, pd.Timestamp]] = None,
-    treatment_in: str = "post",  # "post", "pre", or "exclude"
 ) -> TTEByDayResult:
-    """
-    Compute aggregated TTE per day and render:
-      (1) a time-course line plot (optional treatment date vertical line),
-      (2) a Balanced 3-group per-song plot (Early-Pre, Late-Pre, Post) if treatment_date is given:
-          n = min(floor(#pre_songs/2), #post_songs).
-          Use last 2n pre songs (split into halves) and first n post songs.
-    """
+
     decoded_path = Path(decoded_database_json)
-    metadata_path = Path(creation_metadata_json) if creation_metadata_json else None
+    det_path = Path(song_detection_json) if song_detection_json else None
     tx_date = _parse_treatment_date(treatment_date)
 
-    builder = organize_builder or _ORGANIZE_DEFAULT
-    if builder is None:
-        raise ImportError(
-            "No organizer available. Ensure one of these modules is importable:\n"
-            "  - organized_decoded_serialTS_segments.py\n"
-            "  - organize_decoded_serialTS_segments.py\n"
-            "  - organize_decoded_with_segments.py"
+    # Build tables
+    if det_path is not None:
+        ann = build_decoded_with_split_labels(
+            decoded_database_json=decoded_path,
+            song_detection_json=det_path,
+            only_song_present=True,
+            compute_durations=True,
+            add_recording_datetime=True,
+            songs_only=True,
+            flatten_spec_params=True,
+            max_gap_between_song_segments=max_gap_between_song_segments,
+            segment_index_offset=segment_index_offset,
+            merge_repeated_syllables=merge_repeated_syllables,
+            repeat_gap_ms=repeat_gap_ms,
+            repeat_gap_inclusive=repeat_gap_inclusive,
         )
+        merged_ann_df = ann.annotations_appended_df.copy()
 
-    # Signature-aware call
-    params = inspect.signature(builder).parameters
-    kwargs = {
-        "decoded_database_json": decoded_path,
-        "only_song_present": only_song_present,
-        "compute_durations": compute_durations,
-    }
-    if "add_recording_datetime" in params:
-        kwargs["add_recording_datetime"] = True
-    if "creation_metadata_json" in params:
-        kwargs["creation_metadata_json"] = metadata_path
+        if merged_song_gap_ms and int(merged_song_gap_ms) > 0:
+            det = build_detected_and_merged_songs(
+                det_path,
+                songs_only=True,
+                flatten_spec_params=True,
+                max_gap_between_song_segments=int(merged_song_gap_ms),
+            )
+            merged_dur_df = det["detected_merged_songs"].copy()
+        else:
+            merged_dur_df = None
 
-    od = builder(**kwargs)
-    organized = od.organized_df
-    animal_id = _infer_animal_id(decoded_path, metadata_path, organized_df=organized, od=od)
+        work_df = merged_ann_df
+        od_for_id = None
+    else:
+        builder = organize_builder or _ORGANIZE_DEFAULT
+        if builder is None:
+            raise ImportError("No organizer available and no song_detection_json provided.")
+        params = inspect.signature(builder).parameters
+        kwargs = {
+            "decoded_database_json": decoded_path,
+            "only_song_present": only_song_present,
+            "compute_durations": compute_durations,
+        }
+        if "add_recording_datetime" in params:
+            kwargs["add_recording_datetime"] = True
+        if "creation_metadata_json" in params and creation_metadata_json:
+            kwargs["creation_metadata_json"] = Path(creation_metadata_json)
+        od_for_id = builder(**kwargs)
+        work_df = od_for_id.organized_df.copy()
+        merged_dur_df = None
 
-    # Per-file (per-segment) table
-    pf = _build_per_file_table(organized)
+    animal_id = _infer_animal_id(decoded_path, None, df=work_df, od=od_for_id)
+
+    # Per-song rows from merged annotations (or legacy per-segment)
+    if det_path is not None:
+        pf = _build_per_song_from_merged_annotations(work_df)
+    else:
+        # legacy
+        pf = work_df.copy()
+        dt = None
+        for cand in ["creation_date", "Recording DateTime", "recording_datetime", "date_time"]:
+            if cand in pf.columns:
+                dt = pd.to_datetime(pf[cand], errors="coerce")
+                break
+        if dt is None:
+            for c in ["Date", "Hour", "Minute", "Second"]:
+                if c not in pf.columns:
+                    pf[c] = None
+            dstr = pd.to_datetime(pf["Date"], errors="coerce")
+            hh = pf["Hour"].apply(_safe_pad) if "Hour" in pf.columns else "00"
+            mm = pf["Minute"].apply(_safe_pad) if "Minute" in pf.columns else "00"
+            ss = pf["Second"].apply(_safe_pad) if "Second" in pf.columns else "00"
+            dt = pd.to_datetime(dstr.dt.strftime("%Y-%m-%d") + " " + hh.astype(str) + ":" + mm.astype(str) + ":" + ss.astype(str),
+                                errors="coerce")
+        pf["date_time"] = dt
+        pf["day"] = pf["date_time"].dt.date
+        if "syllable_order" not in pf.columns:
+            pf["syllable_order"] = pf.apply(_derive_order_from_row, axis=1)
+        else:
+            pf["syllable_order"] = pf["syllable_order"].apply(lambda x: [str(v) for v in x] if isinstance(x, (list, tuple)) else [])
+        pf["transition_frequencies"] = pf["syllable_order"].apply(_bigram_counts_from_seq)
+        ok = (~pf["date_time"].isna()) & (pf["transition_frequencies"].apply(lambda d: isinstance(d, dict) and len(d) > 0))
+        keep = ["date_time", "day", "transition_frequencies"]
+        for name in ["file_name", "File Stem", "Segment", "segment"]:
+            if name in pf.columns:
+                keep.append(name)
+        pf = pf.loc[ok, keep].reset_index(drop=True)
+
     if pf.empty:
-        print("No valid per-file transitions (check date_time and syllable dicts).")
-        return TTEByDayResult(pd.DataFrame(), None, None, None, None)
+        print("No valid per-song transitions after merging.")
+        return TTEByDayResult(pd.DataFrame(), None, None, None, None, None, None, merged_durations_df=merged_dur_df, three_group_stats=None)
 
-    # Global syllable set for consistent axes
-    all_transitions: Dict[Tuple[str, str], int] = {}
+    # Global syllable set
+    all_tr: Dict[Tuple[str, str], int] = {}
     for d in pf["transition_frequencies"]:
         for tr, cnt in d.items():
-            all_transitions[tr] = all_transitions.get(tr, 0) + cnt
-    syllable_types = sorted({a for a, _ in all_transitions} | {b for _, b in all_transitions})
+            all_tr[tr] = all_tr.get(tr, 0) + cnt
+    syllable_types = sorted({a for a, _ in all_tr} | {b for _, b in all_tr})
 
-    # Per-day aggregated TTE (+ per-file stats for reference)
+    # Per-day aggregated TTE (+ per-song stats for ref)
     rows: List[Dict[str, object]] = []
     for day, grp in pf.groupby("day"):
         grp = grp.sort_values(["date_time", *(c for c in ["Segment", "segment", "file_name"] if c in grp.columns)])
@@ -413,76 +446,71 @@ def TTE_by_day(
         if n < min_songs_per_day:
             continue
 
-        agg_tte = _aggregated_tte_for_subset(grp, syllable_types)
-        perfile_ttes = _per_file_ttes(grp, syllable_types)
-        mean_pf, sem_pf, _ = _mean_sem(perfile_ttes)
+        per_song_tte = [_per_file_tte_from_freq(freq, syllable_types) for freq in grp["transition_frequencies"]]
+        mean_pf, sem_pf, _ = _mean_sem(per_song_tte)
+
+        pooled: Dict[Tuple[str, str], int] = {}
+        for freq in grp["transition_frequencies"]:
+            for tr, cnt in freq.items():
+                pooled[tr] = pooled.get(tr, 0) + cnt
+        tr_list = list(pooled.keys())
+        tr_counts = list(pooled.values())
+        norm_mat, counts_mat = _generate_normalized_transition_matrix(tr_list, tr_counts, syllable_types)
+        ent_by = _transition_entropy_per_row(norm_mat, syllable_types)
+        agg_tte = _total_transition_entropy(counts_mat, syllable_types, ent_by)
 
         rows.append({
             "day": pd.to_datetime(day),
-            "n_segments": int(n),
+            "n_songs": int(n),
             "agg_TTE": float(agg_tte),
-            "perfile_mean_TTE": float(mean_pf),
-            "perfile_sem_TTE": (None if sem_pf is None else float(sem_pf)),
-            "perfile_TTEs": perfile_ttes,
+            "per_song_mean_TTE": float(mean_pf),
+            "per_song_sem_TTE": (None if sem_pf is None else float(sem_pf)),
+            "per_song_TTEs": per_song_tte,
         })
 
     results_df = pd.DataFrame(rows).sort_values("day").reset_index(drop=True)
     if results_df.empty:
-        print("No days satisfied the minimum segment requirement.")
-        return TTEByDayResult(results_df, None, None, None, None)
+        print("No days satisfied the minimum song requirement.")
+        return TTEByDayResult(results_df, None, None, None, None, None, None, merged_durations_df=merged_dur_df, three_group_stats=None)
 
     fig_dir = _save_dir(fig_dir, decoded_path)
 
     # ──────────────────────────────────────────────────────────────────────────
-    # Figure 1: Time-course (every date tick; 90°; no grid; hide top/right)
+    # Figure 1: Time-course
     # ──────────────────────────────────────────────────────────────────────────
     dates = pd.to_datetime(results_df["day"])
     fig_w = max(12, 0.35 * len(dates))
     fig, ax = plt.subplots(figsize=(fig_w, 5))
     ax.plot(dates, results_df["agg_TTE"], marker="o", linewidth=2)
-
-    ax.set_xlabel("Day")
-    ax.set_ylabel("Total Transition Entropy (bits)")
-    ax.set_title(f"{animal_id} – TTE by Day (aggregated per day)")
-
+    ax.set_xlabel("Day"); ax.set_ylabel("Total Transition Entropy (bits)")
+    ax.set_title(f"{animal_id} – TTE by Day (merged-song annotations)")
     ax.set_xticks(dates.to_list())
     ax.set_xticklabels([d.strftime("%Y-%m-%d") for d in dates], rotation=90, ha="center")
-
-    ax.grid(False)
-    for side in ("top", "right"):
-        ax.spines[side].set_visible(False)
+    for side in ("top", "right"): ax.spines[side].set_visible(False)
     ax.tick_params(top=False, right=False)
-
     if tx_date is not None:
         ax.axvline(pd.Timestamp(tx_date), linestyle="--", linewidth=1.5, color="red")
         ax.text(pd.Timestamp(tx_date), ax.get_ylim()[1], "Treatment",
                 color="red", rotation=90, va="top", ha="right", fontsize=9, clip_on=False)
-
-    fig.tight_layout()
-    fig.subplots_adjust(bottom=0.25)
-
-    fig_path_timecourse = fig_dir / f"{animal_id}_TTE_by_day.png"
+    fig.tight_layout(); fig.subplots_adjust(bottom=0.25)
+    fig_path_timecourse = fig_dir / f"{animal_id}_TTE_by_day_merged.png"
     fig.savefig(fig_path_timecourse, dpi=200)
-    if show:
-        plt.show()
-    else:
-        plt.close(fig)
+    if show: plt.show()
+    else: plt.close(fig)
 
     # ──────────────────────────────────────────────────────────────────────────
-    # Figure 2 (reworked): Balanced 3-group per-song plot (Early-Pre, Late-Pre, Post)
+    # Figure 2: Balanced 3-group per-song (plain + stats)
     # ──────────────────────────────────────────────────────────────────────────
-    fig_path_prepost_box: Optional[Path] = None
-    p_val: Optional[float] = None
-    p_method: Optional[str] = None
+    fig_path_plain: Optional[Path] = None
+    fig_path_stats: Optional[Path] = None
+    three_stats: Optional[Dict[str, object]] = None
 
     if tx_date is not None:
-        # Build per-file TTE column once for selection/plotting
         pf_sorted = pf.sort_values(["date_time", *(c for c in ["Segment", "segment", "file_name"] if c in pf.columns)])
         pf_sorted = pf_sorted.assign(
-            file_TTE=pf_sorted["transition_frequencies"].apply(lambda d: _tte_from_freq(d, syllable_types))
+            file_TTE=pf_sorted["transition_frequencies"].apply(lambda d: _per_file_tte_from_freq(d, syllable_types))
         )
 
-        # Define pre/post masks per treatment_in policy
         dts = pf_sorted["date_time"]
         t0 = pd.Timestamp(tx_date)
         if treatment_in.lower() == "pre":
@@ -491,123 +519,207 @@ def TTE_by_day(
         elif treatment_in.lower() == "exclude":
             pre_mask  = dts.dt.date <  t0.date()
             post_mask = dts.dt.date >  t0.date()
-        else:  # "post" includes the treatment day in post
+        else:
             pre_mask  = dts.dt.date <  t0.date()
             post_mask = dts.dt.date >= t0.date()
 
-        pre_df  = pf_sorted.loc[pre_mask].copy()
-        post_df = pf_sorted.loc[post_mask].copy()
+        pre_df  = pf_sorted.loc[pre_mask].copy().sort_values("date_time")
+        post_df = pf_sorted.loc[post_mask].copy().sort_values("date_time")
 
-        # Sort within groups by time (ascending)
-        pre_df  = pre_df.sort_values("date_time")
-        post_df = post_df.sort_values("date_time")
-
-        # n = min(floor(#pre/2), #post)
-        n_pre   = len(pre_df)
-        n_post  = len(post_df)
-        n = min(n_pre // 2, n_post)
-
-        if n <= 0:
-            print("Balanced 3-group plot skipped: not enough songs to balance (need at least 1 in post and 2 in pre).")
-        else:
-            # Take last 2n pre songs → split into halves
+        n = min(len(pre_df) // 2, len(post_df))
+        if n > 0:
             pre_last_2n = pre_df.tail(2 * n).reset_index(drop=True)
-            early_pre_n = pre_last_2n.iloc[:n]   # older half of the last 2n
-            late_pre_n  = pre_last_2n.iloc[n:]   # newer half of the last 2n
-
-            # First n post songs
+            early_pre_n = pre_last_2n.iloc[:n]
+            late_pre_n  = pre_last_2n.iloc[n:]
             post_first_n = post_df.head(n).reset_index(drop=True)
 
-            # Grab per-song TTE lists
-            vals_early = early_pre_n["file_TTE"].astype(float).tolist()
-            vals_late  = late_pre_n["file_TTE"].astype(float).tolist()
-            vals_post  = post_first_n["file_TTE"].astype(float).tolist()
+            E = early_pre_n["file_TTE"].astype(float).tolist()
+            L = late_pre_n["file_TTE"].astype(float).tolist()
+            P = post_first_n["file_TTE"].astype(float).tolist()
 
-            # Make 3-group box + jitter
-            fig3, ax3 = plt.subplots(figsize=(8, 5))
-            data = [vals_early, vals_late, vals_post]
+            # ------ Plain plot ------
+            figP, axP = plt.subplots(figsize=(8.5, 5))
+            data = [E, L, P]
             labels = [f"Early Pre (n={n})", f"Late Pre (n={n})", f"Post (n={n})"]
-            positions = [1, 2, 3]
+            pos = [1, 2, 3]
+            bp = axP.boxplot(data, positions=pos, widths=0.6, showfliers=False,
+                             patch_artist=True, medianprops=dict(linewidth=2))
+            for patch in bp["boxes"]:
+                patch.set_alpha(0.25)
+            rng = np.random.default_rng(0)
+            for p, vals in zip(pos, data):
+                if vals:
+                    x = np.full(len(vals), p) + rng.uniform(-0.08, 0.08, size=len(vals))
+                    axP.scatter(x, vals, s=22, alpha=0.9)
+            axP.set_xticks(pos); axP.set_xticklabels(labels)
+            axP.set_ylabel("Per-song Total Transition Entropy (bits)")
+            axP.set_title(f"{animal_id} – Balanced per-song TTE (Early/Late Pre vs Post, merged)")
+            for side in ("top", "right"): axP.spines[side].set_visible(False)
+            axP.tick_params(top=False, right=False)
+            figP.tight_layout()
+            fig_path_plain = fig_dir / f"{animal_id}_TTE_pre_vs_post_balanced_3group_box_plain_merged.png"
+            figP.savefig(fig_path_plain, dpi=200)
+            if show: plt.show()
+            else: plt.close(figP)
 
-            bp = ax3.boxplot(
-                data, positions=positions, widths=0.6, showfliers=False,
+            # ------ Stats (omnibus + pairwise + panel + brackets) ------
+            # Omnibus
+            kw = None
+            if _HAVE_SCIPY:
+                try:
+                    kw = _scipy_stats.kruskal(E, L, P, nan_policy="omit")
+                except Exception:
+                    kw = None
+
+            # Pairwise p-values (MWU) + Holm correction
+            raw_pairs = {
+                "Early vs Late": _pairwise_mwu(E, L),
+                "Early vs Post": _pairwise_mwu(E, P),
+                "Late  vs Post": _pairwise_mwu(L, P),
+            }
+            adj_vals = _holm_bonferroni(list(raw_pairs.values()))
+            pairs_adj = {k: a for k, a in zip(raw_pairs.keys(), adj_vals)}
+            effects = {
+                "Early vs Late": _cliffs_delta(E, L),
+                "Early vs Post": _cliffs_delta(E, P),
+                "Late  vs Post": _cliffs_delta(L, P),
+            }
+            three_stats = {
+                "n_per_group": n,
+                "omnibus": ({"H": float(kw.statistic), "p": float(kw.pvalue)} if kw is not None else None),
+                "pairwise_raw_p": raw_pairs,
+                "pairwise_holm_p": pairs_adj,
+                "cliffs_delta": effects,
+                "stars": {k: _p_to_stars(p) for k, p in pairs_adj.items()},
+            }
+
+            # >>> NEW: make a separate right-hand axis just for the text <<<
+            figS, (axS, axTxt) = plt.subplots(
+                1, 2,
+                figsize=(10.8, 5),  # a bit wider to fit the panel
+                gridspec_kw={"width_ratios": [3.6, 1.4], "wspace": 0.30}
+            )
+
+            # Left axis: box + jitter
+            bp = axS.boxplot(
+                data, positions=pos, widths=0.6, showfliers=False,
                 patch_artist=True, medianprops=dict(linewidth=2)
             )
             for patch in bp["boxes"]:
                 patch.set_alpha(0.25)
-
             rng = np.random.default_rng(0)
-            for pos, vals in zip(positions, data):
-                if not vals:
-                    continue
-                x = np.full(len(vals), pos) + rng.uniform(-0.08, 0.08, size=len(vals))
-                ax3.scatter(x, vals, s=22, alpha=0.9)
+            for p, vals in zip(pos, data):
+                if vals:
+                    x = np.full(len(vals), p) + rng.uniform(-0.08, 0.08, size=len(vals))
+                    axS.scatter(x, vals, s=22, alpha=0.9)
 
-            ax3.set_xticks(positions)
-            ax3.set_xticklabels(labels)
-            ax3.set_ylabel("Per-song Total Transition Entropy (bits)")
-            ax3.set_title(f"{animal_id} – Balanced per-song TTE (Early/Late Pre vs Post)")
+            axS.set_xticks(pos); axS.set_xticklabels(labels)
+            axS.set_ylabel("Per-song Total Transition Entropy (bits)")
+            axS.set_title(f"{animal_id} – Balanced per-song TTE (Early/Late Pre vs Post, merged)")
 
-            ax3.grid(False)
-            for side in ("top", "right"):
-                ax3.spines[side].set_visible(False)
-            ax3.tick_params(top=False, right=False)
+            for side in ("top", "right"): axS.spines[side].set_visible(False)
+            axS.tick_params(top=False, right=False)
 
-            fig3.tight_layout()
-            fig_path_prepost_box = fig_dir / f"{animal_id}_TTE_pre_vs_post_balanced_3group_box.png"
-            fig3.savefig(fig_path_prepost_box, dpi=200)
-            if show:
-                plt.show()
+            # Brackets with stars/ns (use Holm-adjusted p)
+            y_max = max([max(vals) if len(vals) else 0 for vals in data] + [1.0])
+            axS.set_ylim(0, y_max * 1.35)  # extra headroom
+            h = (axS.get_ylim()[1] - axS.get_ylim()[0]) * 0.02
+            y1 = y_max * 1.08
+            y2 = y_max * 1.17
+            y3 = y_max * 1.26
+            _draw_sig_bracket(axS, 1, 2, y1, h, _p_to_stars(pairs_adj["Early vs Late"]))
+            _draw_sig_bracket(axS, 1, 3, y2, h, _p_to_stars(pairs_adj["Early vs Post"]))
+            _draw_sig_bracket(axS, 2, 3, y3, h, _p_to_stars(pairs_adj["Late  vs Post"]))
+
+            # Right axis: stats text (no axes visuals)
+            axTxt.axis("off")
+            lines = []
+            if kw is not None:
+                lines.append(f"Kruskal–Wallis: H={kw.statistic:.3g}, p={kw.pvalue:.3g} ({_p_to_stars(kw.pvalue)})")
             else:
-                plt.close(fig3)
+                lines.append("Kruskal–Wallis: unavailable (SciPy not found)")
+            lines.append("")
+            for k in ["Early vs Late", "Early vs Post", "Late  vs Post"]:
+                p_adj = pairs_adj[k]
+                delta = effects[k]
+                lines.append(f"{k}: p_holm={p_adj:.3g} ({_p_to_stars(p_adj)})  δ={delta:.2f}")
+
+            stats_text = "\n".join(lines)
+            axTxt.text(0.0, 1.0, stats_text, transform=axTxt.transAxes,
+                       va="top", ha="left", fontsize=10, wrap=True)
+
+            figS.tight_layout()
+            fig_path_stats = fig_dir / f"{animal_id}_TTE_pre_vs_post_balanced_3group_box_stats_merged.png"
+            figS.savefig(fig_path_stats, dpi=200, bbox_inches="tight")
+            if show: plt.show()
+            else: plt.close(figS)
+
+
+    # Back-compat pointer: prefer stats plot, else plain
+    fallback = fig_path_stats if fig_path_stats is not None else fig_path_plain
 
     return TTEByDayResult(
         results_df=results_df,
         figure_path_timecourse=fig_path_timecourse,
-        figure_path_prepost_box=fig_path_prepost_box,  # now 3-group balanced plot (if treatment_date provided)
-        prepost_p_value=p_val,   # unchanged; 3-group plot does not compute stats by default
-        prepost_test=p_method,
+        figure_path_prepost_box_plain=fig_path_plain,
+        figure_path_prepost_box_stats=fig_path_stats,
+        figure_path_prepost_box=fallback,
+        prepost_p_value=None,
+        prepost_test=None,
+        merged_durations_df=merged_dur_df,
+        three_group_stats=three_stats,
     )
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CLI
 # ──────────────────────────────────────────────────────────────────────────────
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description=(
-            "Compute aggregated TTE per day and plot:\n"
-            " - Time-course by day\n"
-            " - Balanced 3-group per-song plot if treatment_date is given "
-            "(Early-Pre, Late-Pre, Post) with n = min(floor(#pre/2), #post)."
-        )
+        description=("Compute aggregated TTE per day from MERGED song annotations; "
+                     "plot time-course and (if treatment_date) two balanced per-song plots: "
+                     "plain and stats (with right-side panel + bracket stars).")
     )
-    p.add_argument("--decoded", required=True, help="Path to decoded_database.json")
-    p.add_argument("--meta", default=None,
-                   help="(Optional) Path to metadata .json — not required for Excel-serial organizer.")
-    p.add_argument("--only_song_present", action="store_true",
-                   help="Restrict to song_present rows in organizer")
-    p.add_argument("--fig_dir", default=None, help="Directory to save figures (default: decoded file's folder)")
-    p.add_argument("--min_songs_per_day", type=int, default=1,
-                   help="Minimum segments required to include a day (default: 1)")
-    p.add_argument("--treatment_date", default=None,
-                   help="Optional treatment date: 'YYYY-MM-DD' (also accepts 'YYYY.MM.DD')")
-    p.add_argument("--treatment_in", default="post", choices=["post", "pre", "exclude"],
-                   help="Which side includes the treatment day for pre/post split (default: post)")
-    p.add_argument("--no_show", action="store_true", help="Do not display plot windows")
+    p.add_argument("--decoded", required=True, help="Path to *_decoded_database.json")
+    p.add_argument("--detect", required=False, default=None, help="Path to *_song_detection.json (recommended).")
+    # merge knobs
+    p.add_argument("--ann-gap-ms", type=int, default=500)
+    p.add_argument("--seg-offset", type=int, default=0)
+    p.add_argument("--merge-repeats", action="store_true")
+    p.add_argument("--repeat-gap-ms", type=float, default=10.0)
+    p.add_argument("--repeat-gap-inclusive", action="store_true")
+    p.add_argument("--dur-merge-gap-ms", type=int, default=500, help="0 to skip duration merge.")
+    # general
+    p.add_argument("--fig_dir", default=None)
+    p.add_argument("--min_songs_per_day", type=int, default=1)
+    p.add_argument("--treatment_date", default=None)
+    p.add_argument("--treatment_in", default="post", choices=["post", "pre", "exclude"])
+    p.add_argument("--no_show", action="store_true")
+    # legacy fallbacks (if --detect omitted)
+    p.add_argument("--meta", default=None)
+    p.add_argument("--only_song_present", action="store_true")
+    p.add_argument("--compute_durations", action="store_true")
     return p
 
 def main():
     args = _build_arg_parser().parse_args()
     res = TTE_by_day(
         decoded_database_json=args.decoded,
-        creation_metadata_json=args.meta,
-        only_song_present=args.only_song_present,
+        song_detection_json=args.detect,
+        max_gap_between_song_segments=args.ann_gap_ms,
+        segment_index_offset=args.seg_offset,
+        merge_repeated_syllables=args.merge_repeats,
+        repeat_gap_ms=args.repeat_gap_ms,
+        repeat_gap_inclusive=args.repeat_gap_inclusive,
+        merged_song_gap_ms=(None if args.dur_merge_gap_ms == 0 else args.dur_merge_gap_ms),
         fig_dir=args.fig_dir,
         show=not args.no_show,
         min_songs_per_day=args.min_songs_per_day,
         treatment_date=args.treatment_date,
         treatment_in=args.treatment_in,
+        # legacy:
+        creation_metadata_json=args.meta,
+        only_song_present=args.only_song_present,
+        compute_durations=args.compute_durations,
     )
     print("\nResults (first 10 rows):")
     if not res.results_df.empty:
@@ -616,34 +728,48 @@ def main():
         print("No results.")
     if res.figure_path_timecourse:
         print(f"Time-course plot → {res.figure_path_timecourse}")
-    if res.figure_path_prepost_box:
-        print(f"Balanced 3-group plot → {res.figure_path_prepost_box}")
-    if res.prepost_p_value is not None:
-        print(f"Pre vs Post: p={res.prepost_p_value:.3g} ({res.prepost_test})")
+    if res.figure_path_prepost_box_plain:
+        print(f"3-group (plain) → {res.figure_path_prepost_box_plain}")
+    if res.figure_path_prepost_box_stats:
+        print(f"3-group (stats) → {res.figure_path_prepost_box_stats}")
+    if res.three_group_stats:
+        print("\n[Three-group stats]")
+        print(res.three_group_stats)
 
 if __name__ == "__main__":
     main()
-
-
-"""
-import importlib, tte_by_day
+    
+    
+    """
+    import importlib
+from pathlib import Path
+import tte_by_day
 importlib.reload(tte_by_day)
 from tte_by_day import TTE_by_day
 
-decoded = "/Users/mirandahulsey-vincent/Desktop/AreaX_lesion_2025/R08_RC6_Comp2_decoded_database.json"
+detect  = Path("/Volumes/my_own_ssd/2025_areax_lesion/R08_RC6_Comp2_song_detection.json")
+decoded = Path("/Volumes/my_own_ssd/2025_areax_lesion/TweetyBERT_Pretrain_LLB_AreaX_FallSong_R08_RC6_Comp2_decoded_database.json")
 
 out = TTE_by_day(
     decoded_database_json=decoded,
-    creation_metadata_json=None,
-    only_song_present=True,
+    song_detection_json=detect,       # merged mode
+    max_gap_between_song_segments=500,
+    segment_index_offset=0,
+    merge_repeated_syllables=True,
+    repeat_gap_ms=10.0,
+    repeat_gap_inclusive=False,
+    merged_song_gap_ms=500,           # also merge durations (optional)
+    fig_dir=decoded.parent / "figures",
     show=True,
     min_songs_per_day=5,
     treatment_date="2025-05-22",
-    treatment_in="post",      # include the treatment day with post
+    treatment_in="post",              # include treatment day with post
 )
 
-print("p-value:", out.prepost_p_value, "method:", out.prepost_test)
 print("Time-course:", out.figure_path_timecourse)
-print("Pre/Post box:", out.figure_path_prepost_box)
+print("3-group plain:", out.figure_path_prepost_box_plain)
+print("3-group stats:", out.figure_path_prepost_box_stats)
+print("Stats dict:", out.three_group_stats)
 
-"""
+    
+    """
