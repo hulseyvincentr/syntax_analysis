@@ -713,10 +713,9 @@ import importlib
 
 import Area_X_wrapper as axw        # <— NEW MODULE NAME
 importlib.reload(axw)
-
-detect  = Path("/Volumes/my_own_ssd/2024_AreaX_lesions_NMA_and_sham/AreaXlesion_TweetyBERT_outputs/new_outputs/USA5443_song_detection.json")
-decoded = Path("/Volumes/my_own_ssd/2024_AreaX_lesions_NMA_and_sham/AreaXlesion_TweetyBERT_outputs/new_outputs/TweetyBERT_Pretrain_LLB_AreaX_FallSong_USA5443_decoded_database.json")
-tdate   = "2024-04-30"
+detect  = Path("/Volumes/my_own_ssd/2024_2025_Area_X_jsons_npzs/USA5505/USA5505_song_detection.json")
+decoded = Path("/Volumes/my_own_ssd/2024_2025_Area_X_jsons_npzs/USA5505/USA5505_decoded_database.json")
+tdate   = "2024-07-02"
 
 res = axw.run_area_x_meta_bundle(
     song_detection_json=detect,

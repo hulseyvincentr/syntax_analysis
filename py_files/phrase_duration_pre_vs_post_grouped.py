@@ -978,8 +978,9 @@ if __name__ == "__main__":
 from pathlib import Path
 import phrase_duration_pre_vs_post_grouped as pdpg
 
-decoded = Path("/Volumes/my_own_ssd/2025_areax_lesion/TweetyBERT_Pretrain_LLB_AreaX_FallSong_R08_RC6_Comp2_decoded_database.json")
-detect  = Path("/Volumes/my_own_ssd/2025_areax_lesion/R08_RC6_Comp2_song_detection.json")
+detect  = Path("/Volumes/my_own_ssd/2024_2025_Area_X_jsons_npzs/USA5505/USA5505_song_detection.json")
+decoded = Path("/Volumes/my_own_ssd/2024_2025_Area_X_jsons_npzs/USA5505/USA5505_decoded_database.json")
+
 
 outdir = decoded.parent / "figures" / "phrase_durations"
 outdir.mkdir(parents=True, exist_ok=True)
@@ -993,7 +994,7 @@ res = pdpg.run_phrase_duration_pre_vs_post_grouped(
     repeat_gap_ms=10.0,
     repeat_gap_inclusive=False,
     output_dir=outdir,
-    treatment_date="2025-05-22",
+    treatment_date="2024-07-02",
     grouping_mode="auto_balance",
     restrict_to_labels=[str(i) for i in range(26)],
     y_max_ms=40000,

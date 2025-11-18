@@ -29,8 +29,8 @@ from matplotlib.patches import Patch
 # ============
 # User inputs
 # ============
-f = "/Volumes/my_own_ssd/2024_AreaX_lesions_NMA_and_sham/AreaXlesion_TweetyBERT_outputs/new_outputs/TweetyBERT_Pretrain_LLB_AreaX_FallSong_USA5509.npz"
-output_dir = "/Volumes/my_own_ssd/2024_AreaX_lesions_NMA_and_sham/AreaXlesion_TweetyBERT_outputs/new_outputs/USA5509_sample_spectrograms"
+f = "/Volumes/my_own_ssd/2024_2025_Area_X_jsons_npzs/USA5505/USA5505.npz"
+output_dir = "/Volumes/my_own_ssd/2024_2025_Area_X_jsons_npzs/Area_X_figures/USA5505_repertoire"
 
 # Process ALL labels: set to None
 # Process a subset: provide a list, e.g. [0, 3, 15]
@@ -38,7 +38,7 @@ selected_labels: Optional[List[int]] = None
 
 skip_noise_label = True      # If True, skip label == -1 when selected_labels is None
 spectrogram_length = 1000    # timebins per sample
-num_sample_spectrograms = 3  # samples to generate per label (non-overlapping)
+num_sample_spectrograms = 1  # samples to generate per label (non-overlapping)
 cmap = "gray_r"              # black & white
 show_colorbar = False        # add a colorbar for each image
 show_plots = True            # show figures on screen
