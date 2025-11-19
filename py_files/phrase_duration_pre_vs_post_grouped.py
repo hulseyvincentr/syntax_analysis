@@ -71,6 +71,8 @@ class GroupedPlotsResult:
     aggregate_three_box_variance_with_stats_path: Optional[Path]
     syllable_labels: List[str]
     y_limits: Tuple[float, float]
+    # New: per-syllable phrase-duration stats for Early/Late/Post
+    phrase_duration_stats_df: pd.DataFrame
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Utilities: dates, parsing, labels, durations extraction
@@ -368,6 +370,85 @@ def _per_syllable_variances(df_subset: pd.DataFrame, labels: Sequence[str]) -> D
             elif s.size == 1:
                 out[str(lbl)] = 0.0
     return out
+
+def _build_phrase_duration_stats_df(
+    early_pre: pd.DataFrame,
+    late_pre: pd.DataFrame,
+    post_g: pd.DataFrame,
+    labels: Sequence[str],
+) -> pd.DataFrame:
+    """
+    Build a long-form DataFrame with per-syllable phrase-duration stats
+    for each group (Early Pre, Late Pre, Post).
+
+    Columns:
+        Group          : "Early Pre" / "Late Pre" / "Post"
+        Syllable       : syllable label (as string)
+        N_phrases      : number of phrase-duration samples
+        Mean_ms        : mean phrase duration (ms)
+        SEM_ms         : standard error of the mean (ms)
+        Median_ms      : median phrase duration (ms)
+        Std_ms         : standard deviation of phrase duration (ms)
+        Variance_ms2   : variance of phrase duration (ms^2)
+    """
+    groups = [
+        ("Early Pre", early_pre),
+        ("Late Pre",  late_pre),
+        ("Post",      post_g),
+    ]
+
+    rows = []
+    for gname, df_subset in groups:
+        if df_subset is None or df_subset.empty:
+            continue
+
+        for lbl in labels:
+            col = f"syllable_{lbl}_durations"
+            if col not in df_subset.columns:
+                continue
+
+            s = df_subset[col].explode()
+            s = pd.to_numeric(s, errors="coerce").dropna()
+            n = int(s.size)
+            if n == 0:
+                continue
+
+            arr = s.to_numpy(dtype=float)
+            mean = float(arr.mean())
+            if n > 1:
+                std = float(arr.std(ddof=1))
+                var = float(arr.var(ddof=1))
+                sem = float(std / math.sqrt(n))
+            else:
+                std = 0.0
+                var = 0.0
+                sem = 0.0
+            median = float(np.median(arr))
+
+            rows.append({
+                "Group": gname,
+                "Syllable": str(lbl),
+                "N_phrases": n,
+                "Mean_ms": mean,
+                "SEM_ms": sem,
+                "Median_ms": median,
+                "Std_ms": std,
+                "Variance_ms2": var,
+            })
+
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "Group",
+            "Syllable",
+            "N_phrases",
+            "Mean_ms",
+            "SEM_ms",
+            "Median_ms",
+            "Std_ms",
+            "Variance_ms2",
+        ],
+    )
 
 # ───── Stats helpers (Kruskal–Wallis omnibus + pairwise Mann–Whitney with BH FDR) ─────
 def _try_mannwhitney(x: np.ndarray, y: np.ndarray) -> Tuple[float, float]:
@@ -670,6 +751,7 @@ def run_phrase_duration_pre_vs_post_grouped(
                 order=order, color="lightgray",
                 whis=(0, 100), showfliers=False, ax=ax
             )
+            # dashed connectors for per-syllable medians
             for lbl in [str(x) for x in labels]:
                 xs, ys = [], []
                 for g in order:
@@ -868,6 +950,9 @@ def run_phrase_duration_pre_vs_post_grouped(
     else:
         print("[WARN] Per-syllable variance plots: no variance data available.")
 
+    # Build per-syllable phrase-duration summary stats table
+    stats_df = _build_phrase_duration_stats_df(early_pre, late_pre, post_g, labels)
+
     return GroupedPlotsResult(
         early_pre_path=ep,
         late_pre_path=lp,
@@ -882,7 +967,163 @@ def run_phrase_duration_pre_vs_post_grouped(
         aggregate_three_box_variance_with_stats_path=agg3_var_stats,
         syllable_labels=[str(x) for x in labels],
         y_limits=(y_min, y_max),
+        phrase_duration_stats_df=stats_df,
     )
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Batch wrapper: use Excel metadata to drive per-animal runs
+# ──────────────────────────────────────────────────────────────────────────────
+def run_batch_phrase_duration_from_excel(
+    excel_path: Union[str, Path],
+    json_root: Union[str, Path],
+    *,
+    sheet_name: Union[int, str] = 0,
+    id_col: str = "Animal ID",
+    treatment_date_col: str = "Treatment date",
+    grouping_mode: str = "auto_balance",    # or "explicit"
+    early_group_size: int = 100,
+    late_group_size: int = 100,
+    post_group_size: int = 100,
+    restrict_to_labels: Optional[Sequence[Union[str, int]]] = None,
+    y_max_ms: Optional[float] = None,
+    show_plots: bool = True,
+) -> Dict[str, GroupedPlotsResult]:
+    """
+    Batch wrapper that uses an Excel metadata sheet to supply treatment dates to
+    the phrase-duration analysis for multiple animals.
+
+    Parameters
+    ----------
+    excel_path : str or Path
+        Path to the Excel file with metadata.
+    json_root : str or Path
+        Root folder containing subfolders / JSON files for each animal.
+        We search recursively under this root for:
+            *{animal_id}*decoded_database.json
+            *{animal_id}*song_detection.json
+    sheet_name : int or str, default 0
+        Sheet index or name for pd.read_excel.
+    id_col : str, default "Animal ID"
+        Column in the Excel file containing animal IDs (e.g., "USA5505").
+    treatment_date_col : str, default "Treatment date"
+        Column in the Excel file containing the treatment date for each animal.
+    grouping_mode : {"auto_balance", "explicit"}, default "auto_balance"
+        Passed through to run_phrase_duration_pre_vs_post_grouped.
+    early_group_size, late_group_size, post_group_size : int
+        Group sizes when grouping_mode="explicit".
+    restrict_to_labels : sequence of str or int, optional
+        If provided, restrict to these syllable labels.
+    y_max_ms : float, optional
+        Fixed y-axis upper limit in ms for duration plots.
+    show_plots : bool, default True
+        Whether to display plots interactively (Spyder / Jupyter).
+
+    Returns
+    -------
+    results : dict
+        Mapping {animal_id -> GroupedPlotsResult}
+    """
+    excel_path = Path(excel_path)
+    json_root = Path(json_root)
+
+    # 1) Read metadata from Excel
+    meta_df = pd.read_excel(excel_path, sheet_name=sheet_name)
+
+    if id_col not in meta_df.columns:
+        raise ValueError(f"Column '{id_col}' not found in Excel file: {excel_path}")
+    if treatment_date_col not in meta_df.columns:
+        raise ValueError(f"Column '{treatment_date_col}' not found in Excel file: {excel_path}")
+
+    # 2) Build mapping: animal_id -> treatment_date (first non-null per animal)
+    animal_to_tdate: Dict[str, Union[str, pd.Timestamp, None]] = {}
+    for aid, group in meta_df.groupby(id_col):
+        vals = group[treatment_date_col].dropna().unique()
+        tdate = vals[0] if len(vals) > 0 else None
+        animal_to_tdate[str(aid)] = tdate
+
+    # 3) Helper to find JSON files for each animal
+    def _find_json_for_animal(
+        root: Path,
+        animal_id: str,
+        decoded_suffix: str = "decoded_database.json",
+        detect_suffix: str = "song_detection.json",
+    ) -> Tuple[Optional[Path], Optional[Path]]:
+        """
+        Search recursively under `root` for:
+          - *animal_id*decoded_suffix
+          - *animal_id*detect_suffix
+
+        Ignores macOS resource-fork files that start with '._'.
+        """
+        decoded_candidates = [
+            p for p in root.rglob(f"*{animal_id}*{decoded_suffix}")
+            if not p.name.startswith("._")
+        ]
+        detect_candidates = [
+            p for p in root.rglob(f"*{animal_id}*{detect_suffix}")
+            if not p.name.startswith("._")
+        ]
+
+        decoded_path = decoded_candidates[0] if decoded_candidates else None
+        detect_path = detect_candidates[0] if detect_candidates else None
+        return decoded_path, detect_path
+
+    # 4) Iterate over animals and call the phrase-duration function
+    results: Dict[str, GroupedPlotsResult] = {}
+
+    # Normalize restrict_to_labels to strings
+    if restrict_to_labels is not None:
+        restrict_str: Optional[Sequence[str]] = [str(x) for x in restrict_to_labels]
+    else:
+        restrict_str = None
+
+    for animal_id, tdate in animal_to_tdate.items():
+        # Skip animals with no date
+        if tdate is None or (isinstance(tdate, float) and pd.isna(tdate)):
+            print(f"[WARN] {animal_id}: no valid treatment date in Excel, skipping.")
+            continue
+
+        decoded_path, detect_path = _find_json_for_animal(json_root, animal_id)
+
+        if decoded_path is None or detect_path is None:
+            print(
+                f"[WARN] {animal_id}: could not find both JSONs under {json_root}.\n"
+                f"       decoded: {decoded_path}\n"
+                f"       detect : {detect_path}"
+            )
+            continue
+
+        outdir = decoded_path.parent / "figures" / "phrase_durations"
+        outdir.mkdir(parents=True, exist_ok=True)
+
+        print(
+            f"[RUN] {animal_id} | treatment_date={tdate} | "
+            f"decoded={decoded_path.name} | detect={detect_path.name}"
+        )
+
+        res = run_phrase_duration_pre_vs_post_grouped(
+            decoded_database_json=decoded_path,
+            song_detection_json=detect_path,
+            max_gap_between_song_segments=500,
+            segment_index_offset=0,
+            merge_repeated_syllables=True,
+            repeat_gap_ms=10.0,
+            repeat_gap_inclusive=False,
+            output_dir=outdir,
+            treatment_date=tdate,              # ← treatment date from Excel
+            grouping_mode=grouping_mode,
+            early_group_size=early_group_size,
+            late_group_size=late_group_size,
+            post_group_size=post_group_size,
+            restrict_to_labels=restrict_str,
+            y_max_ms=y_max_ms,
+            show_plots=show_plots,
+            animal_id_override=animal_id,
+        )
+
+        results[animal_id] = res
+
+    return results
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CLI
@@ -969,37 +1210,39 @@ def main():
     print("  variance box+scatter:", res.per_syllable_variance_boxscatter_path)
     print("  variance 3-group pts :", res.aggregate_three_box_variance_with_syll_points_path)
     print("  variance 3-group stats:", res.aggregate_three_box_variance_with_stats_path)
+    print("\n[INFO] Phrase-duration stats dataframe shape:", res.phrase_duration_stats_df.shape)
 
 if __name__ == "__main__":
     main()
 
 
 """
+Example interactive usage (single animal):
+
 from pathlib import Path
 import phrase_duration_pre_vs_post_grouped as pdpg
 
-detect  = Path("/Volumes/my_own_ssd/2024_2025_Area_X_jsons_npzs/USA5505/USA5505_song_detection.json")
-decoded = Path("/Volumes/my_own_ssd/2024_2025_Area_X_jsons_npzs/USA5505/USA5505_decoded_database.json")
-
+detect  = Path("/Volumes/my_own_ssd/2024_2025_Area_X_jsons_npzs/USA5288/USA5288_song_detection.json")
+decoded = Path("/Volumes/my_own_ssd/2024_2025_Area_X_jsons_npzs/USA5288/USA5288_decoded_database.json")
 
 outdir = decoded.parent / "figures" / "phrase_durations"
 outdir.mkdir(parents=True, exist_ok=True)
 
 res = pdpg.run_phrase_duration_pre_vs_post_grouped(
-    decoded_database_json=decoded,       # <-- decoded DB here
-    song_detection_json=detect,          # <-- detection JSON here
+    decoded_database_json=decoded,
+    song_detection_json=detect,
     max_gap_between_song_segments=500,
     segment_index_offset=0,
     merge_repeated_syllables=True,
     repeat_gap_ms=10.0,
     repeat_gap_inclusive=False,
     output_dir=outdir,
-    treatment_date="2024-07-02",
+    treatment_date="2024-04-09",
     grouping_mode="auto_balance",
     restrict_to_labels=[str(i) for i in range(26)],
     y_max_ms=40000,
     show_plots=True,
 )
-print(res)
+print(res.phrase_duration_stats_df.head())
 
 """
