@@ -41,21 +41,35 @@ class BirdsPhraseDurationStats:
         PLUS additional derived columns (filled on Post rows for each
         (bird, syllable)):
 
+            # Pooled Pre (Early+Late) stats:
             "Pre_N_phrases"
             "Pre_Mean_ms"
             "Pre_Variance_ms2"
             "Pre_Std_ms"
+            "Pre_Median_ms"   # pooled Pre median (approx, from group medians)
+            "Pre_IQR_ms"      # approximate Pre IQR, ~1.349 * Pre_Std_ms
 
+            # Post vs pooled Pre comparisons (mean, variance, median):
             "Post_vs_Pre_Delta_Mean_ms"
             "Post_vs_Pre_Mean_Ratio"
             "Post_vs_Pre_Delta_Variance_ms2"
             "Post_vs_Pre_Variance_Ratio"
+            "Post_vs_Pre_Delta_Median_ms"
+            "Post_vs_Pre_Median_Ratio"
 
+            # Boolean flags for increase / thresholds:
             "Post_Mean_Increased"
             "Post_Variance_Increased"
             "Post_Mean_Above_Pre_Mean_Plus_1SD"
             "Post_Mean_Above_Pre_Mean_Plus_2SD"
 
+        Notes
+        -----
+        The pooled Pre mean/variance are computed exactly from the Early+Late
+        Pre group means/variances and N_phrases (standard pooled variance
+        formula). The pooled Pre median is an approximation based on group
+        medians and N_phrases; the Pre_IQR_ms is an approximate IQR assuming
+        a roughly normal distribution (IQR ≈ 1.349 * Std).
     per_animal_results : dict[str, GroupedPlotsResult]
         Mapping from animal ID -> full GroupedPlotsResult returned by
         phrase_duration_pre_vs_post_grouped.run_batch_phrase_duration_from_excel.
@@ -96,12 +110,16 @@ def build_birds_phrase_duration_stats_df(
               - Pre_Mean_ms
               - Pre_Variance_ms2
               - Pre_Std_ms
+              - Pre_Median_ms   (approximate pooled median based on group medians)
+              - Pre_IQR_ms      (approximate IQR ≈ 1.349 * Pre_Std_ms)
 
         • comparison metrics between Post and pooled Pre:
               - Post_vs_Pre_Delta_Mean_ms
               - Post_vs_Pre_Mean_Ratio
               - Post_vs_Pre_Delta_Variance_ms2
               - Post_vs_Pre_Variance_Ratio
+              - Post_vs_Pre_Delta_Median_ms
+              - Post_vs_Pre_Median_Ratio
 
         • boolean flags indicating increased mean/variance and whether the
           Post mean lies outside the Pre mean ± 1 SD or ± 2 SD:
@@ -217,10 +235,14 @@ def build_birds_phrase_duration_stats_df(
         "Pre_Mean_ms",
         "Pre_Variance_ms2",
         "Pre_Std_ms",
+        "Pre_Median_ms",   # new: pooled Pre median
+        "Pre_IQR_ms",      # new: approximate pooled Pre IQR
         "Post_vs_Pre_Delta_Mean_ms",
         "Post_vs_Pre_Mean_Ratio",
         "Post_vs_Pre_Delta_Variance_ms2",
         "Post_vs_Pre_Variance_Ratio",
+        "Post_vs_Pre_Delta_Median_ms",  # new: Post - Pre median
+        "Post_vs_Pre_Median_Ratio",     # new: Post / Pre median
     ]
     for col in derived_float_cols:
         big_df[col] = np.nan
@@ -287,17 +309,46 @@ def build_birds_phrase_duration_stats_df(
 
         pre_std = float(np.sqrt(pre_var)) if pre_var >= 0 else np.nan
 
+        # Approximate pooled pre median based on group medians and N_phrases.
+        # We only have per-group medians, so we use a weighted average of
+        # group medians as an approximation of the pooled median.
+        try:
+            med_pre = pre_rows["Median_ms"].astype(float).values
+        except Exception:
+            med_pre = np.array([], dtype=float)
+
+        if med_pre.size and n_pre.size and N_pre_total > 0:
+            pre_median = float(np.average(med_pre, weights=n_pre))
+        else:
+            pre_median = np.nan
+
+        # Approximate pooled Pre IQR (assuming roughly normal distribution):
+        # IQR ≈ 1.349 * Std
+        if not np.isnan(pre_std):
+            pre_iqr = float(1.349 * pre_std)
+        else:
+            pre_iqr = np.nan
+
         # Post stats (there should typically be a single Post row)
         post_row = post_rows.iloc[0]
         post_mean = float(post_row["Mean_ms"])
         post_var = float(post_row["Variance_ms2"])
+        post_median = float(post_row["Median_ms"])
 
-        # Derived comparisons
+        # Derived comparisons: mean/variance
         delta_mean = post_mean - pre_mean
         mean_ratio = post_mean / pre_mean if pre_mean > 0 else np.nan
 
         delta_var = post_var - pre_var if not np.isnan(pre_var) else np.nan
         var_ratio = post_var / pre_var if pre_var > 0 else np.nan
+
+        # Derived comparisons: median
+        if not np.isnan(pre_median) and pre_median != 0:
+            delta_median = post_median - pre_median
+            median_ratio = post_median / pre_median
+        else:
+            delta_median = np.nan
+            median_ratio = np.nan
 
         mean_increased = post_mean > pre_mean
         var_increased = post_var > pre_var if not np.isnan(pre_var) else False
@@ -315,11 +366,16 @@ def build_birds_phrase_duration_stats_df(
         big_df.loc[post_idx, "Pre_Mean_ms"] = pre_mean
         big_df.loc[post_idx, "Pre_Variance_ms2"] = pre_var
         big_df.loc[post_idx, "Pre_Std_ms"] = pre_std
+        big_df.loc[post_idx, "Pre_Median_ms"] = pre_median
+        big_df.loc[post_idx, "Pre_IQR_ms"] = pre_iqr
 
         big_df.loc[post_idx, "Post_vs_Pre_Delta_Mean_ms"] = delta_mean
         big_df.loc[post_idx, "Post_vs_Pre_Mean_Ratio"] = mean_ratio
         big_df.loc[post_idx, "Post_vs_Pre_Delta_Variance_ms2"] = delta_var
         big_df.loc[post_idx, "Post_vs_Pre_Variance_Ratio"] = var_ratio
+
+        big_df.loc[post_idx, "Post_vs_Pre_Delta_Median_ms"] = delta_median
+        big_df.loc[post_idx, "Post_vs_Pre_Median_Ratio"] = median_ratio
 
         big_df.loc[post_idx, "Post_Mean_Increased"] = mean_increased
         big_df.loc[post_idx, "Post_Variance_Increased"] = var_increased
@@ -376,7 +432,9 @@ interesting = big_df[
 print(interesting[[ "Animal ID", "Syllable",
                     "Pre_Mean_ms", "Mean_ms",
                     "Pre_Variance_ms2", "Variance_ms2",
+                    "Pre_Median_ms", "Median_ms",
+                    "Pre_IQR_ms",
                     "Post_vs_Pre_Delta_Mean_ms",
-                    "Post_vs_Pre_Delta_Variance_ms2"]].head())
+                    "Post_vs_Pre_Delta_Median_ms"]].head())
 
 """

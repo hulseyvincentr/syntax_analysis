@@ -870,10 +870,15 @@ def plot_compiled_phrase_stats_by_syllable(
         _pretty_axes_basic(ax, x_rotation=0)
 
         if legend_handles:
+            # Determine which categories to show in legend
             if category_order is None:
                 cats_in_plot = list(legend_handles.keys())
             else:
+                # Start with requested order, then append any others we saw
                 cats_in_plot = [c for c in category_order if c in legend_handles]
+                for c in legend_handles.keys():
+                    if c not in cats_in_plot:
+                        cats_in_plot.append(c)
 
             handles = [legend_handles[c] for c in cats_in_plot]
             labels = []
@@ -932,19 +937,30 @@ def plot_compiled_phrase_stats_by_syllable(
     }
     yN_order = ["Y", "N", "Unknown"]
 
+    # UPDATED: include 'sham' and keep palette consistent for Medial + Lateral
     type_colors = {
         "bilateral": "red",
         "unilateral_L": "orange",
         "unilateral_R": "purple",
+        "sham": "green",     # sham controls
         "miss": "black",
         "unknown": "gray",
     }
-    type_order = ["bilateral", "unilateral_L", "unilateral_R", "miss", "unknown"]
+
+    type_order = [
+        "bilateral",
+        "unilateral_L",
+        "unilateral_R",
+        "sham",
+        "miss",
+        "unknown",
+    ]
 
     medial_type_labels = {
         "bilateral": "bilateral Medial Area X hit",
         "unilateral_L": "unilateral Medial hit (L)",
         "unilateral_R": "unilateral Medial hit (R)",
+        "sham": "bilateral saline sham (Medial)",
         "miss": "no Medial Area X hit",
         "unknown": "Medial Area X type unknown",
     }
@@ -952,6 +968,7 @@ def plot_compiled_phrase_stats_by_syllable(
         "bilateral": "bilateral Lateral Area X hit",
         "unilateral_L": "unilateral Lateral hit (L)",
         "unilateral_R": "unilateral Lateral hit (R)",
+        "sham": "bilateral saline sham (Lateral)",
         "miss": "no Lateral Area X hit",
         "unknown": "Lateral Area X type unknown",
     }
