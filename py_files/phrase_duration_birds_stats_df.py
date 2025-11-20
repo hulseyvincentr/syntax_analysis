@@ -46,8 +46,10 @@ class BirdsPhraseDurationStats:
             "Pre_Mean_ms"
             "Pre_Variance_ms2"
             "Pre_Std_ms"
-            "Pre_Median_ms"   # pooled Pre median (approx, from group medians)
-            "Pre_IQR_ms"      # approximate Pre IQR, ~1.349 * Pre_Std_ms
+            "Pre_Median_ms"         # pooled Pre median (approx, from group medians)
+            "Pre_IQR_ms"            # approximate Pre IQR, ~1.349 * Pre_Std_ms
+            "Pre_Median_IQR_ms"     # IQR across Pre group medians
+            "Pre_Variance_IQR_ms2"  # IQR across Pre group variances
 
             # Post vs pooled Pre comparisons (mean, variance, median):
             "Post_vs_Pre_Delta_Mean_ms"
@@ -70,6 +72,10 @@ class BirdsPhraseDurationStats:
         formula). The pooled Pre median is an approximation based on group
         medians and N_phrases; the Pre_IQR_ms is an approximate IQR assuming
         a roughly normal distribution (IQR ≈ 1.349 * Std).
+
+        The additional Pre_Median_IQR_ms and Pre_Variance_IQR_ms2 columns
+        quantify how different the Pre groups are from each other in terms of
+        their medians and variances, respectively (IQR across Pre groups).
     per_animal_results : dict[str, GroupedPlotsResult]
         Mapping from animal ID -> full GroupedPlotsResult returned by
         phrase_duration_pre_vs_post_grouped.run_batch_phrase_duration_from_excel.
@@ -112,6 +118,8 @@ def build_birds_phrase_duration_stats_df(
               - Pre_Std_ms
               - Pre_Median_ms   (approximate pooled median based on group medians)
               - Pre_IQR_ms      (approximate IQR ≈ 1.349 * Pre_Std_ms)
+              - Pre_Median_IQR_ms     (IQR across Pre group medians)
+              - Pre_Variance_IQR_ms2  (IQR across Pre group variances)
 
         • comparison metrics between Post and pooled Pre:
               - Post_vs_Pre_Delta_Mean_ms
@@ -235,14 +243,16 @@ def build_birds_phrase_duration_stats_df(
         "Pre_Mean_ms",
         "Pre_Variance_ms2",
         "Pre_Std_ms",
-        "Pre_Median_ms",   # new: pooled Pre median
-        "Pre_IQR_ms",      # new: approximate pooled Pre IQR
+        "Pre_Median_ms",          # pooled Pre median
+        "Pre_IQR_ms",             # approximate pooled Pre IQR
+        "Pre_Median_IQR_ms",      # IQR across Pre group medians
+        "Pre_Variance_IQR_ms2",   # IQR across Pre group variances
         "Post_vs_Pre_Delta_Mean_ms",
         "Post_vs_Pre_Mean_Ratio",
         "Post_vs_Pre_Delta_Variance_ms2",
         "Post_vs_Pre_Variance_Ratio",
-        "Post_vs_Pre_Delta_Median_ms",  # new: Post - Pre median
-        "Post_vs_Pre_Median_Ratio",     # new: Post / Pre median
+        "Post_vs_Pre_Delta_Median_ms",
+        "Post_vs_Pre_Median_Ratio",
     ]
     for col in derived_float_cols:
         big_df[col] = np.nan
@@ -329,6 +339,24 @@ def build_birds_phrase_duration_stats_df(
         else:
             pre_iqr = np.nan
 
+        # NEW: IQR across Pre group medians and variances
+        med_pre_clean = med_pre[~np.isnan(med_pre)] if med_pre.size else med_pre
+        var_pre_clean = var_pre[~np.isnan(var_pre)] if var_pre.size else var_pre
+
+        if med_pre_clean.size:
+            pre_median_iqr = float(
+                np.nanpercentile(med_pre_clean, 75) - np.nanpercentile(med_pre_clean, 25)
+            )
+        else:
+            pre_median_iqr = np.nan
+
+        if var_pre_clean.size:
+            pre_variance_iqr = float(
+                np.nanpercentile(var_pre_clean, 75) - np.nanpercentile(var_pre_clean, 25)
+            )
+        else:
+            pre_variance_iqr = np.nan
+
         # Post stats (there should typically be a single Post row)
         post_row = post_rows.iloc[0]
         post_mean = float(post_row["Mean_ms"])
@@ -368,6 +396,8 @@ def build_birds_phrase_duration_stats_df(
         big_df.loc[post_idx, "Pre_Std_ms"] = pre_std
         big_df.loc[post_idx, "Pre_Median_ms"] = pre_median
         big_df.loc[post_idx, "Pre_IQR_ms"] = pre_iqr
+        big_df.loc[post_idx, "Pre_Median_IQR_ms"] = pre_median_iqr
+        big_df.loc[post_idx, "Pre_Variance_IQR_ms2"] = pre_variance_iqr
 
         big_df.loc[post_idx, "Post_vs_Pre_Delta_Mean_ms"] = delta_mean
         big_df.loc[post_idx, "Post_vs_Pre_Mean_Ratio"] = mean_ratio
@@ -422,19 +452,36 @@ out_csv = json_root / "compiled_phrase_duration_stats_with_prepost_metrics.csv"
 big_df.to_csv(out_csv, index=False)
 print(f"Saved big_df with metrics to: {out_csv}")
 
-# Example: filter to Post rows where both mean & variance increased
+# Example: filter to Post rows where both mean & variance increased,
+# and Pre medians/variances are reasonably stable (small IQRs)
 interesting = big_df[
     (big_df["Group"] == "Post")
     & (big_df["Post_Mean_Increased"])
     & (big_df["Post_Variance_Increased"])
+    # Example thresholds for filtering syllables by Pre stability:
+    # (tune these to taste)
+    & (big_df["Pre_Median_IQR_ms"] < 5_000)        # ms
+    & (big_df["Pre_Variance_IQR_ms2"] < 50_000_000)  # ms^2
 ]
 
-print(interesting[[ "Animal ID", "Syllable",
-                    "Pre_Mean_ms", "Mean_ms",
-                    "Pre_Variance_ms2", "Variance_ms2",
-                    "Pre_Median_ms", "Median_ms",
-                    "Pre_IQR_ms",
-                    "Post_vs_Pre_Delta_Mean_ms",
-                    "Post_vs_Pre_Delta_Median_ms"]].head())
+print(
+    interesting[
+        [
+            "Animal ID",
+            "Syllable",
+            "Pre_Mean_ms",
+            "Mean_ms",
+            "Pre_Variance_ms2",
+            "Variance_ms2",
+            "Pre_Median_ms",
+            "Median_ms",
+            "Pre_IQR_ms",
+            "Pre_Median_IQR_ms",
+            "Pre_Variance_IQR_ms2",
+            "Post_vs_Pre_Delta_Mean_ms",
+            "Post_vs_Pre_Delta_Median_ms",
+        ]
+    ].head()
+)
 
 """

@@ -3,12 +3,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, Sequence, Union, Tuple
+from typing import Dict, Optional, Sequence, Union, Tuple, Any
 
 import json
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.lines as mlines
 
 from phrase_duration_pre_vs_post_grouped import (
     GroupedPlotsResult,
@@ -23,418 +24,91 @@ from phrase_duration_birds_stats_df import (
 # Try to import your existing Excel organizer (Area X–specific)
 try:
     from organize_metadata_excel import build_areax_metadata
-
-    def organize_metadata_excel(
-        excel_path: Union[str, Path],
-        *,
-        sheet_name: Union[int, str] = 0,
-    ) -> Dict[str, Dict[str, object]]:
-        """
-        Wrapper that lets this module call a unified name organize_metadata_excel.
-
-        Internally uses build_areax_metadata(excel_file=..., sheet_name=...).
-        """
-        return build_areax_metadata(excel_file=excel_path, sheet_name=sheet_name)
-
-except Exception as e:
-    organize_metadata_excel = None
-    _METADATA_IMPORT_ERR = e
+except Exception:
+    build_areax_metadata = None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Result container
+# Dataclasses
 # ──────────────────────────────────────────────────────────────────────────────
+
+
 @dataclass
 class PhraseAndMetadataResult:
-    # Big concatenated phrase-duration stats across birds
-    phrase_duration_stats: pd.DataFrame
-    # Organized Excel metadata (from organize_metadata_excel)
-    organized_metadata: pd.DataFrame
-    # Per-animal plotting results (only populated when rebuilt, not when loading)
-    per_animal_results: Dict[str, GroupedPlotsResult]
-    # Info about compiled phrase_duration_stats file (if used)
-    compiled_stats_path: Optional[Path] = None
-    compiled_stats_format: Optional[str] = None  # "json", "npz", or "csv"
-    loaded_from_compiled: bool = False
+    """Container for outputs of run_phrase_durations_from_metadata."""
+
+    birds_stats: BirdsPhraseDurationStats
+    compiled_stats_df: pd.DataFrame
+    compiled_stats_path: Path
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Helpers for saving / loading phrase_duration_stats only
+# Wrapper: run phrase-duration analysis from Excel + JSON root
 # ──────────────────────────────────────────────────────────────────────────────
-def _infer_format_from_suffix(path: Path) -> str:
-    suf = path.suffix.lower()
-    if suf == ".json":
-        return "json"
-    if suf == ".npz":
-        return "npz"
-    if suf == ".csv":
-        return "csv"
-    # Default to JSON if unknown suffix
-    return "json"
 
 
-def _save_phrase_stats(
-    phrase_duration_stats: pd.DataFrame,
-    outpath: Path,
-    fmt: str = "json",
-) -> None:
-    """
-    Save phrase_duration_stats to disk.
-
-    fmt = "json":
-        outpath is a JSON file with records orientation.
-    fmt = "npz":
-        outpath is a NumPy .npz file with arrays:
-            phrase_data, phrase_columns
-    fmt = "csv":
-        outpath is a CSV file (index=False).
-    """
-    fmt = fmt.lower()
-    outpath = Path(outpath)
-    outpath.parent.mkdir(parents=True, exist_ok=True)
-
-    if fmt == "json":
-        phrase_duration_stats.to_json(outpath, orient="records", indent=2)
-    elif fmt == "npz":
-        np.savez_compressed(
-            outpath,
-            phrase_data=phrase_duration_stats.to_numpy(),
-            phrase_columns=np.array(phrase_duration_stats.columns, dtype=object),
-        )
-    elif fmt == "csv":
-        phrase_duration_stats.to_csv(outpath, index=False)
-    else:
-        raise ValueError("compiled_stats_format must be 'json', 'npz', or 'csv'.")
-
-
-def _load_phrase_stats(
-    compiled_path: Union[str, Path],
-    fmt: Optional[str] = None,
-) -> pd.DataFrame:
-    """
-    Load phrase_duration_stats from a compiled file.
-    If fmt is None, infer from suffix (.json, .npz, or .csv).
-    """
-    compiled_path = Path(compiled_path)
-    if fmt is None:
-        fmt = _infer_format_from_suffix(compiled_path)
-
-    fmt = fmt.lower()
-
-    if fmt == "json":
-        df = pd.read_json(compiled_path, orient="records")
-    elif fmt == "npz":
-        arr = np.load(compiled_path, allow_pickle=True)
-        df = pd.DataFrame(
-            arr["phrase_data"],
-            columns=[str(c) for c in arr["phrase_columns"]],
-        )
-    elif fmt == "csv":
-        df = pd.read_csv(compiled_path)
-    else:
-        raise ValueError("compiled_format must be 'json', 'npz', or 'csv'.")
-
-    return df
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Metadata organizer wrapper
-# ──────────────────────────────────────────────────────────────────────────────
-def _build_organized_metadata(
-    excel_path: Union[str, Path],
-    *,
-    sheet_name: Union[int, str] = 0,
-) -> pd.DataFrame:
-    """
-    Call your existing organize_metadata_excel() helper to build a rich
-    metadata structure, then turn it into a DataFrame if needed.
-    """
-    if organize_metadata_excel is None:
-        raise ImportError(
-            "organize_metadata_excel/build_areax_metadata could not be imported.\n"
-            "Make sure you have a module 'organize_metadata_excel.py' "
-            "with a function build_areax_metadata(), or adjust the "
-            "import/wrapper in phrase_and_metadata_plotting.py."
-        )
-
-    excel_path = Path(excel_path)
-
-    organized = organize_metadata_excel(excel_path=excel_path, sheet_name=sheet_name)
-
-    # Already a DataFrame?
-    if isinstance(organized, pd.DataFrame):
-        return organized
-
-    # Common case: dict-of-dicts keyed by animal_id
-    if isinstance(organized, dict):
-        try:
-            df = pd.DataFrame.from_dict(organized, orient="index").reset_index()
-            return df
-        except Exception:
-            # Fallback: generic frame
-            return pd.DataFrame(organized)
-
-    # Last-resort fallback
-    return pd.DataFrame(organized)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Core builder: run pre_vs_post grouped for all birds and stack stats
-# ──────────────────────────────────────────────────────────────────────────────
-def _build_phrase_stats_from_scratch(
-    *,
+def run_phrase_durations_from_metadata(
     excel_path: Union[str, Path],
     json_root: Union[str, Path],
+    *,
     sheet_name: Union[int, str] = 0,
     id_col: str = "Animal ID",
     treatment_date_col: str = "Treatment date",
     grouping_mode: str = "auto_balance",
-    early_group_size: int = 100,
-    late_group_size: int = 100,
-    post_group_size: int = 100,
-    restrict_to_labels: Optional[Sequence[Union[str, int]]] = None,
+    restrict_to_labels: Optional[Sequence[str]] = None,
     y_max_ms: Optional[float] = None,
-    show_plots: bool = True,
-) -> Tuple[pd.DataFrame, Dict[str, GroupedPlotsResult]]:
-    """
-    Use build_birds_phrase_duration_stats_df (which wraps
-    run_batch_phrase_duration_from_excel / phrase_duration_pre_vs_post_grouped)
-    for each bird, then return:
-
-      - phrase_duration_stats: big concatenated DataFrame
-      - per_animal_results: dict[animal_id, GroupedPlotsResult]
-    """
-    stats_result: BirdsPhraseDurationStats = build_birds_phrase_duration_stats_df(
-        excel_path=excel_path,
-        json_root=json_root,
-        sheet_name=sheet_name,
-        id_col=id_col,
-        treatment_date_col=treatment_date_col,
-        grouping_mode=grouping_mode,
-        early_group_size=early_group_size,
-        late_group_size=late_group_size,
-        post_group_size=post_group_size,
-        restrict_to_labels=restrict_to_labels,
-        y_max_ms=y_max_ms,
-        show_plots=show_plots,
-    )
-
-    return stats_result.phrase_duration_stats_df, stats_result.per_animal_results
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Main "build from scratch" API
-# ──────────────────────────────────────────────────────────────────────────────
-def run_phrase_durations_from_metadata(
-    *,
-    excel_path: Union[str, Path],
-    json_root: Union[str, Path],
-    sheet_name: Union[int, str] = 0,
-    id_col: str = "Animal ID",
-    treatment_date_col: str = "Treatment date",
-    grouping_mode: str = "auto_balance",    # or "explicit"
-    early_group_size: int = 100,
-    late_group_size: int = 100,
-    post_group_size: int = 100,
-    restrict_to_labels: Optional[Sequence[Union[str, int]]] = None,
-    y_max_ms: Optional[float] = None,
-    show_plots: bool = True,
-    # optional: where to save compiled phrase_duration_stats
-    compiled_stats_path: Optional[Union[str, Path]] = None,
-    compiled_format: str = "json",          # "json", "npz", or "csv"
+    show_plots: bool = False,
+    compiled_filename: str = "compiled_phrase_duration_stats_with_prepost_metrics.csv",
 ) -> PhraseAndMetadataResult:
     """
-    Build everything from scratch:
+    High-level wrapper:
 
-      • organized_metadata: via organize_metadata_excel(excel_path, ...)
-      • phrase_duration_stats: via build_birds_phrase_duration_stats_df + stacking
-      • per_animal_results: full GroupedPlotsResult objects per bird
+    1. Uses your metadata Excel file + JSON root to build phrase-duration stats
+       for all birds via `build_birds_phrase_duration_stats_df`.
+    2. Saves the compiled stats DataFrame to a CSV under:
+          <json_root>/TweetyBERT_outputs/<compiled_filename>
+    3. Returns a small dataclass with the stats and output path.
 
-    Optionally saves phrase_duration_stats to compiled_stats_path in the chosen
-    compiled_format ("json", "npz", or "csv").
+    This does *not* change the internal logic of how per-bird stats are
+    computed; that still lives in `phrase_duration_birds_stats_df.py`.
     """
-    # 1) Organized metadata from Excel (keeps full Excel info)
-    organized_metadata = _build_organized_metadata(
-        excel_path=excel_path,
-        sheet_name=sheet_name,
-    )
+    excel_path = Path(excel_path)
+    json_root = Path(json_root)
 
-    # 2) Phrase-duration stats across birds
-    phrase_duration_stats, per_animal_results = _build_phrase_stats_from_scratch(
+    birds_stats = build_birds_phrase_duration_stats_df(
         excel_path=excel_path,
         json_root=json_root,
         sheet_name=sheet_name,
         id_col=id_col,
         treatment_date_col=treatment_date_col,
         grouping_mode=grouping_mode,
-        early_group_size=early_group_size,
-        late_group_size=late_group_size,
-        post_group_size=post_group_size,
         restrict_to_labels=restrict_to_labels,
         y_max_ms=y_max_ms,
         show_plots=show_plots,
     )
 
-    compiled_path: Optional[Path] = None
-    fmt_norm: Optional[str] = None
+    big_df = birds_stats.phrase_duration_stats_df.copy()
 
-    if compiled_stats_path is not None:
-        compiled_path = Path(compiled_stats_path)
-        fmt_norm = compiled_format.lower()
-        _save_phrase_stats(
-            phrase_duration_stats=phrase_duration_stats,
-            outpath=compiled_path,
-            fmt=fmt_norm,
-        )
-        print(f"[INFO] Saved compiled phrase_duration_stats to: {compiled_path} ({fmt_norm})")
+    # Where to save the compiled stats
+    out_dir = json_root / "TweetyBERT_outputs"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    compiled_path = out_dir / compiled_filename
+
+    big_df.to_csv(compiled_path, index=False)
+    print(f"Saved big_df with metrics to: {compiled_path}")
 
     return PhraseAndMetadataResult(
-        phrase_duration_stats=phrase_duration_stats,
-        organized_metadata=organized_metadata,
-        per_animal_results=per_animal_results,
+        birds_stats=birds_stats,
+        compiled_stats_df=big_df,
         compiled_stats_path=compiled_path,
-        compiled_stats_format=fmt_norm,
-        loaded_from_compiled=False,
     )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Convenience entrypoint: load compiled stats OR build from scratch
+# Plotting: compiled phrase-duration stats (thresholded by baseline variability)
 # ──────────────────────────────────────────────────────────────────────────────
-def phrase_and_metadata_plotting(
-    *,
-    # Option A: load from compiled phrase_duration_stats file
-    compiled_stats_path: Optional[Union[str, Path]] = None,
-    compiled_format: Optional[str] = None,   # if None, inferred from suffix
-
-    # Option B: build from scratch (also used if compiled file missing)
-    excel_path: Optional[Union[str, Path]] = None,
-    json_root: Optional[Union[str, Path]] = None,
-    sheet_name: Union[int, str] = 0,
-    id_col: str = "Animal ID",
-    treatment_date_col: str = "Treatment date",
-    grouping_mode: str = "auto_balance",
-    early_group_size: int = 100,
-    late_group_size: int = 100,
-    post_group_size: int = 100,
-    restrict_to_labels: Optional[Sequence[Union[str, int]]] = None,
-    y_max_ms: Optional[float] = None,
-    show_plots: bool = True,
-) -> PhraseAndMetadataResult:
-    """
-    High-level entrypoint.
-
-    Mode 1: If compiled_stats_path is provided and exists:
-        - Load phrase_duration_stats from that file (csv/json/npz).
-        - Build organized_metadata from Excel (if excel_path is provided),
-          otherwise return an empty metadata DataFrame.
-        - per_animal_results is left empty (we don't reconstruct plots from file).
-
-    Mode 2: Otherwise:
-        - Require excel_path and json_root.
-        - Run full phrase_duration_pre_vs_post_grouped over all birds
-          via run_phrase_durations_from_metadata().
-        - Optionally save phrase_duration_stats to compiled_stats_path.
-    """
-    # Try load-from-compiled mode first
-    if compiled_stats_path is not None:
-        cpath = Path(compiled_stats_path)
-        if cpath.exists():
-            fmt = compiled_format or _infer_format_from_suffix(cpath)
-            phrase_stats = _load_phrase_stats(cpath, fmt)
-
-            if excel_path is not None:
-                organized_metadata = _build_organized_metadata(
-                    excel_path=excel_path,
-                    sheet_name=sheet_name,
-                )
-            else:
-                organized_metadata = pd.DataFrame()
-
-            print(f"[INFO] Loaded compiled phrase_duration_stats from: {cpath} ({fmt})")
-            return PhraseAndMetadataResult(
-                phrase_duration_stats=phrase_stats,
-                organized_metadata=organized_metadata,
-                per_animal_results={},
-                compiled_stats_path=cpath,
-                compiled_stats_format=fmt.lower(),
-                loaded_from_compiled=True,
-            )
-        else:
-            print(f"[INFO] compiled_stats_path does not exist yet; will build: {cpath}")
-
-    # Build-from-scratch mode
-    if excel_path is None or json_root is None:
-        raise ValueError(
-            "If compiled_stats_path is not provided or does not exist, "
-            "you must supply excel_path and json_root."
-        )
-
-    # Decide what format to use when saving if compiled_stats_path is given
-    if compiled_stats_path is not None:
-        cpath = Path(compiled_stats_path)
-        fmt = compiled_format or _infer_format_from_suffix(cpath)
-    else:
-        cpath = None
-        fmt = "json"
-
-    return run_phrase_durations_from_metadata(
-        excel_path=excel_path,
-        json_root=json_root,
-        sheet_name=sheet_name,
-        id_col=id_col,
-        treatment_date_col=treatment_date_col,
-        grouping_mode=grouping_mode,
-        early_group_size=early_group_size,
-        late_group_size=late_group_size,
-        post_group_size=post_group_size,
-        restrict_to_labels=restrict_to_labels,
-        y_max_ms=y_max_ms,
-        show_plots=show_plots,
-        compiled_stats_path=cpath,
-        compiled_format=fmt,
-    )
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Plotting helpers
-# ──────────────────────────────────────────────────────────────────────────────
-def _make_long_color_cycle(n: int):
-    """
-    Build a long color cycle by concatenating tab20, tab20b, and tab20c.
-    Handles up to ~60 distinct colors; repeats if n is larger.
-    """
-    cmap_names = ["tab20", "tab20b", "tab20c"]
-    colors = []
-    for name in cmap_names:
-        cmap = plt.get_cmap(name)
-        colors.extend(list(cmap.colors))
-
-    if n <= len(colors):
-        return colors[:n]
-
-    reps = int(np.ceil(n / len(colors)))
-    colors = (colors * reps)[:n]
-    return colors
-
-
-def _pretty_axes_basic(ax, x_rotation: int = 0):
-    """Simple styling: remove top/right spines, set ticks, optional x tick rotation."""
-    for spine in ["top", "right"]:
-        ax.spines[spine].set_visible(False)
-    ax.tick_params(axis="both", labelsize=11)
-    ax.xaxis.label.set_size(13)
-    ax.yaxis.label.set_size(13)
-    if x_rotation:
-        for lab in ax.get_xticklabels():
-            lab.set_rotation(x_rotation)
-            lab.set_horizontalalignment("right")
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Combined plot + filtered subsets (mean / median / variance)
-# plus additional sets colored by Medial / Lateral Area X hit type
-# ──────────────────────────────────────────────────────────────────────────────
 def plot_compiled_phrase_stats_by_syllable(
     phrase_stats: Optional[pd.DataFrame] = None,
     *,
@@ -445,829 +119,824 @@ def plot_compiled_phrase_stats_by_syllable(
     syllable_col: str = "Syllable",
     mean_col: str = "Mean_ms",
     sem_col: str = "SEM_ms",
-    group_order: Optional[Sequence[str]] = None,
+    median_col: str = "Median_ms",
+    var_col: str = "Variance_ms2",
     output_dir: Optional[Union[str, Path]] = None,
-    file_prefix: str = "phrase_duration_lines",
-    show_plots: bool = True,
-    # metadata for anatomy-based coloring
+    file_prefix: str = "phrase_duration",
+    show_plots: bool = False,
+    # --- coloring style ---
+    color_by: str = "animal",  # "animal" or "metadata"
     metadata_excel_path: Optional[Union[str, Path]] = None,
     metadata_sheet_name: Union[int, str] = 0,
-    medial_hit_col: str = "Medial Area X hit?",
-) -> None:
+    metadata_color_col: Optional[str] = None,
+    category_color_map: Optional[Dict[str, str]] = None,
+    # --- filtering thresholds (k·SD or k·IQR style) ---
+    mean_sd_k: float = 1.0,
+    median_iqr_k: float = 1.0,
+    variance_iqr_k: float = 1.0,
+) -> pd.DataFrame:
     """
-    Make:
-      • One combined figure of all syllables (colored by animal_id)
-      • Three filtered figures:
-          - post mean > pre mean + 1 SD      (Y-axis = Mean_ms)
-          - post median > max(pre medians)   (Y-axis = Median_ms)
-          - post variance > pre pooled var   (Y-axis = Variance_ms2)
+    Plot per-syllable phrase-duration metrics across Early Pre / Late Pre / Post
+    for all birds, using a compiled stats DataFrame.
 
-    For EACH filtered subset we additionally make:
-      • a version colored by Medial Area X hit?   (Y / N / unknown)
-      • a version colored by Medial Area X hit type
-      • a version colored by Lateral Area X hit type
-
-    Medial / lateral hit *types* are read from build_areax_metadata(), which
-    adds the fields:
-        "Medial Area X hit type"
-        "Lateral Area X hit type"
+    It produces:
+      - Line plots of mean/median/variance vs group (all syllables + filtered)
+      - Scatter plots of Late Pre vs Post for mean/median/variance
+        (one point per Animal×Syllable), with a y=x dashed red line.
     """
-    # --- Load phrase_stats if not provided ---
-    if phrase_stats is None:
+    # ------------------------------------------------------------------
+    # 0. Load / validate DataFrame
+    # ------------------------------------------------------------------
+    if phrase_stats is not None:
+        df = phrase_stats.copy()
+    else:
         if compiled_stats_path is None:
             raise ValueError(
-                "Either phrase_stats must be provided or compiled_stats_path "
-                "must be given."
+                "Either `phrase_stats` or `compiled_stats_path` must be provided."
             )
-        cpath = Path(compiled_stats_path)
-        if not cpath.exists():
-            raise FileNotFoundError(f"compiled_stats_path does not exist: {cpath}")
-        fmt = compiled_format or _infer_format_from_suffix(cpath)
-        phrase_stats = _load_phrase_stats(cpath, fmt)
+        compiled_stats_path = Path(compiled_stats_path)
 
-    df_base = phrase_stats.copy()
-
-    # Normalize group labels: "Early-Pre", "Early Pre " -> "Early Pre"
-    df_base[group_col] = (
-        df_base[group_col]
-        .astype(str)
-        .str.strip()
-        .str.replace("-", " ", regex=False)
-    )
-
-    # Ensure required columns exist for plotting
-    required_cols = {id_col, group_col, syllable_col, mean_col, sem_col}
-    missing = required_cols - set(df_base.columns)
-    if missing:
-        raise KeyError(
-            f"phrase_stats is missing required columns: {sorted(missing)}"
-        )
-
-    PRE_GROUPS = {"Early Pre", "Late Pre"}
-    POST_GROUP = "Post"
-
-    # Decide group order for x-axis
-    if group_order is None:
-        groups = list(df_base[group_col].unique())
-        default_order = ["Early Pre", "Late Pre", "Post"]
-        ordered = [g for g in default_order if g in groups]
-        remaining = [g for g in sorted(groups) if g not in ordered]
-        group_order = ordered + remaining
-    else:
-        group_order = [
-            str(g).strip().replace("-", " ")
-            for g in group_order
-        ]
-
-    # Map each group to a numeric x-position
-    group_to_x = {g: i for i, g in enumerate(group_order)}
-
-    # Color cycle based on number of animals (for animal-colored plots)
-    animal_ids = sorted(df_base[id_col].dropna().unique(), key=str)
-    colors = _make_long_color_cycle(len(animal_ids))
-
-    # Create output dir if needed
-    if output_dir is not None:
-        outdir = Path(output_dir)
-        outdir.mkdir(parents=True, exist_ok=True)
-    else:
-        outdir = None
-
-    # ------------------------------------------------------------------
-    # Build metadata-based mappings:
-    #   - medial_hit_map       : raw "Medial Area X hit?" per animal
-    #   - medial_type_map      : "Medial Area X hit type" per animal
-    #   - lateral_type_map     : "Lateral Area X hit type" per animal
-    # ------------------------------------------------------------------
-    medial_hit_map: Dict[str, object] = {}
-    medial_type_map: Dict[str, str] = {}
-    lateral_type_map: Dict[str, str] = {}
-
-    if metadata_excel_path is not None:
-        # 1) Directly from the Excel sheet: "Medial Area X hit?"
-        try:
-            meta_df = pd.read_excel(metadata_excel_path, sheet_name=metadata_sheet_name)
-            if id_col in meta_df.columns and medial_hit_col in meta_df.columns:
-                grouped = (
-                    meta_df.groupby(id_col)[medial_hit_col]
-                    .apply(lambda s: next((v for v in s if pd.notna(v)), np.nan))
-                    .reset_index()
-                )
-                for _, row in grouped.iterrows():
-                    medial_hit_map[str(row[id_col])] = row[medial_hit_col]
+        if compiled_format is None:
+            suf = compiled_stats_path.suffix.lower()
+            if suf == ".csv":
+                compiled_format = "csv"
+            elif suf == ".json":
+                compiled_format = "json"
+            elif suf == ".npz":
+                compiled_format = "npz"
             else:
-                print(
-                    f"[WARN] metadata Excel missing '{id_col}' or '{medial_hit_col}' "
-                    "columns; Medial-hit Y/N coloring disabled."
+                raise ValueError(
+                    f"Cannot infer compiled_format from suffix {compiled_stats_path.suffix!r}."
                 )
-        except Exception as e:
-            print(f"[WARN] Could not read metadata Excel for Medial-hit Y/N: {e}")
 
-        # 2) Use build_areax_metadata to get hit *types*
-        try:
-            from organize_metadata_excel import build_areax_metadata as _bam
+        if compiled_format == "csv":
+            df = pd.read_csv(compiled_stats_path)
+        elif compiled_format == "json":
+            df = pd.read_json(compiled_stats_path)
+        elif compiled_format == "npz":
+            arr = np.load(compiled_stats_path, allow_pickle=True)
+            if "phrase_stats" not in arr:
+                raise KeyError("NPZ must contain an array named 'phrase_stats'.")
+            df = pd.DataFrame(arr["phrase_stats"])
+        else:
+            raise ValueError(f"Unsupported compiled_format={compiled_format!r}")
 
-            meta_dict = _bam(excel_file=metadata_excel_path,
-                             sheet_name=metadata_sheet_name)
-            for aid, entry in meta_dict.items():
-                akey = str(aid)
-                med_type = entry.get("Medial Area X hit type", "unknown")
-                lat_type = entry.get("Lateral Area X hit type", "unknown")
+    required_cols = {id_col, group_col, syllable_col, mean_col, median_col, var_col}
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise KeyError(f"Compiled stats DataFrame is missing columns: {missing}")
 
-                med_type = str(med_type).strip() or "unknown"
-                lat_type = str(lat_type).strip() or "unknown"
+    # If we don't have SEM for mean, that's OK (we'll just skip errorbars).
+    have_sem = sem_col in df.columns
 
-                medial_type_map[akey] = med_type
-                lateral_type_map[akey] = lat_type
-        except Exception as e:
+    # ------------------------------------------------------------------
+    # 1. Output directory
+    # ------------------------------------------------------------------
+    if output_dir is None:
+        if compiled_stats_path is None:
+            output_dir = Path(".")
+        else:
+            output_dir = compiled_stats_path.parent
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # ------------------------------------------------------------------
+    # 2. Build color / category maps
+    # ------------------------------------------------------------------
+    animal_ids = sorted(df[id_col].dropna().unique().tolist())
+
+    # Default legend title
+    legend_title = "Animal ID"
+
+    # id_to_category maps each animal to a category string used for color & legend
+    id_to_category: Dict[str, str] = {str(a): str(a) for a in animal_ids}
+
+    # category_to_color maps category → color
+    category_to_color: Dict[str, str] = {}
+
+    if color_by.lower() == "metadata" and build_areax_metadata is None:
+        print(
+            "[WARN] color_by='metadata' requested, but "
+            "organize_metadata_excel.build_areax_metadata is not importable. "
+            "Falling back to color_by='animal'."
+        )
+        color_by = "animal"
+
+    if color_by.lower() == "animal":
+        # One color per animal
+        legend_title = "Animal ID"
+        cmap = plt.get_cmap("tab20")
+        for idx, a in enumerate(animal_ids):
+            category = str(a)
+            id_to_category[str(a)] = category
+            category_to_color[category] = cmap(idx % cmap.N)
+
+    elif color_by.lower() == "metadata":
+        if metadata_excel_path is None or metadata_color_col is None:
             print(
-                "[WARN] Could not derive Medial/Lateral Area X hit types from "
-                f"organize_metadata_excel: {e}"
+                "[WARN] color_by='metadata' requested but "
+                "`metadata_excel_path` or `metadata_color_col` not provided. "
+                "Falling back to color_by='animal'."
             )
-            medial_type_map.clear()
-            lateral_type_map.clear()
+            color_by = "animal"
+            return plot_compiled_phrase_stats_by_syllable(
+                df,
+                compiled_stats_path=None,
+                compiled_format=None,
+                id_col=id_col,
+                group_col=group_col,
+                syllable_col=syllable_col,
+                mean_col=mean_col,
+                sem_col=sem_col,
+                median_col=median_col,
+                var_col=var_col,
+                output_dir=output_dir,
+                file_prefix=file_prefix,
+                show_plots=show_plots,
+                color_by="animal",
+                mean_sd_k=mean_sd_k,
+                median_iqr_k=median_iqr_k,
+                variance_iqr_k=variance_iqr_k,
+            )
 
-    def _is_medial_hit(animal: str) -> Optional[bool]:
-        """Return True/False/None based on Medial Area X hit? mapping."""
-        if not medial_hit_map:
-            return None
-        val = medial_hit_map.get(str(animal))
-        if val is None or (isinstance(val, float) and np.isnan(val)):
-            return None
-        s = str(val).strip().upper()
-        if not s:
-            return None
-        if s in {"Y", "YES", "TRUE", "1"}:
-            return True
-        if s in {"N", "NO", "FALSE", "0"}:
-            return False
-        return None
+        # Use Area X metadata to get e.g. "Medial Area X hit type" / "Lateral ..."
+        meta_dict = build_areax_metadata(metadata_excel_path, sheet_name=metadata_sheet_name)
 
-    # Precompute category maps for all animals we might plot
-    medial_hit_cat_map: Dict[str, str] = {}
-    for animal in animal_ids:
-        hit = _is_medial_hit(animal)
-        if hit is True:
-            cat = "Y"
-        elif hit is False:
-            cat = "N"
+        # Map each animal to the requested metadata category
+        categories = set()
+        for a in animal_ids:
+            a_str = str(a)
+            entry: Dict[str, Any] = meta_dict.get(a_str, {})
+            cat_val = entry.get(metadata_color_col, "unknown")
+            if cat_val is None or str(cat_val).strip() == "":
+                cat_val = "unknown"
+            cat_str = str(cat_val)
+            id_to_category[a_str] = cat_str
+            categories.add(cat_str)
+
+        # Legend title becomes the metadata column name, e.g. "Medial Area X hit type"
+        legend_title = metadata_color_col or "Metadata category"
+
+        # Seed with user-specified colors (e.g., bilateral, unilateral_L, miss, sham, unknown)
+        if category_color_map is not None:
+            for cat, col in category_color_map.items():
+                category_to_color[str(cat)] = col
+
+        # For any remaining categories, assign automatic colors
+        cmap = plt.get_cmap("tab20")
+        for idx, cat in enumerate(sorted(categories)):
+            if cat not in category_to_color:
+                category_to_color[cat] = cmap(idx % cmap.N)
+
+        # Ensure "miss" / "unknown" have sensible defaults
+        if "miss" in categories and "miss" not in category_to_color:
+            category_to_color["miss"] = "black"
+        if "unknown" in categories and "unknown" not in category_to_color:
+            category_to_color["unknown"] = "gray"
+
+    else:
+        raise ValueError(f"Unsupported color_by={color_by!r}. Use 'animal' or 'metadata'.")
+
+    # ------------------------------------------------------------------
+    # 3. Helper to pretty up axes
+    # ------------------------------------------------------------------
+    def _pretty_axes(ax: plt.Axes, x_rotation: int = 0) -> None:
+        for spine in ["top", "right"]:
+            ax.spines[spine].set_visible(False)
+        ax.tick_params(axis="both", labelsize=11)
+        ax.xaxis.label.set_size(12)
+        ax.yaxis.label.set_size(12)
+        if x_rotation:
+            for lab in ax.get_xticklabels():
+                lab.set_rotation(x_rotation)
+                lab.set_horizontalalignment("right")
+
+    # ------------------------------------------------------------------
+    # 4. Threshold filters (using Pre_* columns from compiled CSV)
+    # ------------------------------------------------------------------
+    PRE_MEAN_COL        = "Pre_Mean_ms"
+    PRE_VAR_COL         = "Pre_Variance_ms2"
+    PRE_MEDIAN_COL      = "Pre_Median_ms"
+    PRE_MEDIAN_IQR_COL  = "Pre_Median_IQR_ms"
+    PRE_VAR_IQR_COL     = "Pre_Variance_IQR_ms2"
+
+    have_pre_mean       = PRE_MEAN_COL in df.columns
+    have_pre_var        = PRE_VAR_COL in df.columns
+    have_pre_median     = PRE_MEDIAN_COL in df.columns
+    have_pre_median_iqr = PRE_MEDIAN_IQR_COL in df.columns
+    have_pre_var_iqr    = PRE_VAR_IQR_COL in df.columns
+
+    # group labels we expect; we preserve whatever unique ordering exists,
+    # but try to put Early Pre / Late Pre / Post in a sensible order
+    raw_groups = list(df[group_col].dropna().unique())
+    group_order = []
+    for g in ["Early Pre", "Late Pre", "Post"]:
+        if g in raw_groups:
+            group_order.append(g)
+    # Add any other group labels at the end
+    for g in raw_groups:
+        if g not in group_order:
+            group_order.append(g)
+
+    # --- Mean filter: Post mean > Pre mean + k·SD ---
+    if have_pre_mean and have_pre_var:
+        post_rows = df[group_col].eq("Post")
+        post = df.loc[post_rows, [id_col, syllable_col, mean_col, PRE_MEAN_COL, PRE_VAR_COL]].copy()
+        # SD = sqrt(variance)
+        post["Pre_SD_ms"] = np.sqrt(post[PRE_VAR_COL].clip(lower=0.0))
+        post["Mean_threshold"] = post[PRE_MEAN_COL] + mean_sd_k * post["Pre_SD_ms"]
+        mean_mask = post[mean_col] > post["Mean_threshold"]
+        keys_mean_filtered = set(
+            (str(a), s)
+            for a, s in zip(post.loc[mean_mask, id_col], post.loc[mean_mask, syllable_col])
+        )
+    else:
+        print(
+            "[INFO] Pre mean or variance columns not found; using simple "
+            "Post mean > Pre mean for filtering."
+        )
+        if have_pre_mean:
+            post_rows = df[group_col].eq("Post") & df[PRE_MEAN_COL].notna()
+            post = df.loc[post_rows, [id_col, syllable_col, mean_col, PRE_MEAN_COL]].copy()
+            mean_mask = post[mean_col] > post[PRE_MEAN_COL]
+            keys_mean_filtered = set(
+                (str(a), s)
+                for a, s in zip(post.loc[mean_mask, id_col], post.loc[mean_mask, syllable_col])
+            )
         else:
-            cat = "Unknown"
-        medial_hit_cat_map[str(animal)] = cat
+            keys_mean_filtered = set()
 
-    medial_type_cat_map: Dict[str, str] = {}
-    lateral_type_cat_map: Dict[str, str] = {}
-    for animal in animal_ids:
-        akey = str(animal)
-        med_t = medial_type_map.get(akey, "unknown") or "unknown"
-        lat_t = lateral_type_map.get(akey, "unknown") or "unknown"
-        medial_type_cat_map[akey] = str(med_t)
-        lateral_type_cat_map[akey] = str(lat_t)
+    # --- Median filter: Post median > Pre median + k·IQR_median (if available) ---
+    if have_pre_median and have_pre_median_iqr:
+        post_rows = df[group_col].eq("Post")
+        post = df.loc[post_rows, [id_col, syllable_col, median_col,
+                                  PRE_MEDIAN_COL, PRE_MEDIAN_IQR_COL]].copy()
+        post["Median_threshold"] = post[PRE_MEDIAN_COL] + median_iqr_k * post[PRE_MEDIAN_IQR_COL]
+        median_mask = post[median_col] > post["Median_threshold"]
+        keys_median_filtered = set(
+            (str(a), s)
+            for a, s in zip(post.loc[median_mask, id_col], post.loc[median_mask, syllable_col])
+        )
+    elif have_pre_median:
+        print(
+            "[INFO] No Pre_Median_IQR_ms column found; using simple "
+            "Post median > Pre median for filtering."
+        )
+        post_rows = df[group_col].eq("Post")
+        post = df.loc[post_rows, [id_col, syllable_col, median_col, PRE_MEDIAN_COL]].copy()
+        median_mask = post[median_col] > post[PRE_MEDIAN_COL]
+        keys_median_filtered = set(
+            (str(a), s)
+            for a, s in zip(post.loc[median_mask, id_col], post.loc[median_mask, syllable_col])
+        )
+    else:
+        keys_median_filtered = set()
+
+    # --- Variance filter: Post var > Pre var + k·IQR_var (if available) ---
+    if have_pre_var and have_pre_var_iqr:
+        post_rows = df[group_col].eq("Post")
+        post = df.loc[post_rows, [id_col, syllable_col, var_col,
+                                  PRE_VAR_COL, PRE_VAR_IQR_COL]].copy()
+        post["Var_threshold"] = post[PRE_VAR_COL] + variance_iqr_k * post[PRE_VAR_IQR_COL]
+        var_mask = post[var_col] > post["Var_threshold"]
+        keys_var_filtered = set(
+            (str(a), s)
+            for a, s in zip(post.loc[var_mask, id_col], post.loc[var_mask, syllable_col])
+        )
+    elif have_pre_var:
+        print(
+            "[INFO] No Pre_Variance_IQR_ms2 column found; using simple "
+            "Post variance > Pre variance for filtering."
+        )
+        post_rows = df[group_col].eq("Post")
+        post = df.loc[post_rows, [id_col, syllable_col, var_col, PRE_VAR_COL]].copy()
+        var_mask = post[var_col] > post[PRE_VAR_COL]
+        keys_var_filtered = set(
+            (str(a), s)
+            for a, s in zip(post.loc[var_mask, id_col], post.loc[var_mask, syllable_col])
+        )
+    else:
+        keys_var_filtered = set()
 
     # ------------------------------------------------------------------
-    # Inner helper: draw ONE combined figure (colored by animal_id)
+    # 5. Core line-plot helper (group vs metric)
     # ------------------------------------------------------------------
-    def _plot_one_combined(
-        df_plot: pd.DataFrame,
+    def _plot_metric_lines(
+        df_src: pd.DataFrame,
+        *,
         title: str,
         filename_suffix: str,
-        *,
-        legend_mode: str = "animal",  # "animal" or "animal_syllables"
-        y_col: str = mean_col,
-        yerr_col: Optional[str] = sem_col,
-        y_label: str = "Mean phrase duration (ms)",
-    ) -> None:
-        """
-        legend_mode:
-          - "animal"          → legend entry per animal_id
-          - "animal_syllables"→ legend entry per animal_id with syllables listed
-        """
-        syllables = sorted(df_plot[syllable_col].dropna().unique(), key=str)
-        if not syllables:
-            print(f"[WARN] No syllables found for subset '{filename_suffix}'; skipping.")
-            return
-
-        fig, ax = plt.subplots(figsize=(8, 5.5))
-
-        if legend_mode == "animal_syllables":
-            animal_to_syllables: Dict[str, Sequence[object]] = (
-                df_plot.groupby(id_col)[syllable_col]
-                .apply(lambda s: sorted(pd.unique(s)))
-                .to_dict()
-            )
-        else:
-            animal_to_syllables = {}
-
-        seen_animals = set()
-        legend_handles = []
-        legend_labels = []
-
-        for a_idx, animal in enumerate(animal_ids):
-            color = colors[a_idx]
-            a_all = df_plot[df_plot[id_col] == animal]
-            if a_all.empty:
-                continue
-
-            for syll in syllables:
-                a_df = a_all[a_all[syllable_col] == syll]
-                if a_df.empty:
-                    continue
-
-                x_vals: list[float] = []
-                y_vals: list[float] = []
-                y_errs: list[float] = []
-
-                for g in group_order:
-                    rows = a_df[a_df[group_col] == g]
-                    if rows.empty:
-                        continue
-                    x_vals.append(group_to_x[g])
-                    y_vals.append(rows[y_col].iloc[0])
-                    if yerr_col is not None and yerr_col in rows:
-                        y_errs.append(rows[yerr_col].iloc[0])
-
-                if not x_vals:
-                    continue
-
-                if yerr_col is None or not y_errs:
-                    (line,) = ax.plot(
-                        x_vals,
-                        y_vals,
-                        "o-",
-                        linewidth=1.0,
-                        markersize=3.5,
-                        color=color,
-                        alpha=0.35,
-                    )
-                    handle = line
-                else:
-                    container = ax.errorbar(
-                        x_vals,
-                        y_vals,
-                        yerr=y_errs,
-                        fmt="o-",
-                        linewidth=1.0,
-                        markersize=3.5,
-                        capsize=2.5,
-                        color=color,
-                        alpha=0.35,
-                    )
-                    handle = container
-
-                if animal not in seen_animals:
-                    seen_animals.add(animal)
-                    if legend_mode == "animal_syllables":
-                        syll_list = animal_to_syllables.get(animal, [])
-                        if syll_list:
-                            syll_text = ", ".join(str(s) for s in syll_list)
-                            label = f"{animal} (syll {syll_text})"
-                        else:
-                            label = str(animal)
-                    else:
-                        label = str(animal)
-
-                    legend_handles.append(handle)
-                    legend_labels.append(label)
-
-        ax.set_xticks(list(group_to_x.values()))
-        ax.set_xticklabels(list(group_to_x.keys()))
-        ax.set_xlabel("Group")
-        ax.set_ylabel(y_label)
-        ax.set_title(title)
-
-        _pretty_axes_basic(ax, x_rotation=0)
-
-        if legend_handles:
-            legend_title = (
-                f"{id_col} (syllables)" if legend_mode == "animal_syllables" else id_col
-            )
-            ax.legend(
-                legend_handles,
-                legend_labels,
-                title=legend_title,
-                bbox_to_anchor=(1.02, 1.0),
-                loc="upper left",
-                borderaxespad=0.0,
-                fontsize=8,
-            )
-
-        fig.tight_layout(rect=[0.0, 0.0, 0.8, 0.95])
-
-        if outdir is not None:
-            fname = f"{file_prefix}{filename_suffix}.png"
-            fig.savefig(outdir / fname, dpi=300)
-            print(f"[PLOT] Saved combined figure: {outdir / fname}")
-
-        if show_plots:
-            plt.show()
-        else:
-            plt.close(fig)
-
-    # ------------------------------------------------------------------
-    # Generic helper: draw ONE figure colored by a per-animal category
-    # ------------------------------------------------------------------
-    def _plot_one_by_category(
-        df_plot: pd.DataFrame,
-        title: str,
-        filename_suffix: str,
-        *,
         y_col: str,
         yerr_col: Optional[str],
         y_label: str,
-        category_map: Dict[str, str],
-        legend_title: str,
-        category_colors: Dict[str, str],
-        category_labels: Optional[Dict[str, str]] = None,
-        category_order: Optional[Sequence[str]] = None,
+        filter_keys: Optional[set[Tuple[str, Any]]] = None,
+        legend_title_override: Optional[str] = None,
+        threshold_text: Optional[str] = None,
     ) -> None:
-        """
-        category_map:    animal_id -> category string (e.g. 'bilateral', 'miss')
-        category_colors: category  -> matplotlib color
-        category_labels: category  -> legend label (optional)
-        """
-        if not category_map:
-            print(
-                f"[INFO] No category_map for '{legend_title}'; "
-                f"skipping plot '{filename_suffix}'."
-            )
+        """Plot lines for one metric (mean / median / variance)."""
+
+        if filter_keys is not None:
+            # Keep only rows where (Animal ID, Syllable) is in filter_keys
+            mask = [
+                (str(a), s) in filter_keys
+                for a, s in zip(df_src[id_col], df_src[syllable_col])
+            ]
+            df_plot = df_src.loc[mask].copy()
+        else:
+            df_plot = df_src.copy()
+
+        if df_plot.empty:
+            print(f"[INFO] No data to plot for {filename_suffix!r}. Skipping.")
             return
 
-        syllables = sorted(df_plot[syllable_col].dropna().unique(), key=str)
-        if not syllables:
-            print(f"[WARN] No syllables found for subset '{filename_suffix}'; skipping.")
-            return
+        x_positions = np.arange(len(group_order))
 
-        fig, ax = plt.subplots(figsize=(8, 5.5))
-        legend_handles: Dict[str, object] = {}
+        fig, ax = plt.subplots(figsize=(7.5, 4.5))
 
-        for animal in animal_ids:
-            a_all = df_plot[df_plot[id_col] == animal]
-            if a_all.empty:
-                continue
+        cats_present = set()
 
-            cat = category_map.get(str(animal), "unknown")
-            if cat is None or (isinstance(cat, float) and np.isnan(cat)):
-                cat = "unknown"
-            cat = str(cat)
+        # One line per (animal, syllable) pair
+        for animal in sorted(df_plot[id_col].unique()):
+            a_str = str(animal)
+            a_cat = id_to_category.get(a_str, a_str)
+            color = category_to_color.get(a_cat, "black")
+            cats_present.add(a_cat)
 
-            color = category_colors.get(cat, category_colors.get("unknown", "gray"))
+            sdf = df_plot[df_plot[id_col] == animal]
 
-            for syll in syllables:
-                a_df = a_all[a_all[syllable_col] == syll]
-                if a_df.empty:
+            for syll in sorted(sdf[syllable_col].unique()):
+                sub = sdf[sdf[syllable_col] == syll].copy()
+                if sub.empty:
                     continue
 
-                x_vals: list[float] = []
-                y_vals: list[float] = []
-                y_errs: list[float] = []
-
+                # Preserve group order on x-axis
+                ys = []
+                yerrs = []
                 for g in group_order:
-                    rows = a_df[a_df[group_col] == g]
-                    if rows.empty:
+                    row = sub[sub[group_col] == g]
+                    if row.empty:
+                        ys.append(np.nan)
+                        if yerr_col:
+                            yerrs.append(np.nan)
                         continue
-                    x_vals.append(group_to_x[g])
-                    y_vals.append(rows[y_col].iloc[0])
-                    if yerr_col is not None and yerr_col in rows:
-                        y_errs.append(rows[yerr_col].iloc[0])
+                    ys.append(float(row.iloc[0][y_col]))
+                    if yerr_col:
+                        yerrs.append(float(row.iloc[0][yerr_col]))
+                ys = np.array(ys, dtype=float)
 
-                if not x_vals:
+                if yerr_col:
+                    yerrs = np.array(yerrs, dtype=float)
+                else:
+                    yerrs = None
+
+                if np.all(np.isnan(ys)):
                     continue
 
-                if yerr_col is None or not y_errs:
-                    (line,) = ax.plot(
-                        x_vals,
-                        y_vals,
-                        "o-",
-                        linewidth=1.0,
-                        markersize=3.5,
-                        color=color,
-                        alpha=0.35,
-                    )
-                    handle = line
-                else:
-                    container = ax.errorbar(
-                        x_vals,
-                        y_vals,
-                        yerr=y_errs,
-                        fmt="o-",
-                        linewidth=1.0,
-                        markersize=3.5,
-                        capsize=2.5,
-                        color=color,
-                        alpha=0.35,
-                    )
-                    handle = container
+                ax.errorbar(
+                    x_positions,
+                    ys,
+                    yerr=yerrs,
+                    fmt="-o",
+                    lw=1.0,
+                    ms=3.0,
+                    color=color,
+                    alpha=0.7,
+                )
 
-                if cat not in legend_handles:
-                    legend_handles[cat] = handle
-
-        ax.set_xticks(list(group_to_x.values()))
-        ax.set_xticklabels(list(group_to_x.keys()))
-        ax.set_xlabel("Group")
+        # X-axis labels
+        ax.set_xticks(x_positions)
+        ax.set_xticklabels(group_order)
         ax.set_ylabel(y_label)
-        ax.set_title(title)
 
-        _pretty_axes_basic(ax, x_rotation=0)
+        # Title, optionally with threshold text appended
+        full_title = title
+        if threshold_text:
+            full_title = f"{title}\n({threshold_text})"
+        ax.set_title(full_title)
+
+        _pretty_axes(ax)
+
+        # Build a clean legend with one entry per category
+        legend_cats = sorted(cats_present)
+        legend_handles = [
+            mlines.Line2D([], [], color=category_to_color.get(cat, "black"), marker="o",
+                          linestyle="-", label=cat)
+            for cat in legend_cats
+        ]
 
         if legend_handles:
-            # Determine which categories to show in legend
-            if category_order is None:
-                cats_in_plot = list(legend_handles.keys())
-            else:
-                # Start with requested order, then append any others we saw
-                cats_in_plot = [c for c in category_order if c in legend_handles]
-                for c in legend_handles.keys():
-                    if c not in cats_in_plot:
-                        cats_in_plot.append(c)
-
-            handles = [legend_handles[c] for c in cats_in_plot]
-            labels = []
-            for c in cats_in_plot:
-                if category_labels and c in category_labels:
-                    labels.append(category_labels[c])
-                else:
-                    labels.append(str(c))
-
+            lt = legend_title_override if legend_title_override is not None else legend_title
             ax.legend(
-                handles,
-                labels,
-                title=legend_title,
-                bbox_to_anchor=(1.02, 1.0),
-                loc="upper left",
+                handles=legend_handles,
+                title=lt,
+                loc="center left",
+                bbox_to_anchor=(1.02, 0.5),
                 borderaxespad=0.0,
-                fontsize=8,
+                frameon=False,
             )
 
-        fig.tight_layout(rect=[0.0, 0.0, 0.8, 0.95])
-
-        if outdir is not None:
-            fname = f"{file_prefix}{filename_suffix}.png"
-            fig.savefig(outdir / fname, dpi=300)
-            print(f"[PLOT] Saved category-colored figure: {outdir / fname}")
-
+        fname = f"{file_prefix}{filename_suffix}.png"
+        outpath = output_dir / fname
+        fig.tight_layout()
+        fig.savefig(outpath, dpi=300)
         if show_plots:
             plt.show()
         else:
             plt.close(fig)
 
+        print(f"[PLOT] Saved figure: {outpath}")
+
     # ------------------------------------------------------------------
-    # 1) Plot ALL syllables: one legend entry per animal
+    # 6. New helper: Late Pre vs Post scatter plots with y=x line
     # ------------------------------------------------------------------
-    _plot_one_combined(
-        df_plot=df_base,
-        title="All syllables: mean ± SEM by group and animal",
-        filename_suffix="_all_syllables_combined",
-        legend_mode="animal",
+    def _plot_latepre_vs_post_scatter(
+        df_src: pd.DataFrame,
+        *,
+        title: str,
+        filename_suffix: str,
+        metric_col: str,
+        x_label: str,
+        y_label: str,
+        filter_keys: Optional[set[Tuple[str, Any]]] = None,
+        legend_title_override: Optional[str] = None,
+        threshold_text: Optional[str] = None,
+    ) -> None:
+        """
+        Scatter plot of Late Pre vs Post metric values
+        (one point per Animal × Syllable), plus dashed y=x reference line.
+        """
+
+        late = df_src[df_src[group_col] == "Late Pre"].copy()
+        post = df_src[df_src[group_col] == "Post"].copy()
+
+        if late.empty or post.empty:
+            print(f"[INFO] Need both 'Late Pre' and 'Post' rows for {filename_suffix!r}. Skipping.")
+            return
+
+        merged = pd.merge(
+            late[[id_col, syllable_col, metric_col]],
+            post[[id_col, syllable_col, metric_col]],
+            on=[id_col, syllable_col],
+            suffixes=("_LatePre", "_Post"),
+            how="inner",
+        )
+
+        if filter_keys is not None:
+            mask = [
+                (str(a), s) in filter_keys
+                for a, s in zip(merged[id_col], merged[syllable_col])
+            ]
+            merged = merged.loc[mask].copy()
+
+        if merged.empty:
+            print(f"[INFO] No data after filtering for {filename_suffix!r}. Skipping.")
+            return
+
+        # Drop rows with non-finite values
+        merged = merged[
+            np.isfinite(merged[f"{metric_col}_LatePre"]) &
+            np.isfinite(merged[f"{metric_col}_Post"])
+        ]
+
+        if merged.empty:
+            print(f"[INFO] No finite Late Pre/Post pairs for {filename_suffix!r}. Skipping.")
+            return
+
+        fig, ax = plt.subplots(figsize=(7.0, 6.0))
+        cats_present = set()
+
+        for animal in sorted(merged[id_col].unique()):
+            a_str = str(animal)
+            a_cat = id_to_category.get(a_str, a_str)
+            color = category_to_color.get(a_cat, "black")
+            cats_present.add(a_cat)
+
+            sub = merged[merged[id_col] == animal]
+            x_vals = sub[f"{metric_col}_LatePre"].values.astype(float)
+            y_vals = sub[f"{metric_col}_Post"].values.astype(float)
+
+            ax.scatter(
+                x_vals,
+                y_vals,
+                s=25.0,
+                alpha=0.7,
+                color=color,
+                edgecolors="none",
+            )
+
+        ax.set_xlabel(x_label)
+        ax.set_ylabel(y_label)
+
+        # Title + optional threshold text
+        full_title = title
+        if threshold_text:
+            full_title = f"{title}\n({threshold_text})"
+        ax.set_title(full_title)
+
+        # y = x dashed red line
+        x_all = merged[f"{metric_col}_LatePre"].values.astype(float)
+        y_all = merged[f"{metric_col}_Post"].values.astype(float)
+        xmin = np.nanmin(x_all)
+        xmax = np.nanmax(x_all)
+        ymin = np.nanmin(y_all)
+        ymax = np.nanmax(y_all)
+
+        lower = min(xmin, ymin)
+        upper = max(xmax, ymax)
+        if not np.isfinite(lower) or not np.isfinite(upper):
+            lower, upper = 0.0, 1.0
+        pad = 0.05 * (upper - lower) if upper > lower else 0.1
+
+        line_min = max(0.0, lower - pad)  # keep origin visible for durations
+        line_max = upper + pad
+
+        ax.plot(
+            [line_min, line_max],
+            [line_min, line_max],
+            linestyle="--",
+            color="red",
+            linewidth=1.5,
+            label="y=x",
+        )
+
+        ax.set_xlim(line_min, line_max)
+        ax.set_ylim(line_min, line_max)
+
+        _pretty_axes(ax)
+
+        # Legend: categories + y=x line
+        legend_cats = sorted(cats_present)
+        category_handles = [
+            mlines.Line2D([], [], color=category_to_color.get(cat, "black"),
+                          marker="o", linestyle="none", label=cat)
+            for cat in legend_cats
+        ]
+        line_handle = mlines.Line2D(
+            [], [], color="red", linestyle="--", label="y=x"
+        )
+
+        handles = category_handles + [line_handle]
+        if handles:
+            lt = legend_title_override if legend_title_override is not None else legend_title
+            ax.legend(
+                handles=handles,
+                title=lt,
+                loc="center left",
+                bbox_to_anchor=(1.02, 0.5),
+                borderaxespad=0.0,
+                frameon=False,
+            )
+
+        fname = f"{file_prefix}{filename_suffix}.png"
+        outpath = output_dir / fname
+        fig.tight_layout()
+        fig.savefig(outpath, dpi=300)
+        if show_plots:
+            plt.show()
+        else:
+            plt.close(fig)
+
+        print(f"[PLOT] Saved Late Pre vs Post scatter figure: {outpath}")
+
+    # ------------------------------------------------------------------
+    # 7. Line plots vs group (same as before)
+    # ------------------------------------------------------------------
+    legend_title_override = legend_title  # usually "Animal ID" or metadata_color_col
+
+    # 7.1 Mean (all syllables)
+    _plot_metric_lines(
+        df,
+        title="All syllables: mean phrase duration by group",
+        filename_suffix="_mean_all",
         y_col=mean_col,
-        yerr_col=sem_col,
-        y_label="Mean phrase duration (ms)",
+        yerr_col=sem_col if have_sem else None,
+        y_label="Phrase duration mean (ms)",
+        filter_keys=None,
+        legend_title_override=legend_title_override,
     )
 
-    # Common mask for Post rows
-    post_mask = (df_base[group_col] == POST_GROUP)
-    key_cols = [id_col, syllable_col]
+    # 7.2 Mean (filtered: Post mean > Pre mean + k·SD)
+    threshold_text_mean = None
+    if have_pre_mean and have_pre_var:
+        threshold_text_mean = f"Post mean > Pre mean + {mean_sd_k:.2g}×SD"
+    elif have_pre_mean:
+        threshold_text_mean = "Post mean > Pre mean"
 
-    # Convenience category configs
-    yN_colors = {"Y": "red", "N": "black", "Unknown": "gray", "unknown": "gray"}
-    yN_labels = {
-        "Y": "Medial Area X hit = Y",
-        "N": "Medial Area X hit = N",
-        "Unknown": "Medial Area X hit = unknown",
-        "unknown": "Medial Area X hit = unknown",
-    }
-    yN_order = ["Y", "N", "Unknown"]
+    _plot_metric_lines(
+        df,
+        title="Filtered syllables: mean phrase duration by group",
+        filename_suffix="_mean_filtered_post_gt_pre",
+        y_col=mean_col,
+        yerr_col=sem_col if have_sem else None,
+        y_label="Phrase duration mean (ms)",
+        filter_keys=keys_mean_filtered if keys_mean_filtered else None,
+        legend_title_override=legend_title_override,
+        threshold_text=threshold_text_mean,
+    )
 
-    # UPDATED: include 'sham' and keep palette consistent for Medial + Lateral
-    type_colors = {
-        "bilateral": "red",
-        "unilateral_L": "orange",
-        "unilateral_R": "purple",
-        "sham": "green",     # sham controls
-        "miss": "black",
-        "unknown": "gray",
-    }
+    # 7.3 Median (all syllables)
+    _plot_metric_lines(
+        df,
+        title="All syllables: median phrase duration by group",
+        filename_suffix="_median_all",
+        y_col=median_col,
+        yerr_col=None,
+        y_label="Phrase duration median (ms)",
+        filter_keys=None,
+        legend_title_override=legend_title_override,
+    )
 
-    type_order = [
-        "bilateral",
-        "unilateral_L",
-        "unilateral_R",
-        "sham",
-        "miss",
-        "unknown",
-    ]
+    # 7.4 Median (filtered)
+    threshold_text_median = None
+    if have_pre_median and have_pre_median_iqr:
+        threshold_text_median = f"Post median > Pre median + {median_iqr_k:.2g}×IQR"
+    elif have_pre_median:
+        threshold_text_median = "Post median > Pre median"
 
-    medial_type_labels = {
-        "bilateral": "bilateral Medial Area X hit",
-        "unilateral_L": "unilateral Medial hit (L)",
-        "unilateral_R": "unilateral Medial hit (R)",
-        "sham": "bilateral saline sham (Medial)",
-        "miss": "no Medial Area X hit",
-        "unknown": "Medial Area X type unknown",
-    }
-    lateral_type_labels = {
-        "bilateral": "bilateral Lateral Area X hit",
-        "unilateral_L": "unilateral Lateral hit (L)",
-        "unilateral_R": "unilateral Lateral hit (R)",
-        "sham": "bilateral saline sham (Lateral)",
-        "miss": "no Lateral Area X hit",
-        "unknown": "Lateral Area X type unknown",
-    }
+    _plot_metric_lines(
+        df,
+        title="Filtered syllables: median phrase duration by group",
+        filename_suffix="_median_filtered_post_gt_pre",
+        y_col=median_col,
+        yerr_col=None,
+        y_label="Phrase duration median (ms)",
+        filter_keys=keys_median_filtered if keys_median_filtered else None,
+        legend_title_override=legend_title_override,
+        threshold_text=threshold_text_median,
+    )
 
-    # ------------------------------------------------------------------
-    # 2) Filter by MEAN: post mean > pre mean + 1 SD
-    # ------------------------------------------------------------------
-    mean_metric_cols = {"Post_Mean_Above_Pre_Mean_Plus_1SD"}
-    if mean_metric_cols.issubset(df_base.columns):
-        interesting_post_mean = df_base[
-            post_mask & df_base["Post_Mean_Above_Pre_Mean_Plus_1SD"]
-        ]
-        if not interesting_post_mean.empty:
-            keys_mean = interesting_post_mean[key_cols].drop_duplicates()
-            df_filtered_mean = df_base.merge(keys_mean, on=key_cols, how="inner")
+    # 7.5 Variance (all syllables)
+    _plot_metric_lines(
+        df,
+        title="All syllables: variance of phrase duration by group",
+        filename_suffix="_variance_all",
+        y_col=var_col,
+        yerr_col=None,
+        y_label="Phrase duration variance (ms$^2$)",
+        filter_keys=None,
+        legend_title_override=legend_title_override,
+    )
 
-            # Animal-colored + syllables in legend
-            _plot_one_combined(
-                df_plot=df_filtered_mean,
-                title="Filtered syllables: post mean > pre mean + 1 SD",
-                filename_suffix="_filtered_mean_gt_pre_plus1SD",
-                legend_mode="animal_syllables",
-                y_col=mean_col,
-                yerr_col=sem_col,
-                y_label="Mean phrase duration (ms)",
-            )
+    # 7.6 Variance (filtered)
+    threshold_text_var = None
+    if have_pre_var and have_pre_var_iqr:
+        threshold_text_var = f"Post variance > Pre variance + {variance_iqr_k:.2g}×IQR"
+    elif have_pre_var:
+        threshold_text_var = "Post variance > Pre variance"
 
-            # Colored by Medial Area X hit? (Y/N)
-            _plot_one_by_category(
-                df_plot=df_filtered_mean,
-                title=(
-                    "Filtered syllables: post mean > pre mean + 1 SD\n"
-                    "colored by Medial Area X hit?"
-                ),
-                filename_suffix="_filtered_mean_gt_pre_plus1SD_MhitYN",
-                y_col=mean_col,
-                yerr_col=sem_col,
-                y_label="Mean phrase duration (ms)",
-                category_map=medial_hit_cat_map,
-                legend_title="Medial Area X hit?",
-                category_colors=yN_colors,
-                category_labels=yN_labels,
-                category_order=yN_order,
-            )
-
-            # Colored by Medial Area X hit type
-            _plot_one_by_category(
-                df_plot=df_filtered_mean,
-                title=(
-                    "Filtered syllables: post mean > pre mean + 1 SD\n"
-                    "colored by Medial Area X hit type"
-                ),
-                filename_suffix="_filtered_mean_gt_pre_plus1SD_Mtype",
-                y_col=mean_col,
-                yerr_col=sem_col,
-                y_label="Mean phrase duration (ms)",
-                category_map=medial_type_cat_map,
-                legend_title="Medial Area X hit type",
-                category_colors=type_colors,
-                category_labels=medial_type_labels,
-                category_order=type_order,
-            )
-
-            # Colored by Lateral Area X hit type
-            _plot_one_by_category(
-                df_plot=df_filtered_mean,
-                title=(
-                    "Filtered syllables: post mean > pre mean + 1 SD\n"
-                    "colored by Lateral Area X hit type"
-                ),
-                filename_suffix="_filtered_mean_gt_pre_plus1SD_Ltype",
-                y_col=mean_col,
-                yerr_col=sem_col,
-                y_label="Mean phrase duration (ms)",
-                category_map=lateral_type_cat_map,
-                legend_title="Lateral Area X hit type",
-                category_colors=type_colors,
-                category_labels=lateral_type_labels,
-                category_order=type_order,
-            )
-        else:
-            print("[INFO] No syllables met the mean > pre+1SD criterion.")
-    else:
-        print(
-            "[INFO] Column 'Post_Mean_Above_Pre_Mean_Plus_1SD' not found; "
-            "skipping mean-based filtered plot."
-        )
+    _plot_metric_lines(
+        df,
+        title="Filtered syllables: variance of phrase duration by group",
+        filename_suffix="_variance_filtered_post_gt_pre",
+        y_col=var_col,
+        yerr_col=None,
+        y_label="Phrase duration variance (ms$^2$)",
+        filter_keys=keys_var_filtered if keys_var_filtered else None,
+        legend_title_override=legend_title_override,
+        threshold_text=threshold_text_var,
+    )
 
     # ------------------------------------------------------------------
-    # 3) Filter by MEDIAN: post median > max(Early-Pre median, Late-Pre median)
+    # 8. Late Pre vs Post scatter plots (filtered syllables)
     # ------------------------------------------------------------------
-    if "Median_ms" in df_base.columns:
-        df_pre = df_base[df_base[group_col].isin(PRE_GROUPS)]
-        df_post = df_base[df_base[group_col] == POST_GROUP]
+    # 8.1 Mean
+    _plot_latepre_vs_post_scatter(
+        df,
+        title="Filtered syllables: Late Pre vs Post mean phrase duration",
+        filename_suffix="_mean_LatePre_vs_Post_scatter",
+        metric_col=mean_col,
+        x_label="Late Pre mean (ms)",
+        y_label="Post lesion mean (ms)",
+        filter_keys=keys_mean_filtered if keys_mean_filtered else None,
+        legend_title_override=legend_title_override,
+        threshold_text=threshold_text_mean,
+    )
 
-        if not df_pre.empty and not df_post.empty:
-            pre_medians = (
-                df_pre
-                .groupby(key_cols)["Median_ms"]
-                .max()                     # bigger of Early & Late
-                .reset_index()
-                .rename(columns={"Median_ms": "Pre_Median_max_ms"})
-            )
-            post_medians = (
-                df_post[key_cols + ["Median_ms"]]
-                .rename(columns={"Median_ms": "Post_Median_ms"})
-            )
+    # 8.2 Median
+    _plot_latepre_vs_post_scatter(
+        df,
+        title="Filtered syllables: Late Pre vs Post median phrase duration",
+        filename_suffix="_median_LatePre_vs_Post_scatter",
+        metric_col=median_col,
+        x_label="Late Pre median (ms)",
+        y_label="Post lesion median (ms)",
+        filter_keys=keys_median_filtered if keys_median_filtered else None,
+        legend_title_override=legend_title_override,
+        threshold_text=threshold_text_median,
+    )
 
-            merged = pd.merge(post_medians, pre_medians, on=key_cols, how="inner")
-            interesting_med = merged[
-                merged["Post_Median_ms"] > merged["Pre_Median_max_ms"]
-            ]
+    # 8.3 Variance
+    _plot_latepre_vs_post_scatter(
+        df,
+        title="Filtered syllables: Late Pre vs Post variance of phrase duration",
+        filename_suffix="_variance_LatePre_vs_Post_scatter",
+        metric_col=var_col,
+        x_label="Late Pre variance (ms$^2$)",
+        y_label="Post lesion variance (ms$^2$)",
+        filter_keys=keys_var_filtered if keys_var_filtered else None,
+        legend_title_override=legend_title_override,
+        threshold_text=threshold_text_var,
+    )
 
-            if not interesting_med.empty:
-                keys_med = interesting_med[key_cols].drop_duplicates()
-                df_filtered_med = df_base.merge(keys_med, on=key_cols, how="inner")
-
-                _plot_one_combined(
-                    df_plot=df_filtered_med,
-                    title="Filtered syllables: post median > max(Early, Late pre medians)",
-                    filename_suffix="_filtered_median_gt_pre",
-                    legend_mode="animal_syllables",
-                    y_col="Median_ms",
-                    yerr_col=None,
-                    y_label="Median phrase duration (ms)",
-                )
-
-                _plot_one_by_category(
-                    df_plot=df_filtered_med,
-                    title=(
-                        "Filtered syllables: post median > max(Early, Late pre medians)\n"
-                        "colored by Medial Area X hit?"
-                    ),
-                    filename_suffix="_filtered_median_gt_pre_MhitYN",
-                    y_col="Median_ms",
-                    yerr_col=None,
-                    y_label="Median phrase duration (ms)",
-                    category_map=medial_hit_cat_map,
-                    legend_title="Medial Area X hit?",
-                    category_colors=yN_colors,
-                    category_labels=yN_labels,
-                    category_order=yN_order,
-                )
-
-                _plot_one_by_category(
-                    df_plot=df_filtered_med,
-                    title=(
-                        "Filtered syllables: post median > max(Early, Late pre medians)\n"
-                        "colored by Medial Area X hit type"
-                    ),
-                    filename_suffix="_filtered_median_gt_pre_Mtype",
-                    y_col="Median_ms",
-                    yerr_col=None,
-                    y_label="Median phrase duration (ms)",
-                    category_map=medial_type_cat_map,
-                    legend_title="Medial Area X hit type",
-                    category_colors=type_colors,
-                    category_labels=medial_type_labels,
-                    category_order=type_order,
-                )
-
-                _plot_one_by_category(
-                    df_plot=df_filtered_med,
-                    title=(
-                        "Filtered syllables: post median > max(Early, Late pre medians)\n"
-                        "colored by Lateral Area X hit type"
-                    ),
-                    filename_suffix="_filtered_median_gt_pre_Ltype",
-                    y_col="Median_ms",
-                    yerr_col=None,
-                    y_label="Median phrase duration (ms)",
-                    category_map=lateral_type_cat_map,
-                    legend_title="Lateral Area X hit type",
-                    category_colors=type_colors,
-                    category_labels=lateral_type_labels,
-                    category_order=type_order,
-                )
-            else:
-                print("[INFO] No syllables met the median > pre criterion.")
-        else:
-            print(
-                "[INFO] Missing pre or post rows when computing median filter; "
-                "skipping median-based filtered plot."
-            )
-    else:
-        print(
-            "[INFO] Column 'Median_ms' not found; skipping median-based filtered plot."
-        )
-
-    # ------------------------------------------------------------------
-    # 4) Filter by VARIANCE: post variance > pre pooled variance
-    # ------------------------------------------------------------------
-    var_metric_cols = {"Pre_Variance_ms2", "Variance_ms2"}
-    if var_metric_cols.issubset(df_base.columns):
-        df_post_var = df_base[post_mask & df_base["Pre_Variance_ms2"].notna()]
-        interesting_var = df_post_var[
-            df_post_var["Variance_ms2"] > df_post_var["Pre_Variance_ms2"]
-        ]
-
-        if not interesting_var.empty:
-            keys_var = interesting_var[key_cols].drop_duplicates()
-            df_filtered_var = df_base.merge(keys_var, on=key_cols, how="inner")
-
-            _plot_one_combined(
-                df_plot=df_filtered_var,
-                title="Filtered syllables: post variance > pre pooled variance",
-                filename_suffix="_filtered_variance_gt_pre",
-                legend_mode="animal_syllables",
-                y_col="Variance_ms2",
-                yerr_col=None,
-                y_label="Phrase duration variance (ms$^2$)",
-            )
-
-            _plot_one_by_category(
-                df_plot=df_filtered_var,
-                title=(
-                    "Filtered syllables: post variance > pre pooled variance\n"
-                    "colored by Medial Area X hit?"
-                ),
-                filename_suffix="_filtered_variance_gt_pre_MhitYN",
-                y_col="Variance_ms2",
-                yerr_col=None,
-                y_label="Phrase duration variance (ms$^2$)",
-                category_map=medial_hit_cat_map,
-                legend_title="Medial Area X hit?",
-                category_colors=yN_colors,
-                category_labels=yN_labels,
-                category_order=yN_order,
-            )
-
-            _plot_one_by_category(
-                df_plot=df_filtered_var,
-                title=(
-                    "Filtered syllables: post variance > pre pooled variance\n"
-                    "colored by Medial Area X hit type"
-                ),
-                filename_suffix="_filtered_variance_gt_pre_Mtype",
-                y_col="Variance_ms2",
-                yerr_col=None,
-                y_label="Phrase duration variance (ms$^2$)",
-                category_map=medial_type_cat_map,
-                legend_title="Medial Area X hit type",
-                category_colors=type_colors,
-                category_labels=medial_type_labels,
-                category_order=type_order,
-            )
-
-            _plot_one_by_category(
-                df_plot=df_filtered_var,
-                title=(
-                    "Filtered syllables: post variance > pre pooled variance\n"
-                    "colored by Lateral Area X hit type"
-                ),
-                filename_suffix="_filtered_variance_gt_pre_Ltype",
-                y_col="Variance_ms2",
-                yerr_col=None,
-                y_label="Phrase duration variance (ms$^2$)",
-                category_map=lateral_type_cat_map,
-                legend_title="Lateral Area X hit type",
-                category_colors=type_colors,
-                category_labels=lateral_type_labels,
-                category_order=type_order,
-            )
-        else:
-            print("[INFO] No syllables met the variance > pre criterion.")
-    else:
-        print(
-            "[INFO] Columns 'Pre_Variance_ms2' / 'Variance_ms2' not found; "
-            "skipping variance-based filtered plot."
-        )
-
+    return df
 
 
 """
-Example: plotting from a compiled CSV
--------------------------------------
-
 from pathlib import Path
 import importlib
 import phrase_and_metadata_plotting as pmp
 importlib.reload(pmp)
 
-compiled_csv = Path("/Volumes/my_own_ssd/2024_2025_Area_X_jsons_npzs/compiled_phrase_duration_stats_with_prepost_metrics.csv")
-excel_path = Path("/Users/mirandahulsey-vincent/Desktop/Area_X_lesion_metadata.xlsx")
+compiled_csv = Path(
+    "/Volumes/my_own_ssd/2024_2025_Area_X_jsons_npzs/compiled_phrase_duration_stats_with_prepost_metrics.csv"
+)
+excel_path = Path("/Volumes/my_own_ssd/2024_2025_Area_X_jsons_npzs/Area_X_lesion_metadata.xlsx")
 
+# 1) Colored by animal
 pmp.plot_compiled_phrase_stats_by_syllable(
     compiled_stats_path=compiled_csv,
-    compiled_format="csv",              # or omit; inferred from .csv suffix
+    compiled_format="csv",
     id_col="Animal ID",
     group_col="Group",
     syllable_col="Syllable",
-    mean_col="Mean_ms",
-    sem_col="SEM_ms",
     output_dir=compiled_csv.parent / "phrase_duration_line_plots",
     file_prefix="AreaX_phrase_durations",
     show_plots=True,
-    metadata_excel_path=excel_path,
-    metadata_sheet_name=0,
-    medial_hit_col="Medial Area X hit?",
+    mean_sd_k=1.0,
+    median_iqr_k=1.0,
+    variance_iqr_k=1.0,
 )
 
+# 2) Colored by **Medial Area X hit type**
+pmp.plot_compiled_phrase_stats_by_syllable(
+    compiled_stats_path=compiled_csv,
+    compiled_format="csv",
+    id_col="Animal ID",
+    group_col="Group",
+    syllable_col="Syllable",
+    output_dir=compiled_csv.parent / "phrase_duration_line_plots_Medial",
+    file_prefix="AreaX_phrase_durations_by_medial_type",
+    show_plots=True,
+    color_by="metadata",
+    metadata_excel_path=excel_path,
+    metadata_sheet_name=0,
+    metadata_color_col="Medial Area X hit type",
+    category_color_map={
+        "bilateral": "red",
+        "unilateral_L": "orange",
+        "unilateral_R": "purple",
+        "sham": "green",
+        "miss": "black",
+        "unknown": "gray",
+    },
+    mean_sd_k=1.0,
+    median_iqr_k=1.0,
+    variance_iqr_k=1.0,
+)
+
+# 3) Colored by **Lateral Area X hit type**
+pmp.plot_compiled_phrase_stats_by_syllable(
+    compiled_stats_path=compiled_csv,
+    compiled_format="csv",
+    id_col="Animal ID",
+    group_col="Group",
+    syllable_col="Syllable",
+    output_dir=compiled_csv.parent / "phrase_duration_line_plots_Lateral",
+    file_prefix="AreaX_phrase_durations_by_lateral_type",
+    show_plots=True,
+    color_by="metadata",
+    metadata_excel_path=excel_path,
+    metadata_sheet_name=0,
+    metadata_color_col="Lateral Area X hit type",
+    category_color_map={
+        "bilateral": "red",
+        "unilateral_L": "orange",
+        "unilateral_R": "purple",
+        "sham": "green",
+        "miss": "black",
+        "unknown": "gray",
+    },
+    mean_sd_k=1.0,
+    median_iqr_k=1.0,
+    variance_iqr_k=1.0,
+)
+
+# 4) Colored by **total injection volume** (nL)
+pmp.plot_compiled_phrase_stats_by_syllable(
+    compiled_stats_path=compiled_csv,
+    compiled_format="csv",
+    id_col="Animal ID",
+    group_col="Group",
+    syllable_col="Syllable",
+    output_dir=compiled_csv.parent / "phrase_duration_line_plots_total_volume",
+    file_prefix="AreaX_phrase_durations_by_total_inj_volume",
+    show_plots=True,
+    color_by="metadata",
+    metadata_excel_path=excel_path,
+    metadata_sheet_name=0,
+    metadata_color_col="total_inj_volume",
+    mean_sd_k=1.0,
+    median_iqr_k=1.0,
+    variance_iqr_k=1.0,
+)
 """
