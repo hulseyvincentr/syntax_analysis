@@ -1,25 +1,13 @@
 # phrase_and_metadata_plotting.py
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Sequence, Union, Tuple, Any
 
-import json
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.lines as mlines
-
-from phrase_duration_pre_vs_post_grouped import (
-    GroupedPlotsResult,
-)
-
-# Helper that builds big_df across birds
-from phrase_duration_birds_stats_df import (
-    BirdsPhraseDurationStats,
-    build_birds_phrase_duration_stats_df,
-)
 
 # Try to import your existing Excel organizer (Area X–specific)
 try:
@@ -28,84 +16,23 @@ except Exception:
     build_areax_metadata = None
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Dataclasses
-# ──────────────────────────────────────────────────────────────────────────────
+"""
+Plotting utilities for compiled phrase-duration stats.
 
+This module no longer computes the big concatenated DataFrame (`big_df`)
+itself. You must generate a compiled phrase-duration stats file
+(CSV/JSON/NPZ) ahead of time, for example:
 
-@dataclass
-class PhraseAndMetadataResult:
-    """Container for outputs of run_phrase_durations_from_metadata."""
+  - Using `phrase_duration_balanced_syllable_usage.run_balanced_syllable_usage_from_metadata_excel`
+    to produce a `usage_balanced_phrase_duration_stats.csv`, or
+  - Using your previous pipeline that builds `compiled_phrase_duration_stats_with_prepost_metrics.csv`.
 
-    birds_stats: BirdsPhraseDurationStats
-    compiled_stats_df: pd.DataFrame
-    compiled_stats_path: Path
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Wrapper: run phrase-duration analysis from Excel + JSON root
-# ──────────────────────────────────────────────────────────────────────────────
-
-
-def run_phrase_durations_from_metadata(
-    excel_path: Union[str, Path],
-    json_root: Union[str, Path],
-    *,
-    sheet_name: Union[int, str] = 0,
-    id_col: str = "Animal ID",
-    treatment_date_col: str = "Treatment date",
-    grouping_mode: str = "auto_balance",
-    restrict_to_labels: Optional[Sequence[str]] = None,
-    y_max_ms: Optional[float] = None,
-    show_plots: bool = False,
-    compiled_filename: str = "compiled_phrase_duration_stats_with_prepost_metrics.csv",
-) -> PhraseAndMetadataResult:
-    """
-    High-level wrapper:
-
-    1. Uses your metadata Excel file + JSON root to build phrase-duration stats
-       for all birds via `build_birds_phrase_duration_stats_df`.
-    2. Saves the compiled stats DataFrame to a CSV under:
-          <json_root>/TweetyBERT_outputs/<compiled_filename>
-    3. Returns a small dataclass with the stats and output path.
-
-    This does *not* change the internal logic of how per-bird stats are
-    computed; that still lives in `phrase_duration_birds_stats_df.py`.
-    """
-    excel_path = Path(excel_path)
-    json_root = Path(json_root)
-
-    birds_stats = build_birds_phrase_duration_stats_df(
-        excel_path=excel_path,
-        json_root=json_root,
-        sheet_name=sheet_name,
-        id_col=id_col,
-        treatment_date_col=treatment_date_col,
-        grouping_mode=grouping_mode,
-        restrict_to_labels=restrict_to_labels,
-        y_max_ms=y_max_ms,
-        show_plots=show_plots,
-    )
-
-    big_df = birds_stats.phrase_duration_stats_df.copy()
-
-    # Where to save the compiled stats
-    out_dir = json_root / "TweetyBERT_outputs"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    compiled_path = out_dir / compiled_filename
-
-    big_df.to_csv(compiled_path, index=False)
-    print(f"Saved big_df with metrics to: {compiled_path}")
-
-    return PhraseAndMetadataResult(
-        birds_stats=birds_stats,
-        compiled_stats_df=big_df,
-        compiled_stats_path=compiled_path,
-    )
+Then call `plot_compiled_phrase_stats_by_syllable(...)` on that compiled file.
+"""
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Plotting: compiled phrase-duration stats (thresholded by baseline variability)
+# Plotting: compiled phrase-duration stats (thresholded + N_phrases filtering)
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -134,21 +61,93 @@ def plot_compiled_phrase_stats_by_syllable(
     mean_sd_k: float = 1.0,
     median_iqr_k: float = 1.0,
     variance_iqr_k: float = 1.0,
+    # --- minimum sample size per (animal, syllable) across groups ---
+    min_phrases: int = 0,
+    n_phrases_col: Optional[str] = "N_phrases",
 ) -> pd.DataFrame:
     """
     Plot per-syllable phrase-duration metrics across Early Pre / Late Pre / Post
     for all birds, using a compiled stats DataFrame.
 
-    It produces:
-      - Line plots of mean/median/variance vs group (all syllables + filtered)
-      - Scatter plots of Late Pre vs Post for mean/median/variance
-        (one point per Animal×Syllable), with a y=x dashed red line.
+    You must generate the compiled stats file beforehand (e.g. using your
+    "balanced by song" or "balanced by syllable usage" pipeline) so that each
+    row corresponds to (Animal ID, Group, Syllable).
+
+    It produces three kinds of plots for each metric (mean/median/variance):
+
+      1) "All syllables" (no additional filtering)
+      2) "Threshold-filtered" syllables:
+           - mean:      Post mean > Pre mean + k·SD
+           - median:    Post median > Pre median + k·IQR
+           - variance:  Post variance > Pre variance + k·IQR
+      3) "N_phrases-filtered" syllables:
+           - Syllables with min(N_phrases across groups) ≥ min_phrases
+
+    For each of these, it generates:
+      - Line plots of metric vs group
+      - Late Pre vs Post scatter plots (with dashed y=x reference line)
+        + zoomed variance scatter plots.
+
+    Parameters
+    ----------
+    phrase_stats : pd.DataFrame or None
+        If provided, use this DataFrame directly.
+        Otherwise, load from `compiled_stats_path`.
+    compiled_stats_path : str or Path or None
+        Path to compiled stats file (CSV/JSON/NPZ).
+    compiled_format : {"csv","json","npz"} or None
+        If None, inferred from file suffix.
+    id_col, group_col, syllable_col : str
+        Column names for animal ID, group label, and syllable label.
+    mean_col, sem_col, median_col, var_col : str
+        Column names for mean / SEM / median / variance of phrase duration.
+    output_dir : str or Path or None
+        Directory where PNGs will be saved. If None, uses the directory of
+        `compiled_stats_path` or the current directory.
+    file_prefix : str
+        Prefix for all output PNG filenames.
+    show_plots : bool
+        If True, show plots interactively. Otherwise, just save and close.
+    color_by : {"animal", "metadata"}
+        If "animal", one color per animal ID.
+        If "metadata", color by `metadata_color_col` from the metadata Excel.
+    metadata_excel_path : str or Path or None
+        Excel file with Area X lesion metadata (for color_by="metadata").
+    metadata_sheet_name : int or str
+        Sheet index or name for the metadata Excel.
+    metadata_color_col : str or None
+        Column name in the metadata dict used to define categories for coloring.
+    category_color_map : dict or None
+        Optional mapping category → color (e.g. "bilateral" → "red").
+        Any categories not listed here receive automatic colors.
+    mean_sd_k, median_iqr_k, variance_iqr_k : float
+        Threshold factors for selecting "threshold-filtered" syllables using
+        Pre_* columns:
+          - mean:      Post mean > Pre mean + k·SD
+          - median:    Post median > Pre median + k·IQR
+          - variance:  Post variance > Pre variance + k·IQR
+    min_phrases : int, default 0
+        If > 0 and an N_phrases column is present, defines a *separate* set of
+        "N_phrases-filtered" plots (those with min N_phrases ≥ min_phrases).
+        This no longer globally filters the DataFrame; it only affects the
+        extra N_phrases-based plots.
+    n_phrases_col : str or None, default "N_phrases"
+        Name of the N_phrases column. If None or not found, the function will
+        also try "N_phrases" then "n_phrases". If no such column exists, the
+        N_phrases-based plots are skipped with an info message.
+
+    Returns
+    -------
+    df : pd.DataFrame
+        The DataFrame actually used for plotting (unfiltered, except for
+        basic validity checks).
     """
     # ------------------------------------------------------------------
     # 0. Load / validate DataFrame
     # ------------------------------------------------------------------
     if phrase_stats is not None:
         df = phrase_stats.copy()
+        compiled_stats_path = None  # not used for I/O here
     else:
         if compiled_stats_path is None:
             raise ValueError(
@@ -188,6 +187,48 @@ def plot_compiled_phrase_stats_by_syllable(
 
     # If we don't have SEM for mean, that's OK (we'll just skip errorbars).
     have_sem = sem_col in df.columns
+
+    # ------------------------------------------------------------------
+    # 0b. Build N_phrases filter keys (but do NOT globally filter df)
+    # ------------------------------------------------------------------
+    keys_min_phrases: Optional[set[Tuple[str, Any]]] = None
+    if min_phrases is not None and min_phrases > 0:
+        # Determine which N_phrases column to use
+        n_col: Optional[str] = None
+        candidate_cols: list[str] = []
+
+        if n_phrases_col is not None:
+            candidate_cols.append(n_phrases_col)
+        # Also consider common fallbacks
+        for c in ["N_phrases", "n_phrases"]:
+            if c not in candidate_cols:
+                candidate_cols.append(c)
+
+        for c in candidate_cols:
+            if c in df.columns:
+                n_col = c
+                break
+
+        if n_col is not None:
+            # Compute min N across groups for each (Animal, Syllable)
+            grp = df.groupby([id_col, syllable_col])[n_col].min()
+            keys_min_phrases = set(
+                (str(a), s) for (a, s), val in grp.items() if val >= min_phrases
+            )
+            if not keys_min_phrases:
+                print(
+                    f"[INFO] No (Animal, Syllable) pairs with {n_col} >= {min_phrases}. "
+                    "N_phrases-filtered plots will be empty."
+                )
+        else:
+            print(
+                "[INFO] `min_phrases` specified but no N_phrases/n_phrases column "
+                "found; skipping N_phrases-based filtering."
+            )
+
+    have_nphrases_filter = (
+        min_phrases is not None and min_phrases > 0 and keys_min_phrases is not None
+    )
 
     # ------------------------------------------------------------------
     # 1. Output directory
@@ -257,6 +298,8 @@ def plot_compiled_phrase_stats_by_syllable(
                 mean_sd_k=mean_sd_k,
                 median_iqr_k=median_iqr_k,
                 variance_iqr_k=variance_iqr_k,
+                min_phrases=min_phrases,
+                n_phrases_col=n_phrases_col,
             )
 
         # Use Area X metadata to get e.g. "Medial Area X hit type" / "Lateral ..."
@@ -329,7 +372,7 @@ def plot_compiled_phrase_stats_by_syllable(
     # group labels we expect; we preserve whatever unique ordering exists,
     # but try to put Early Pre / Late Pre / Post in a sensible order
     raw_groups = list(df[group_col].dropna().unique())
-    group_order = []
+    group_order: list[str] = []
     for g in ["Early Pre", "Late Pre", "Post"]:
         if g in raw_groups:
             group_order.append(g)
@@ -434,6 +477,10 @@ def plot_compiled_phrase_stats_by_syllable(
         threshold_text: Optional[str] = None,
     ) -> None:
         """Plot lines for one metric (mean / median / variance)."""
+
+        if df_src.empty:
+            print(f"[INFO] Source DataFrame empty for {filename_suffix!r}. Skipping.")
+            return
 
         if filter_keys is not None:
             # Keep only rows where (Animal ID, Syllable) is in filter_keys
@@ -547,7 +594,7 @@ def plot_compiled_phrase_stats_by_syllable(
         print(f"[PLOT] Saved figure: {outpath}")
 
     # ------------------------------------------------------------------
-    # 6. New helper: Late Pre vs Post scatter plots with y=x line
+    # 6. Late Pre vs Post scatter helper with y=x line
     # ------------------------------------------------------------------
     def _plot_latepre_vs_post_scatter(
         df_src: pd.DataFrame,
@@ -560,10 +607,12 @@ def plot_compiled_phrase_stats_by_syllable(
         filter_keys: Optional[set[Tuple[str, Any]]] = None,
         legend_title_override: Optional[str] = None,
         threshold_text: Optional[str] = None,
-    ) -> None:
+    ) -> Tuple[Tuple[float, float], Tuple[float, float]]:
         """
         Scatter plot of Late Pre vs Post metric values
         (one point per Animal × Syllable), plus dashed y=x reference line.
+
+        Returns (xlim, ylim) used in the plot.
         """
 
         late = df_src[df_src[group_col] == "Late Pre"].copy()
@@ -571,7 +620,7 @@ def plot_compiled_phrase_stats_by_syllable(
 
         if late.empty or post.empty:
             print(f"[INFO] Need both 'Late Pre' and 'Post' rows for {filename_suffix!r}. Skipping.")
-            return
+            return ((0.0, 1.0), (0.0, 1.0))
 
         merged = pd.merge(
             late[[id_col, syllable_col, metric_col]],
@@ -590,7 +639,7 @@ def plot_compiled_phrase_stats_by_syllable(
 
         if merged.empty:
             print(f"[INFO] No data after filtering for {filename_suffix!r}. Skipping.")
-            return
+            return ((0.0, 1.0), (0.0, 1.0))
 
         # Drop rows with non-finite values
         merged = merged[
@@ -600,7 +649,7 @@ def plot_compiled_phrase_stats_by_syllable(
 
         if merged.empty:
             print(f"[INFO] No finite Late Pre/Post pairs for {filename_suffix!r}. Skipping.")
-            return
+            return ((0.0, 1.0), (0.0, 1.0))
 
         fig, ax = plt.subplots(figsize=(7.0, 6.0))
         cats_present = set()
@@ -698,10 +747,192 @@ def plot_compiled_phrase_stats_by_syllable(
 
         print(f"[PLOT] Saved Late Pre vs Post scatter figure: {outpath}")
 
+        return ax.get_xlim(), ax.get_ylim()
+
     # ------------------------------------------------------------------
-    # 7. Line plots vs group (same as before)
+    # 6b. Zoomed-variance scatter helper (x from 0 to 1.05×max LatePre; keep y-lims)
+    # ------------------------------------------------------------------
+    def _plot_latepre_vs_post_scatter_zoom_x_from_zero(
+        df_src: pd.DataFrame,
+        *,
+        title: str,
+        filename_suffix: str,
+        metric_col: str,
+        x_label: str,
+        y_label: str,
+        filter_keys: Optional[set[Tuple[str, Any]]] = None,
+        legend_title_override: Optional[str] = None,
+        base_ylim: Optional[Tuple[float, float]] = None,
+        threshold_text: Optional[str] = None,
+    ) -> None:
+        """
+        Same as _plot_latepre_vs_post_scatter, but:
+          - x-axis runs 0 → 1.05×max(Late Pre metric)
+          - y-axis limits are fixed to base_ylim (from the non-zoomed plot).
+        """
+
+        late = df_src[df_src[group_col] == "Late Pre"].copy()
+        post = df_src[df_src[group_col] == "Post"].copy()
+
+        if late.empty or post.empty:
+            print(f"[INFO] Need both 'Late Pre' and 'Post' rows for {filename_suffix!r}. Skipping.")
+            return
+
+        merged = pd.merge(
+            late[[id_col, syllable_col, metric_col]],
+            post[[id_col, syllable_col, metric_col]],
+            on=[id_col, syllable_col],
+            suffixes=("_LatePre", "_Post"),
+            how="inner",
+        )
+
+        if filter_keys is not None:
+            mask = [
+                (str(a), s) in filter_keys
+                for a, s in zip(merged[id_col], merged[syllable_col])
+            ]
+            merged = merged.loc[mask].copy()
+
+        if merged.empty:
+            print(f"[INFO] No data after filtering for {filename_suffix!r}. Skipping.")
+            return
+
+        merged = merged[
+            np.isfinite(merged[f"{metric_col}_LatePre"]) &
+            np.isfinite(merged[f"{metric_col}_Post"])
+        ]
+        if merged.empty:
+            print(f"[INFO] No finite Late Pre/Post pairs for {filename_suffix!r}. Skipping.")
+            return
+
+        fig, ax = plt.subplots(figsize=(7.0, 6.0))
+        cats_present = set()
+
+        for animal in sorted(merged[id_col].unique()):
+            a_str = str(animal)
+            a_cat = id_to_category.get(a_str, a_str)
+            color = category_to_color.get(a_cat, "black")
+            cats_present.add(a_cat)
+
+            sub = merged[merged[id_col] == animal]
+            x_vals = sub[f"{metric_col}_LatePre"].values.astype(float)
+            y_vals = sub[f"{metric_col}_Post"].values.astype(float)
+
+            ax.scatter(
+                x_vals,
+                y_vals,
+                s=25.0,
+                alpha=0.7,
+                color=color,
+                edgecolors="none",
+            )
+
+        ax.set_xlabel(x_label)
+        ax.set_ylabel(y_label)
+
+        full_title = title
+        if threshold_text:
+            full_title = f"{title}\n({threshold_text})"
+        ax.set_title(full_title)
+
+        # ranges
+        x_all = merged[f"{metric_col}_LatePre"].values.astype(float)
+        y_all = merged[f"{metric_col}_Post"].values.astype(float)
+
+        # y-limits from base plot
+        if base_ylim is None:
+            ymin = np.nanmin(y_all)
+            ymax = np.nanmax(y_all)
+            lower = min(0.0, ymin)
+            upper = max(ymax, 1.0)
+            pad = 0.05 * (upper - lower) if upper > lower else 0.1
+            y_min_use = max(0.0, lower - pad)
+            y_max_use = upper + pad
+        else:
+            y_min_use, y_max_use = base_ylim
+
+        # x-limits: 0 → 1.05×max LatePre
+        xmax_lp = np.nanmax(x_all)
+        if not np.isfinite(xmax_lp) or xmax_lp <= 0:
+            xmax_lp = y_max_use
+        x_min_use = 0.0
+        x_max_use = xmax_lp * 1.05
+
+        # y=x line within visible window
+        line_end = min(x_max_use, y_max_use)
+        ax.plot(
+            [0.0, line_end],
+            [0.0, line_end],
+            linestyle="--",
+            color="red",
+            linewidth=1.5,
+            label="y=x",
+        )
+
+        ax.set_xlim(x_min_use, x_max_use)
+        ax.set_ylim(y_min_use, y_max_use)
+
+        _pretty_axes(ax)
+
+        legend_cats = sorted(cats_present)
+        category_handles = [
+            mlines.Line2D([], [], color=category_to_color.get(cat, "black"),
+                          marker="o", linestyle="none", label=cat)
+            for cat in legend_cats
+        ]
+        line_handle = mlines.Line2D(
+            [], [], color="red", linestyle="--", label="y=x"
+        )
+        handles = category_handles + [line_handle]
+        if handles:
+            lt = legend_title_override if legend_title_override is not None else legend_title
+            ax.legend(
+                handles=handles,
+                title=lt,
+                loc="center left",
+                bbox_to_anchor=(1.02, 0.5),
+                borderaxespad=0.0,
+                frameon=False,
+            )
+
+        fname = f"{file_prefix}{filename_suffix}.png"
+        outpath = output_dir / fname
+        fig.tight_layout()
+        fig.savefig(outpath, dpi=300)
+        if show_plots:
+            plt.show()
+        else:
+            plt.close(fig)
+
+        print(f"[PLOT] Saved zoomed Late Pre vs Post scatter figure: {outpath}")
+
+    # ------------------------------------------------------------------
+    # 7. Line plots vs group
     # ------------------------------------------------------------------
     legend_title_override = legend_title  # usually "Animal ID" or metadata_color_col
+
+    # --- Text labels for filters ---
+    threshold_text_mean = None
+    if have_pre_mean and have_pre_var:
+        threshold_text_mean = f"Post mean > Pre mean + {mean_sd_k:.2g}×SD"
+    elif have_pre_mean:
+        threshold_text_mean = "Post mean > Pre mean"
+
+    threshold_text_median = None
+    if have_pre_median and have_pre_median_iqr:
+        threshold_text_median = f"Post median > Pre median + {median_iqr_k:.2g}×IQR"
+    elif have_pre_median:
+        threshold_text_median = "Post median > Pre median"
+
+    threshold_text_var = None
+    if have_pre_var and have_pre_var_iqr:
+        threshold_text_var = f"Post variance > Pre variance + {variance_iqr_k:.2g}×IQR"
+    elif have_pre_var:
+        threshold_text_var = "Post variance > Pre variance"
+
+    nphr_text = None
+    if have_nphrases_filter:
+        nphr_text = f"N_phrases ≥ {min_phrases}"
 
     # 7.1 Mean (all syllables)
     _plot_metric_lines(
@@ -715,16 +946,10 @@ def plot_compiled_phrase_stats_by_syllable(
         legend_title_override=legend_title_override,
     )
 
-    # 7.2 Mean (filtered: Post mean > Pre mean + k·SD)
-    threshold_text_mean = None
-    if have_pre_mean and have_pre_var:
-        threshold_text_mean = f"Post mean > Pre mean + {mean_sd_k:.2g}×SD"
-    elif have_pre_mean:
-        threshold_text_mean = "Post mean > Pre mean"
-
+    # 7.2 Mean (threshold-filtered: Post mean > Pre mean + k·SD)
     _plot_metric_lines(
         df,
-        title="Filtered syllables: mean phrase duration by group",
+        title="Threshold-filtered syllables: mean phrase duration by group",
         filename_suffix="_mean_filtered_post_gt_pre",
         y_col=mean_col,
         yerr_col=sem_col if have_sem else None,
@@ -734,7 +959,21 @@ def plot_compiled_phrase_stats_by_syllable(
         threshold_text=threshold_text_mean,
     )
 
-    # 7.3 Median (all syllables)
+    # 7.3 Mean (N_phrases-filtered only)
+    if have_nphrases_filter:
+        _plot_metric_lines(
+            df,
+            title="N_phrases-filtered syllables: mean phrase duration by group",
+            filename_suffix="_mean_filtered_by_nphrases",
+            y_col=mean_col,
+            yerr_col=sem_col if have_sem else None,
+            y_label="Phrase duration mean (ms)",
+            filter_keys=keys_min_phrases,
+            legend_title_override=legend_title_override,
+            threshold_text=nphr_text,
+        )
+
+    # 7.4 Median (all syllables)
     _plot_metric_lines(
         df,
         title="All syllables: median phrase duration by group",
@@ -746,16 +985,10 @@ def plot_compiled_phrase_stats_by_syllable(
         legend_title_override=legend_title_override,
     )
 
-    # 7.4 Median (filtered)
-    threshold_text_median = None
-    if have_pre_median and have_pre_median_iqr:
-        threshold_text_median = f"Post median > Pre median + {median_iqr_k:.2g}×IQR"
-    elif have_pre_median:
-        threshold_text_median = "Post median > Pre median"
-
+    # 7.5 Median (threshold-filtered)
     _plot_metric_lines(
         df,
-        title="Filtered syllables: median phrase duration by group",
+        title="Threshold-filtered syllables: median phrase duration by group",
         filename_suffix="_median_filtered_post_gt_pre",
         y_col=median_col,
         yerr_col=None,
@@ -765,7 +998,21 @@ def plot_compiled_phrase_stats_by_syllable(
         threshold_text=threshold_text_median,
     )
 
-    # 7.5 Variance (all syllables)
+    # 7.6 Median (N_phrases-filtered only)
+    if have_nphrases_filter:
+        _plot_metric_lines(
+            df,
+            title="N_phrases-filtered syllables: median phrase duration by group",
+            filename_suffix="_median_filtered_by_nphrases",
+            y_col=median_col,
+            yerr_col=None,
+            y_label="Phrase duration median (ms)",
+            filter_keys=keys_min_phrases,
+            legend_title_override=legend_title_override,
+            threshold_text=nphr_text,
+        )
+
+    # 7.7 Variance (all syllables)
     _plot_metric_lines(
         df,
         title="All syllables: variance of phrase duration by group",
@@ -777,16 +1024,10 @@ def plot_compiled_phrase_stats_by_syllable(
         legend_title_override=legend_title_override,
     )
 
-    # 7.6 Variance (filtered)
-    threshold_text_var = None
-    if have_pre_var and have_pre_var_iqr:
-        threshold_text_var = f"Post variance > Pre variance + {variance_iqr_k:.2g}×IQR"
-    elif have_pre_var:
-        threshold_text_var = "Post variance > Pre variance"
-
+    # 7.8 Variance (threshold-filtered)
     _plot_metric_lines(
         df,
-        title="Filtered syllables: variance of phrase duration by group",
+        title="Threshold-filtered syllables: variance of phrase duration by group",
         filename_suffix="_variance_filtered_post_gt_pre",
         y_col=var_col,
         yerr_col=None,
@@ -796,14 +1037,41 @@ def plot_compiled_phrase_stats_by_syllable(
         threshold_text=threshold_text_var,
     )
 
+    # 7.9 Variance (N_phrases-filtered only)
+    if have_nphrases_filter:
+        _plot_metric_lines(
+            df,
+            title="N_phrases-filtered syllables: variance of phrase duration by group",
+            filename_suffix="_variance_filtered_by_nphrases",
+            y_col=var_col,
+            yerr_col=None,
+            y_label="Phrase duration variance (ms$^2$)",
+            filter_keys=keys_min_phrases,
+            legend_title_override=legend_title_override,
+            threshold_text=nphr_text,
+        )
+
     # ------------------------------------------------------------------
-    # 8. Late Pre vs Post scatter plots (filtered syllables)
+    # 8. Late Pre vs Post scatter plots (all syllables + threshold + N_phrases)
     # ------------------------------------------------------------------
-    # 8.1 Mean
+    # 8.1 Mean – all syllables
     _plot_latepre_vs_post_scatter(
         df,
-        title="Filtered syllables: Late Pre vs Post mean phrase duration",
-        filename_suffix="_mean_LatePre_vs_Post_scatter",
+        title="All syllables: Late Pre vs Post mean phrase duration",
+        filename_suffix="_mean_LatePre_vs_Post_scatter_all",
+        metric_col=mean_col,
+        x_label="Late Pre mean (ms)",
+        y_label="Post lesion mean (ms)",
+        filter_keys=None,
+        legend_title_override=legend_title_override,
+        threshold_text=None,
+    )
+
+    # 8.2 Mean – threshold-filtered syllables
+    _plot_latepre_vs_post_scatter(
+        df,
+        title="Threshold-filtered syllables: Late Pre vs Post mean phrase duration",
+        filename_suffix="_mean_LatePre_vs_Post_scatter_threshold",
         metric_col=mean_col,
         x_label="Late Pre mean (ms)",
         y_label="Post lesion mean (ms)",
@@ -812,11 +1080,38 @@ def plot_compiled_phrase_stats_by_syllable(
         threshold_text=threshold_text_mean,
     )
 
-    # 8.2 Median
+    # 8.3 Mean – N_phrases-filtered syllables only
+    if have_nphrases_filter:
+        _plot_latepre_vs_post_scatter(
+            df,
+            title="N_phrases-filtered syllables: Late Pre vs Post mean phrase duration",
+            filename_suffix="_mean_LatePre_vs_Post_scatter_nphrases",
+            metric_col=mean_col,
+            x_label="Late Pre mean (ms)",
+            y_label="Post lesion mean (ms)",
+            filter_keys=keys_min_phrases,
+            legend_title_override=legend_title_override,
+            threshold_text=nphr_text,
+        )
+
+    # 8.4 Median – all syllables
     _plot_latepre_vs_post_scatter(
         df,
-        title="Filtered syllables: Late Pre vs Post median phrase duration",
-        filename_suffix="_median_LatePre_vs_Post_scatter",
+        title="All syllables: Late Pre vs Post median phrase duration",
+        filename_suffix="_median_LatePre_vs_Post_scatter_all",
+        metric_col=median_col,
+        x_label="Late Pre median (ms)",
+        y_label="Post lesion median (ms)",
+        filter_keys=None,
+        legend_title_override=legend_title_override,
+        threshold_text=None,
+    )
+
+    # 8.5 Median – threshold-filtered syllables
+    _plot_latepre_vs_post_scatter(
+        df,
+        title="Threshold-filtered syllables: Late Pre vs Post median phrase duration",
+        filename_suffix="_median_LatePre_vs_Post_scatter_threshold",
         metric_col=median_col,
         x_label="Late Pre median (ms)",
         y_label="Post lesion median (ms)",
@@ -825,11 +1120,38 @@ def plot_compiled_phrase_stats_by_syllable(
         threshold_text=threshold_text_median,
     )
 
-    # 8.3 Variance
-    _plot_latepre_vs_post_scatter(
+    # 8.6 Median – N_phrases-filtered syllables only
+    if have_nphrases_filter:
+        _plot_latepre_vs_post_scatter(
+            df,
+            title="N_phrases-filtered syllables: Late Pre vs Post median phrase duration",
+            filename_suffix="_median_LatePre_vs_Post_scatter_nphrases",
+            metric_col=median_col,
+            x_label="Late Pre median (ms)",
+            y_label="Post lesion median (ms)",
+            filter_keys=keys_min_phrases,
+            legend_title_override=legend_title_override,
+            threshold_text=nphr_text,
+        )
+
+    # 8.7 Variance – all syllables (original full-range)
+    var_all_xlim, var_all_ylim = _plot_latepre_vs_post_scatter(
         df,
-        title="Filtered syllables: Late Pre vs Post variance of phrase duration",
-        filename_suffix="_variance_LatePre_vs_Post_scatter",
+        title="All syllables: Late Pre vs Post variance of phrase duration",
+        filename_suffix="_variance_LatePre_vs_Post_scatter_all",
+        metric_col=var_col,
+        x_label="Late Pre variance (ms$^2$)",
+        y_label="Post lesion variance (ms$^2$)",
+        filter_keys=None,
+        legend_title_override=legend_title_override,
+        threshold_text=None,
+    )
+
+    # 8.8 Variance – threshold-filtered syllables (original full-range)
+    var_thr_xlim, var_thr_ylim = _plot_latepre_vs_post_scatter(
+        df,
+        title="Threshold-filtered syllables: Late Pre vs Post variance of phrase duration",
+        filename_suffix="_variance_LatePre_vs_Post_scatter_threshold",
         metric_col=var_col,
         x_label="Late Pre variance (ms$^2$)",
         y_label="Post lesion variance (ms$^2$)",
@@ -838,21 +1160,82 @@ def plot_compiled_phrase_stats_by_syllable(
         threshold_text=threshold_text_var,
     )
 
+    # 8.9 Variance – N_phrases-filtered syllables (original full-range)
+    if have_nphrases_filter:
+        var_nphr_xlim, var_nphr_ylim = _plot_latepre_vs_post_scatter(
+            df,
+            title="N_phrases-filtered syllables: Late Pre vs Post variance of phrase duration",
+            filename_suffix="_variance_LatePre_vs_Post_scatter_nphrases",
+            metric_col=var_col,
+            x_label="Late Pre variance (ms$^2$)",
+            y_label="Post lesion variance (ms$^2$)",
+            filter_keys=keys_min_phrases,
+            legend_title_override=legend_title_override,
+            threshold_text=nphr_text,
+        )
+    else:
+        var_nphr_ylim = None
+
+    # 8.10 Variance – all syllables, zoomed x from 0 → 1.05×max LatePre, keep y-lims
+    _plot_latepre_vs_post_scatter_zoom_x_from_zero(
+        df,
+        title="All syllables: Late Pre vs Post variance (zoomed x)",
+        filename_suffix="_variance_LatePre_vs_Post_scatter_all_zoomx",
+        metric_col=var_col,
+        x_label="Late Pre variance (ms$^2$)",
+        y_label="Post lesion variance (ms$^2$)",
+        filter_keys=None,
+        legend_title_override=legend_title_override,
+        base_ylim=var_all_ylim,
+        threshold_text=None,
+    )
+
+    # 8.11 Variance – threshold-filtered syllables, zoomed x, keep y-lims
+    _plot_latepre_vs_post_scatter_zoom_x_from_zero(
+        df,
+        title="Threshold-filtered syllables: Late Pre vs Post variance (zoomed x)",
+        filename_suffix="_variance_LatePre_vs_Post_scatter_threshold_zoomx",
+        metric_col=var_col,
+        x_label="Late Pre variance (ms$^2$)",
+        y_label="Post lesion variance (ms$^2$)",
+        filter_keys=keys_var_filtered if keys_var_filtered else None,
+        legend_title_override=legend_title_override,
+        base_ylim=var_thr_ylim,
+        threshold_text=threshold_text_var,
+    )
+
+    # 8.12 Variance – N_phrases-filtered syllables, zoomed x, keep y-lims
+    if have_nphrases_filter and var_nphr_ylim is not None:
+        _plot_latepre_vs_post_scatter_zoom_x_from_zero(
+            df,
+            title="N_phrases-filtered syllables: Late Pre vs Post variance (zoomed x)",
+            filename_suffix="_variance_LatePre_vs_Post_scatter_nphrases_zoomx",
+            metric_col=var_col,
+            x_label="Late Pre variance (ms$^2$)",
+            y_label="Post lesion variance (ms$^2$)",
+            filter_keys=keys_min_phrases,
+            legend_title_override=legend_title_override,
+            base_ylim=var_nphr_ylim,
+            threshold_text=nphr_text,
+        )
+
     return df
 
 
 """
+Example usage (Spyder console)
+
 from pathlib import Path
 import importlib
 import phrase_and_metadata_plotting as pmp
 importlib.reload(pmp)
 
 compiled_csv = Path(
-    "/Volumes/my_own_ssd/2024_2025_Area_X_jsons_npzs/compiled_phrase_duration_stats_with_prepost_metrics.csv"
+    "/Volumes/my_own_ssd/2024_2025_Area_X_jsons_npzs/usage_balanced_phrase_duration_stats.csv"
 )
 excel_path = Path("/Volumes/my_own_ssd/2024_2025_Area_X_jsons_npzs/Area_X_lesion_metadata.xlsx")
 
-# 1) Colored by animal
+# 1) Colored by animal, with threshold-filtered AND N_phrases-filtered plots
 pmp.plot_compiled_phrase_stats_by_syllable(
     compiled_stats_path=compiled_csv,
     compiled_format="csv",
@@ -862,9 +1245,10 @@ pmp.plot_compiled_phrase_stats_by_syllable(
     output_dir=compiled_csv.parent / "phrase_duration_line_plots",
     file_prefix="AreaX_phrase_durations",
     show_plots=True,
-    mean_sd_k=1.0,
-    median_iqr_k=1.0,
-    variance_iqr_k=1.0,
+    mean_sd_k=1.0,       # Post mean > Pre mean + 1×SD
+    median_iqr_k=1.0,    # Post median > Pre median + 1×IQR
+    variance_iqr_k=1.0,  # Post var > Pre var + 1×IQR
+    min_phrases=50,      # N_phrases-filtered plots require ≥10 phrases
 )
 
 # 2) Colored by **Medial Area X hit type**
@@ -892,6 +1276,7 @@ pmp.plot_compiled_phrase_stats_by_syllable(
     mean_sd_k=1.0,
     median_iqr_k=1.0,
     variance_iqr_k=1.0,
+    min_phrases=50,
 )
 
 # 3) Colored by **Lateral Area X hit type**
@@ -919,6 +1304,7 @@ pmp.plot_compiled_phrase_stats_by_syllable(
     mean_sd_k=1.0,
     median_iqr_k=1.0,
     variance_iqr_k=1.0,
+    min_phrases=50,
 )
 
 # 4) Colored by **total injection volume** (nL)
@@ -938,5 +1324,6 @@ pmp.plot_compiled_phrase_stats_by_syllable(
     mean_sd_k=1.0,
     median_iqr_k=1.0,
     variance_iqr_k=1.0,
+    min_phrases=50,
 )
 """
