@@ -1248,7 +1248,7 @@ pmp.plot_compiled_phrase_stats_by_syllable(
     mean_sd_k=1.0,       # Post mean > Pre mean + 1×SD
     median_iqr_k=1.0,    # Post median > Pre median + 1×IQR
     variance_iqr_k=1.0,  # Post var > Pre var + 1×IQR
-    min_phrases=50,      # N_phrases-filtered plots require ≥10 phrases
+    min_phrases=10,      # N_phrases-filtered plots require ≥10 phrases
 )
 
 # 2) Colored by **Medial Area X hit type**
@@ -1276,7 +1276,7 @@ pmp.plot_compiled_phrase_stats_by_syllable(
     mean_sd_k=1.0,
     median_iqr_k=1.0,
     variance_iqr_k=1.0,
-    min_phrases=50,
+    min_phrases=10,
 )
 
 # 3) Colored by **Lateral Area X hit type**
@@ -1304,7 +1304,7 @@ pmp.plot_compiled_phrase_stats_by_syllable(
     mean_sd_k=1.0,
     median_iqr_k=1.0,
     variance_iqr_k=1.0,
-    min_phrases=50,
+    min_phrases=10,
 )
 
 # 4) Colored by **total injection volume** (nL)
@@ -1324,6 +1324,6 @@ pmp.plot_compiled_phrase_stats_by_syllable(
     mean_sd_k=1.0,
     median_iqr_k=1.0,
     variance_iqr_k=1.0,
-    min_phrases=50,
+    min_phrases=10,
 )
 """
