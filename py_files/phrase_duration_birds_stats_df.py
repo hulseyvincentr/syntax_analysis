@@ -138,37 +138,6 @@ def build_birds_phrase_duration_stats_df(
 
     These derived columns are populated on the Post rows for each
     (Animal ID, Syllable). Pre rows keep NaN / False in these columns.
-
-    Parameters
-    ----------
-    excel_path : str or Path
-        Path to the Excel metadata sheet (with Animal IDs, treatment dates, etc.).
-    json_root : str or Path
-        Root directory containing the decoded/detected JSON files for each bird.
-    sheet_name : int or str, default 0
-        Excel sheet index or name.
-    id_col : str, default "Animal ID"
-        Column in the Excel sheet that uniquely identifies each bird.
-    treatment_date_col : str, default "Treatment date"
-        Column containing the treatment (lesion) date per animal.
-    grouping_mode : {"auto_balance", "explicit"}, default "auto_balance"
-        Passed through to run_batch_phrase_duration_from_excel and ultimately
-        to run_phrase_duration_pre_vs_post_grouped.
-    early_group_size, late_group_size, post_group_size : int
-        Number of songs per group when grouping_mode="auto_balance".
-    restrict_to_labels : sequence of str/int or None
-        If not None, restrict analysis to these syllable labels.
-    y_max_ms : float or None
-        Optional upper limit for y-axis in plotting (passed through).
-    show_plots : bool, default True
-        Whether to display plots while running per-bird analysis.
-
-    Returns
-    -------
-    BirdsPhraseDurationStats
-        An object with:
-            - phrase_duration_stats_df : big concatenated & annotated DataFrame
-            - per_animal_results       : dict[animal_id, GroupedPlotsResult]
     """
     excel_path = Path(excel_path)
     json_root = Path(json_root)
@@ -197,6 +166,30 @@ def build_birds_phrase_duration_stats_df(
             continue
 
         stats = stats.copy()
+
+        # NEW: ensure N_phrases exists for compatibility with plotting
+        # phrase_and_metadata_plotting expects an N_phrases (or n_phrases)
+        # column to do the min_phrases-based filtering.
+        if "N_phrases" not in stats.columns:
+            if "n_phrases" in stats.columns:
+                stats["N_phrases"] = stats["n_phrases"]
+            elif "N" in stats.columns:
+                stats["N_phrases"] = stats["N"]
+            else:
+                # If there is a raw durations list column, count elements
+                for cand in ["Durations_ms", "durations_ms", "Durations"]:
+                    if cand in stats.columns:
+                        stats["N_phrases"] = stats[cand].apply(
+                            lambda v: len(v)
+                            if isinstance(v, (list, np.ndarray))
+                            else (len(v) if hasattr(v, "__len__") else np.nan)
+                        )
+                        break
+                # Final fallback: create column of NaN; N_phrases-based
+                # plots will just end up empty if min_phrases > 0.
+                if "N_phrases" not in stats.columns:
+                    stats["N_phrases"] = np.nan
+
         # Track which bird each row comes from
         stats[id_col] = animal_id
         frames.append(stats)
@@ -299,29 +292,21 @@ def build_birds_phrase_duration_stats_df(
         # Pooled pre mean
         pre_mean = float((n_pre * mean_pre).sum() / N_pre_total)
 
-        # Pooled pre variance (unbiased), combining within-group variance and
-        # between-group mean differences:
-        #   S = Σ[(n_i - 1)*s_i^2 + n_i*(m_i - m)^2]
-        #   s_pooled^2 = S / (N_total - 1)
+        # Pooled pre variance (unbiased)
         if N_pre_total > 1:
             S = 0.0
             for ni, mi, si2 in zip(n_pre, mean_pre, var_pre):
                 if ni <= 0:
                     continue
-                # (ni - 1)*si^2 term
                 S += max(ni - 1, 0) * float(si2)
-                # between-group contribution
                 S += float(ni) * (float(mi) - pre_mean) ** 2
             pre_var = S / (N_pre_total - 1)
         else:
-            # Only one phrase overall; degenerate variance
             pre_var = np.nan
 
         pre_std = float(np.sqrt(pre_var)) if pre_var >= 0 else np.nan
 
         # Approximate pooled pre median based on group medians and N_phrases.
-        # We only have per-group medians, so we use a weighted average of
-        # group medians as an approximation of the pooled median.
         try:
             med_pre = pre_rows["Median_ms"].astype(float).values
         except Exception:
@@ -333,13 +318,12 @@ def build_birds_phrase_duration_stats_df(
             pre_median = np.nan
 
         # Approximate pooled Pre IQR (assuming roughly normal distribution):
-        # IQR ≈ 1.349 * Std
         if not np.isnan(pre_std):
             pre_iqr = float(1.349 * pre_std)
         else:
             pre_iqr = np.nan
 
-        # NEW: IQR across Pre group medians and variances
+        # IQR across Pre group medians and variances
         med_pre_clean = med_pre[~np.isnan(med_pre)] if med_pre.size else med_pre
         var_pre_clean = var_pre[~np.isnan(var_pre)] if var_pre.size else var_pre
 

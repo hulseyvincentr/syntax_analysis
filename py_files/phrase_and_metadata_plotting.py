@@ -1231,7 +1231,7 @@ import phrase_and_metadata_plotting as pmp
 importlib.reload(pmp)
 
 compiled_csv = Path(
-    "/Volumes/my_own_ssd/2024_2025_Area_X_jsons_npzs/usage_balanced_phrase_duration_stats.csv"
+    "/Volumes/my_own_ssd/2024_2025_Area_X_jsons_npzs/compiled_phrase_duration_stats_with_prepost_metrics.csv"
 )
 excel_path = Path("/Volumes/my_own_ssd/2024_2025_Area_X_jsons_npzs/Area_X_lesion_metadata.xlsx")
 
