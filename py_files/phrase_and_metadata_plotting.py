@@ -1248,7 +1248,7 @@ pmp.plot_compiled_phrase_stats_by_syllable(
     mean_sd_k=1.0,       # Post mean > Pre mean + 1×SD
     median_iqr_k=1.0,    # Post median > Pre median + 1×IQR
     variance_iqr_k=1.0,  # Post var > Pre var + 1×IQR
-    min_phrases=50,      # N_phrases-filtered plots require ≥10 phrases
+    min_phrases=50,      # N_phrases-filtered plots require ≥50 phrases
 )
 
 # 2) Colored by **Medial Area X hit type**
@@ -1267,12 +1267,13 @@ pmp.plot_compiled_phrase_stats_by_syllable(
     metadata_color_col="Medial Area X hit type",
     category_color_map={
         "bilateral": "red",
-        "unilateral_L": "orange",
+        "large lesion Area x not visible": "darkorange",
+        "large lesion, Area X not visible": "darkorange",  # legacy spelling
+        "unilateral_L": "blue",
         "unilateral_R": "purple",
-        "sham saline injection": "green",
-        "Area X not visible in histology": "grey",
+        "sham saline injection": "black",
         "miss": "black",
-        "unknown": "blue",
+        "unknown": "yellow",
     },
     mean_sd_k=1.0,
     median_iqr_k=1.0,
@@ -1296,19 +1297,19 @@ pmp.plot_compiled_phrase_stats_by_syllable(
     metadata_color_col="Lateral Area X hit type",
     category_color_map={
         "bilateral": "red",
-        "unilateral_L": "orange",
+        "large lesion Area x not visible": "darkorange",
+        "large lesion, Area X not visible": "darkorange",  # legacy spelling
+        "unilateral_L": "blue",
         "unilateral_R": "purple",
-        "sham saline injection": "green",
-        "Area X not visible in histology": "grey",
+        "sham saline injection": "black",
         "miss": "black",
-        "unknown": "blue",
+        "unknown": "yellow",
     },
     mean_sd_k=1.0,
     median_iqr_k=1.0,
     variance_iqr_k=1.0,
     min_phrases=50,
 )
-
 
 # 4) Colored by **total injection volume** (nL)
 pmp.plot_compiled_phrase_stats_by_syllable(
