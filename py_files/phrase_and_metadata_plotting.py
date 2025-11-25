@@ -25,7 +25,8 @@ itself. You must generate a compiled phrase-duration stats file
 
   - Using `phrase_duration_balanced_syllable_usage.run_balanced_syllable_usage_from_metadata_excel`
     to produce a `usage_balanced_phrase_duration_stats.csv`, or
-  - Using your previous pipeline that builds `compiled_phrase_duration_stats_with_prepost_metrics.csv`.
+  - Using your previous pipeline that builds
+    `compiled_phrase_duration_stats_with_prepost_metrics.csv`.
 
 Then call `plot_compiled_phrase_stats_by_syllable(...)` on that compiled file.
 """
@@ -51,12 +52,22 @@ def plot_compiled_phrase_stats_by_syllable(
     output_dir: Optional[Union[str, Path]] = None,
     file_prefix: str = "phrase_duration",
     show_plots: bool = False,
-    # --- coloring style ---
+    # --- coloring style for line plots & category-based scatters ---
     color_by: str = "animal",  # "animal" or "metadata"
     metadata_excel_path: Optional[Union[str, Path]] = None,
     metadata_sheet_name: Union[int, str] = 0,
     metadata_color_col: Optional[str] = None,
     category_color_map: Optional[Dict[str, str]] = None,
+    # --- lesion percentage info (from metadata + *_final_volumes.json) ---
+    metadata_volumes_dir: Optional[Union[str, Path]] = None,
+    left_lesion_pct_col: str = "L_Percent_of_Area_X_Lesioned_pct",
+    right_lesion_pct_col: str = "R_Percent_of_Area_X_Lesioned_pct",
+    # If set to "left", "right", or "avg", then for animals whose metadata
+    # category is "bilateral", "unilateral_L", or "unilateral_R", their color
+    # is a *shade* within the usual color family (Reds / Blues / Purples)
+    # proportional to the % Area X lesioned (0–100). Sham / miss / large-lesion /
+    # unknown still use fixed colors from category_color_map.
+    lesion_color_mode: Optional[str] = None,
     # --- filtering thresholds (k·SD or k·IQR style) ---
     mean_sd_k: float = 1.0,
     median_iqr_k: float = 1.0,
@@ -73,74 +84,53 @@ def plot_compiled_phrase_stats_by_syllable(
     "balanced by song" or "balanced by syllable usage" pipeline) so that each
     row corresponds to (Animal ID, Group, Syllable).
 
-    It produces three kinds of plots for each metric (mean/median/variance):
+    For each metric (mean/median/variance), this function produces:
 
-      1) "All syllables" (no additional filtering)
-      2) "Threshold-filtered" syllables:
-           - mean:      Post mean > Pre mean + k·SD
-           - median:    Post median > Pre median + k·IQR
-           - variance:  Post variance > Pre variance + k·IQR
-      3) "N_phrases-filtered" syllables:
-           - Syllables with min(N_phrases across groups) ≥ min_phrases
+      • Line plots vs group for:
+          - All syllables
+          - Threshold-filtered syllables:
+                mean:      Post mean > Pre mean + k·SD
+                median:    Post median > Pre median + k·IQR
+                variance:  Post variance > Pre variance + k·IQR
+          - N_phrases-filtered syllables:
+                min N_phrases across groups ≥ min_phrases
 
-    For each of these, it generates:
-      - Line plots of metric vs group
-      - Late Pre vs Post scatter plots (with dashed y=x reference line)
-        + zoomed variance scatter plots.
+      • Late Pre vs Post scatter plots for:
+          - All syllables (one scatter per metric)
+          - N_phrases-filtered syllables (if min_phrases > 0 and an
+            N_phrases column is available)
 
-    Parameters
-    ----------
-    phrase_stats : pd.DataFrame or None
-        If provided, use this DataFrame directly.
-        Otherwise, load from `compiled_stats_path`.
-    compiled_stats_path : str or Path or None
-        Path to compiled stats file (CSV/JSON/NPZ).
-    compiled_format : {"csv","json","npz"} or None
-        If None, inferred from file suffix.
-    id_col, group_col, syllable_col : str
-        Column names for animal ID, group label, and syllable label.
-    mean_col, sem_col, median_col, var_col : str
-        Column names for mean / SEM / median / variance of phrase duration.
-    output_dir : str or Path or None
-        Directory where PNGs will be saved. If None, uses the directory of
-        `compiled_stats_path` or the current directory.
-    file_prefix : str
-        Prefix for all output PNG filenames.
-    show_plots : bool
-        If True, show plots interactively. Otherwise, just save and close.
-    color_by : {"animal", "metadata"}
-        If "animal", one color per animal ID.
-        If "metadata", color by `metadata_color_col` from the metadata Excel.
-    metadata_excel_path : str or Path or None
-        Excel file with Area X lesion metadata (for color_by="metadata").
-    metadata_sheet_name : int or str
-        Sheet index or name for the metadata Excel.
-    metadata_color_col : str or None
-        Column name in the metadata dict used to define categories for coloring.
-    category_color_map : dict or None
-        Optional mapping category → color (e.g. "bilateral" → "red").
-        Any categories not listed here receive automatic colors.
-    mean_sd_k, median_iqr_k, variance_iqr_k : float
-        Threshold factors for selecting "threshold-filtered" syllables using
-        Pre_* columns:
-          - mean:      Post mean > Pre mean + k·SD
-          - median:    Post median > Pre median + k·IQR
-          - variance:  Post variance > Pre variance + k·IQR
-    min_phrases : int, default 0
-        If > 0 and an N_phrases column is present, defines a *separate* set of
-        "N_phrases-filtered" plots (those with min N_phrases ≥ min_phrases).
-        This no longer globally filters the DataFrame; it only affects the
-        extra N_phrases-based plots.
-    n_phrases_col : str or None, default "N_phrases"
-        Name of the N_phrases column. If None or not found, the function will
-        also try "N_phrases" then "n_phrases". If no such column exists, the
-        N_phrases-based plots are skipped with an info message.
+      • Additional variance scatters with zoomed x-axis for:
+          - All syllables
+          - N_phrases-filtered syllables (if available)
 
-    Returns
-    -------
-    df : pd.DataFrame
-        The DataFrame actually used for plotting (unfiltered, except for
-        basic validity checks).
+    If `color_by="metadata"` and you provide both `metadata_excel_path`
+    and `metadata_color_col`, then the color legend is based on that
+    metadata category (e.g. "Medial Area X hit type", "Lateral Area X hit type",
+    "total_inj_volume", etc.), using `category_color_map` for explicit colors
+    (with auto-colors for any remaining categories).
+
+    If in addition you provide:
+
+        - `metadata_volumes_dir` (directory with *_final_volumes.json),
+        - per-animal lesion-percentage keys `left_lesion_pct_col`,
+          `right_lesion_pct_col`,
+        - and set `lesion_color_mode` to "left", "right", or "avg",
+
+    then for the categories "bilateral", "unilateral_L", and "unilateral_R",
+    the color for each animal is modulated by the % Area X lesioned
+    (in that hemisphere or the average of both), using:
+
+        bilateral     → Reds colormap
+        unilateral_L  → Blues colormap
+        unilateral_R  → Purples colormap
+
+    while the other categories (e.g. sham saline injection, miss,
+    large lesion Area X not visible, unknown) keep their fixed colors
+    from `category_color_map`.
+
+    On runs where `lesion_color_mode` is active, plot titles include the
+    note: "bilateral/unilateral colored by % lesion".
     """
     # ------------------------------------------------------------------
     # 0. Load / validate DataFrame
@@ -242,9 +232,25 @@ def plot_compiled_phrase_stats_by_syllable(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
-    # 2. Build color / category maps
+    # 2. Build metadata dict (for categories and lesion percentages)
     # ------------------------------------------------------------------
     animal_ids = sorted(df[id_col].dropna().unique().tolist())
+
+    meta_dict: Optional[Dict[str, Dict[str, Any]]] = None
+    if metadata_excel_path is not None and build_areax_metadata is not None:
+        try:
+            # Newer signature with volumes_dir
+            meta_dict = build_areax_metadata(
+                metadata_excel_path,
+                sheet_name=metadata_sheet_name,
+                volumes_dir=metadata_volumes_dir,
+            )
+        except TypeError:
+            # Fallback to older signature if volumes_dir is not accepted
+            meta_dict = build_areax_metadata(
+                metadata_excel_path,
+                sheet_name=metadata_sheet_name,
+            )
 
     # Default legend title
     legend_title = "Animal ID"
@@ -255,6 +261,49 @@ def plot_compiled_phrase_stats_by_syllable(
     # category_to_color maps category → color
     category_to_color: Dict[str, str] = {}
 
+    # ------------------------------------------------------------------
+    # 2a. Lesion-percentage maps (used only if lesion_color_mode is set)
+    # ------------------------------------------------------------------
+    id_to_left_pct: Dict[str, float] = {}
+    id_to_right_pct: Dict[str, float] = {}
+    id_to_avg_pct: Dict[str, float] = {}
+    have_lesion_pct = False
+
+    if meta_dict is not None:
+        for a in animal_ids:
+            a_str = str(a)
+            entry = meta_dict.get(a_str, {})
+
+            def _to_float(x: Any) -> float:
+                try:
+                    return float(x)
+                except Exception:
+                    return float("nan")
+
+            l_raw = entry.get(left_lesion_pct_col, None)
+            r_raw = entry.get(right_lesion_pct_col, None)
+            l = _to_float(l_raw)
+            r = _to_float(r_raw)
+
+            if np.isfinite(l) and np.isfinite(r):
+                avg = 0.5 * (l + r)
+            elif np.isfinite(l):
+                avg = l
+            elif np.isfinite(r):
+                avg = r
+            else:
+                avg = float("nan")
+
+            if np.isfinite(l) or np.isfinite(r):
+                have_lesion_pct = True
+
+            id_to_left_pct[a_str] = l
+            id_to_right_pct[a_str] = r
+            id_to_avg_pct[a_str] = avg
+
+    # ------------------------------------------------------------------
+    # 2b. Build category / color mapping (animal-based or metadata-based)
+    # ------------------------------------------------------------------
     if color_by.lower() == "metadata" and build_areax_metadata is None:
         print(
             "[WARN] color_by='metadata' requested, but "
@@ -273,13 +322,13 @@ def plot_compiled_phrase_stats_by_syllable(
             category_to_color[category] = cmap(idx % cmap.N)
 
     elif color_by.lower() == "metadata":
-        if metadata_excel_path is None or metadata_color_col is None:
+        if meta_dict is None or metadata_color_col is None:
             print(
-                "[WARN] color_by='metadata' requested but "
-                "`metadata_excel_path` or `metadata_color_col` not provided. "
-                "Falling back to color_by='animal'."
+                "[WARN] color_by='metadata' requested but metadata not available "
+                "or `metadata_color_col` not provided. Falling back to color_by='animal'."
             )
             color_by = "animal"
+            # Recurse with animal coloring and same other arguments
             return plot_compiled_phrase_stats_by_syllable(
                 df,
                 compiled_stats_path=None,
@@ -295,6 +344,14 @@ def plot_compiled_phrase_stats_by_syllable(
                 file_prefix=file_prefix,
                 show_plots=show_plots,
                 color_by="animal",
+                metadata_excel_path=metadata_excel_path,
+                metadata_sheet_name=metadata_sheet_name,
+                metadata_color_col=None,
+                category_color_map=category_color_map,
+                metadata_volumes_dir=metadata_volumes_dir,
+                left_lesion_pct_col=left_lesion_pct_col,
+                right_lesion_pct_col=right_lesion_pct_col,
+                lesion_color_mode=lesion_color_mode,
                 mean_sd_k=mean_sd_k,
                 median_iqr_k=median_iqr_k,
                 variance_iqr_k=variance_iqr_k,
@@ -302,15 +359,12 @@ def plot_compiled_phrase_stats_by_syllable(
                 n_phrases_col=n_phrases_col,
             )
 
-        # Use Area X metadata to get e.g. "Medial Area X hit type" / "Lateral ..."
-        meta_dict = build_areax_metadata(metadata_excel_path, sheet_name=metadata_sheet_name)
-
         # Map each animal to the requested metadata category
         categories = set()
         for a in animal_ids:
             a_str = str(a)
-            entry: Dict[str, Any] = meta_dict.get(a_str, {})
-            cat_val = entry.get(metadata_color_col, "unknown")
+            entry2: Dict[str, Any] = meta_dict.get(a_str, {})
+            cat_val = entry2.get(metadata_color_col, "unknown")
             if cat_val is None or str(cat_val).strip() == "":
                 cat_val = "unknown"
             cat_str = str(cat_val)
@@ -331,7 +385,7 @@ def plot_compiled_phrase_stats_by_syllable(
             if cat not in category_to_color:
                 category_to_color[cat] = cmap(idx % cmap.N)
 
-        # Ensure "miss" / "unknown" have sensible defaults
+        # Ensure some sensible defaults
         if "miss" in categories and "miss" not in category_to_color:
             category_to_color["miss"] = "black"
         if "unknown" in categories and "unknown" not in category_to_color:
@@ -339,6 +393,71 @@ def plot_compiled_phrase_stats_by_syllable(
 
     else:
         raise ValueError(f"Unsupported color_by={color_by!r}. Use 'animal' or 'metadata'.")
+
+    # ------------------------------------------------------------------
+    # 2c. Helper to pick the actual color for each animal
+    # ------------------------------------------------------------------
+    lesion_color_mode = (
+        lesion_color_mode.lower()
+        if isinstance(lesion_color_mode, str)
+        else None
+    )
+    if lesion_color_mode not in {None, "left", "right", "avg"}:
+        print(
+            f"[WARN] lesion_color_mode={lesion_color_mode!r} not in "
+            "{None, 'left', 'right', 'avg'}; ignoring."
+        )
+        lesion_color_mode = None
+
+    # Note that should appear on titles when lesion-based shading is active
+    lesion_color_note: Optional[str] = None
+    if lesion_color_mode is not None:
+        lesion_color_note = "bilateral/unilateral colored by % lesion"
+
+    # Colormaps for bilateral / unilateral_L / unilateral_R
+    lesion_cmaps = {
+        "bilateral": plt.get_cmap("Reds"),
+        "unilateral_L": plt.get_cmap("Blues"),
+        "unilateral_R": plt.get_cmap("Purples"),
+    }
+    lesion_categories = set(lesion_cmaps.keys())
+
+    def _get_animal_color(a_str: str, a_cat: str) -> Any:
+        """
+        Base color from category_to_color, possibly modulated by lesion %
+        for bilateral / unilateral_L / unilateral_R if lesion_color_mode
+        is set and we have usable lesion data.
+        """
+        base_col = category_to_color.get(a_cat, "black")
+
+        if (
+            lesion_color_mode is None
+            or not have_lesion_pct
+            or a_cat not in lesion_categories
+        ):
+            return base_col
+
+        if lesion_color_mode == "left":
+            val = id_to_left_pct.get(a_str, float("nan"))
+        elif lesion_color_mode == "right":
+            val = id_to_right_pct.get(a_str, float("nan"))
+        elif lesion_color_mode == "avg":
+            val = id_to_avg_pct.get(a_str, float("nan"))
+        else:
+            return base_col
+
+        if not np.isfinite(val):
+            return base_col
+
+        # Assume val is in percent 0–100; map to [0.2, 0.9] within the colormap
+        v_norm = np.clip(val / 100.0, 0.0, 1.0)
+        v_norm = 0.2 + 0.7 * v_norm
+
+        cmap2 = lesion_cmaps.get(a_cat)
+        if cmap2 is None:
+            return base_col
+
+        return cmap2(v_norm)
 
     # ------------------------------------------------------------------
     # 3. Helper to pretty up axes
@@ -464,6 +583,19 @@ def plot_compiled_phrase_stats_by_syllable(
     # ------------------------------------------------------------------
     # 5. Core line-plot helper (group vs metric)
     # ------------------------------------------------------------------
+    def _build_full_title(base: str,
+                          threshold_text: Optional[str],
+                          lesion_note: Optional[str]) -> str:
+        """Combine base title, threshold text, and lesion-color note."""
+        parts = []
+        if threshold_text:
+            parts.append(threshold_text)
+        if lesion_note:
+            parts.append(lesion_note)
+        if parts:
+            return f"{base}\n(" + "; ".join(parts) + ")"
+        return base
+
     def _plot_metric_lines(
         df_src: pd.DataFrame,
         *,
@@ -506,7 +638,7 @@ def plot_compiled_phrase_stats_by_syllable(
         for animal in sorted(df_plot[id_col].unique()):
             a_str = str(animal)
             a_cat = id_to_category.get(a_str, a_str)
-            color = category_to_color.get(a_cat, "black")
+            color = _get_animal_color(a_str, a_cat)
             cats_present.add(a_cat)
 
             sdf = df_plot[df_plot[id_col] == animal]
@@ -555,19 +687,19 @@ def plot_compiled_phrase_stats_by_syllable(
         ax.set_xticklabels(group_order)
         ax.set_ylabel(y_label)
 
-        # Title, optionally with threshold text appended
-        full_title = title
-        if threshold_text:
-            full_title = f"{title}\n({threshold_text})"
+        # Title, optionally with threshold text and lesion-color note
+        full_title = _build_full_title(title, threshold_text, lesion_color_note)
         ax.set_title(full_title)
 
         _pretty_axes(ax)
 
-        # Build a clean legend with one entry per category
+        # Build a clean legend with one entry per *category*.
+        # (Note: with lesion-based shading, the legend still shows the base
+        # family color for that category.)
         legend_cats = sorted(cats_present)
         legend_handles = [
-            mlines.Line2D([], [], color=category_to_color.get(cat, "black"), marker="o",
-                          linestyle="-", label=cat)
+            mlines.Line2D([], [], color=category_to_color.get(cat, "black"),
+                          marker="o", linestyle="-", label=cat)
             for cat in legend_cats
         ]
 
@@ -594,7 +726,7 @@ def plot_compiled_phrase_stats_by_syllable(
         print(f"[PLOT] Saved figure: {outpath}")
 
     # ------------------------------------------------------------------
-    # 6. Late Pre vs Post scatter helper with y=x line
+    # 6. Late Pre vs Post scatter helper with y=x line (category colors)
     # ------------------------------------------------------------------
     def _plot_latepre_vs_post_scatter(
         df_src: pd.DataFrame,
@@ -657,7 +789,7 @@ def plot_compiled_phrase_stats_by_syllable(
         for animal in sorted(merged[id_col].unique()):
             a_str = str(animal)
             a_cat = id_to_category.get(a_str, a_str)
-            color = category_to_color.get(a_cat, "black")
+            color = _get_animal_color(a_str, a_cat)
             cats_present.add(a_cat)
 
             sub = merged[merged[id_col] == animal]
@@ -676,10 +808,8 @@ def plot_compiled_phrase_stats_by_syllable(
         ax.set_xlabel(x_label)
         ax.set_ylabel(y_label)
 
-        # Title + optional threshold text
-        full_title = title
-        if threshold_text:
-            full_title = f"{title}\n({threshold_text})"
+        # Title + optional threshold text + lesion-color note
+        full_title = _build_full_title(title, threshold_text, lesion_color_note)
         ax.set_title(full_title)
 
         # y = x dashed red line
@@ -811,7 +941,7 @@ def plot_compiled_phrase_stats_by_syllable(
         for animal in sorted(merged[id_col].unique()):
             a_str = str(animal)
             a_cat = id_to_category.get(a_str, a_str)
-            color = category_to_color.get(a_cat, "black")
+            color = _get_animal_color(a_str, a_cat)
             cats_present.add(a_cat)
 
             sub = merged[merged[id_col] == animal]
@@ -830,9 +960,7 @@ def plot_compiled_phrase_stats_by_syllable(
         ax.set_xlabel(x_label)
         ax.set_ylabel(y_label)
 
-        full_title = title
-        if threshold_text:
-            full_title = f"{title}\n({threshold_text})"
+        full_title = _build_full_title(title, threshold_text, lesion_color_note)
         ax.set_title(full_title)
 
         # ranges
@@ -1052,7 +1180,9 @@ def plot_compiled_phrase_stats_by_syllable(
         )
 
     # ------------------------------------------------------------------
-    # 8. Late Pre vs Post scatter plots (all syllables + threshold + N_phrases)
+    # 8. Late Pre vs Post scatter plots
+    #    - All syllables (one scatter per metric)
+    #    - N_phrases-filtered syllables (if available)
     # ------------------------------------------------------------------
     # 8.1 Mean – all syllables
     _plot_latepre_vs_post_scatter(
@@ -1067,20 +1197,7 @@ def plot_compiled_phrase_stats_by_syllable(
         threshold_text=None,
     )
 
-    # 8.2 Mean – threshold-filtered syllables
-    _plot_latepre_vs_post_scatter(
-        df,
-        title="Threshold-filtered syllables: Late Pre vs Post mean phrase duration",
-        filename_suffix="_mean_LatePre_vs_Post_scatter_threshold",
-        metric_col=mean_col,
-        x_label="Late Pre mean (ms)",
-        y_label="Post lesion mean (ms)",
-        filter_keys=keys_mean_filtered if keys_mean_filtered else None,
-        legend_title_override=legend_title_override,
-        threshold_text=threshold_text_mean,
-    )
-
-    # 8.3 Mean – N_phrases-filtered syllables only
+    # 8.2 Mean – N_phrases-filtered syllables only
     if have_nphrases_filter:
         _plot_latepre_vs_post_scatter(
             df,
@@ -1094,7 +1211,7 @@ def plot_compiled_phrase_stats_by_syllable(
             threshold_text=nphr_text,
         )
 
-    # 8.4 Median – all syllables
+    # 8.3 Median – all syllables
     _plot_latepre_vs_post_scatter(
         df,
         title="All syllables: Late Pre vs Post median phrase duration",
@@ -1107,20 +1224,7 @@ def plot_compiled_phrase_stats_by_syllable(
         threshold_text=None,
     )
 
-    # 8.5 Median – threshold-filtered syllables
-    _plot_latepre_vs_post_scatter(
-        df,
-        title="Threshold-filtered syllables: Late Pre vs Post median phrase duration",
-        filename_suffix="_median_LatePre_vs_Post_scatter_threshold",
-        metric_col=median_col,
-        x_label="Late Pre median (ms)",
-        y_label="Post lesion median (ms)",
-        filter_keys=keys_median_filtered if keys_median_filtered else None,
-        legend_title_override=legend_title_override,
-        threshold_text=threshold_text_median,
-    )
-
-    # 8.6 Median – N_phrases-filtered syllables only
+    # 8.4 Median – N_phrases-filtered syllables only
     if have_nphrases_filter:
         _plot_latepre_vs_post_scatter(
             df,
@@ -1134,8 +1238,8 @@ def plot_compiled_phrase_stats_by_syllable(
             threshold_text=nphr_text,
         )
 
-    # 8.7 Variance – all syllables (original full-range)
-    var_all_xlim, var_all_ylim = _plot_latepre_vs_post_scatter(
+    # 8.5 Variance – all syllables (original full-range)
+    _, var_all_ylim = _plot_latepre_vs_post_scatter(
         df,
         title="All syllables: Late Pre vs Post variance of phrase duration",
         filename_suffix="_variance_LatePre_vs_Post_scatter_all",
@@ -1147,22 +1251,10 @@ def plot_compiled_phrase_stats_by_syllable(
         threshold_text=None,
     )
 
-    # 8.8 Variance – threshold-filtered syllables (original full-range)
-    var_thr_xlim, var_thr_ylim = _plot_latepre_vs_post_scatter(
-        df,
-        title="Threshold-filtered syllables: Late Pre vs Post variance of phrase duration",
-        filename_suffix="_variance_LatePre_vs_Post_scatter_threshold",
-        metric_col=var_col,
-        x_label="Late Pre variance (ms$^2$)",
-        y_label="Post lesion variance (ms$^2$)",
-        filter_keys=keys_var_filtered if keys_var_filtered else None,
-        legend_title_override=legend_title_override,
-        threshold_text=threshold_text_var,
-    )
-
-    # 8.9 Variance – N_phrases-filtered syllables (original full-range)
+    # 8.6 Variance – N_phrases-filtered syllables (original full-range)
+    var_nphr_ylim = None
     if have_nphrases_filter:
-        var_nphr_xlim, var_nphr_ylim = _plot_latepre_vs_post_scatter(
+        _, var_nphr_ylim = _plot_latepre_vs_post_scatter(
             df,
             title="N_phrases-filtered syllables: Late Pre vs Post variance of phrase duration",
             filename_suffix="_variance_LatePre_vs_Post_scatter_nphrases",
@@ -1173,10 +1265,8 @@ def plot_compiled_phrase_stats_by_syllable(
             legend_title_override=legend_title_override,
             threshold_text=nphr_text,
         )
-    else:
-        var_nphr_ylim = None
 
-    # 8.10 Variance – all syllables, zoomed x from 0 → 1.05×max LatePre, keep y-lims
+    # 8.7 Variance – all syllables, zoomed x from 0 → 1.05×max LatePre, keep y-lims
     _plot_latepre_vs_post_scatter_zoom_x_from_zero(
         df,
         title="All syllables: Late Pre vs Post variance (zoomed x)",
@@ -1190,21 +1280,7 @@ def plot_compiled_phrase_stats_by_syllable(
         threshold_text=None,
     )
 
-    # 8.11 Variance – threshold-filtered syllables, zoomed x, keep y-lims
-    _plot_latepre_vs_post_scatter_zoom_x_from_zero(
-        df,
-        title="Threshold-filtered syllables: Late Pre vs Post variance (zoomed x)",
-        filename_suffix="_variance_LatePre_vs_Post_scatter_threshold_zoomx",
-        metric_col=var_col,
-        x_label="Late Pre variance (ms$^2$)",
-        y_label="Post lesion variance (ms$^2$)",
-        filter_keys=keys_var_filtered if keys_var_filtered else None,
-        legend_title_override=legend_title_override,
-        base_ylim=var_thr_ylim,
-        threshold_text=threshold_text_var,
-    )
-
-    # 8.12 Variance – N_phrases-filtered syllables, zoomed x, keep y-lims
+    # 8.8 Variance – N_phrases-filtered syllables, zoomed x, keep y-lims
     if have_nphrases_filter and var_nphr_ylim is not None:
         _plot_latepre_vs_post_scatter_zoom_x_from_zero(
             df,
@@ -1231,11 +1307,14 @@ import phrase_and_metadata_plotting as pmp
 importlib.reload(pmp)
 
 compiled_csv = Path(
-    "/Volumes/my_own_ssd/2024_2025_Area_X_jsons_npzs/compiled_phrase_duration_stats_with_prepost_metrics.csv"
+    "/Volumes/my_own_ssd/2024_2025_Area_X_analysis/compiled_phrase_duration_stats_with_prepost_metrics.csv"
 )
-excel_path = Path("/Volumes/my_own_ssd/2024_2025_Area_X_jsons_npzs/Area_X_lesion_metadata.xlsx")
+excel_path = Path("/Volumes/my_own_ssd/2024_2025_Area_X_analysis/Area_X_lesion_metadata.xlsx")
+histology_volumes_dir = Path(
+    "/Volumes/my_own_ssd/2024_2025_Area_X_analysis/lesion_quantification_csvs_jsons"
+)
 
-# 1) Colored by animal, with threshold-filtered AND N_phrases-filtered plots
+# 1) Colored by animal
 pmp.plot_compiled_phrase_stats_by_syllable(
     compiled_stats_path=compiled_csv,
     compiled_format="csv",
@@ -1245,13 +1324,13 @@ pmp.plot_compiled_phrase_stats_by_syllable(
     output_dir=compiled_csv.parent / "phrase_duration_line_plots",
     file_prefix="AreaX_phrase_durations",
     show_plots=True,
-    mean_sd_k=1.0,       # Post mean > Pre mean + 1×SD
-    median_iqr_k=1.0,    # Post median > Pre median + 1×IQR
-    variance_iqr_k=1.0,  # Post var > Pre var + 1×IQR
-    min_phrases=50,      # N_phrases-filtered plots require ≥50 phrases
+    mean_sd_k=1.0,
+    median_iqr_k=1.0,
+    variance_iqr_k=1.0,
+    min_phrases=50,
 )
 
-# 2) Colored by **Medial Area X hit type**
+# 2) Colored by **Medial Area X hit type** (categorical only)
 pmp.plot_compiled_phrase_stats_by_syllable(
     compiled_stats_path=compiled_csv,
     compiled_format="csv",
@@ -1265,10 +1344,11 @@ pmp.plot_compiled_phrase_stats_by_syllable(
     metadata_excel_path=excel_path,
     metadata_sheet_name=0,
     metadata_color_col="Medial Area X hit type",
+    metadata_volumes_dir=histology_volumes_dir,
     category_color_map={
         "bilateral": "red",
         "large lesion Area x not visible": "darkorange",
-        "large lesion, Area X not visible": "darkorange",  # legacy spelling
+        "large lesion, Area X not visible": "darkorange",
         "unilateral_L": "blue",
         "unilateral_R": "purple",
         "sham saline injection": "black",
@@ -1281,7 +1361,7 @@ pmp.plot_compiled_phrase_stats_by_syllable(
     min_phrases=50,
 )
 
-# 3) Colored by **Lateral Area X hit type**
+# 3) Colored by **Lateral Area X hit type** (categorical only)
 pmp.plot_compiled_phrase_stats_by_syllable(
     compiled_stats_path=compiled_csv,
     compiled_format="csv",
@@ -1295,10 +1375,11 @@ pmp.plot_compiled_phrase_stats_by_syllable(
     metadata_excel_path=excel_path,
     metadata_sheet_name=0,
     metadata_color_col="Lateral Area X hit type",
+    metadata_volumes_dir=histology_volumes_dir,
     category_color_map={
         "bilateral": "red",
         "large lesion Area x not visible": "darkorange",
-        "large lesion, Area X not visible": "darkorange",  # legacy spelling
+        "large lesion, Area X not visible": "darkorange",
         "unilateral_L": "blue",
         "unilateral_R": "purple",
         "sham saline injection": "black",
@@ -1311,7 +1392,7 @@ pmp.plot_compiled_phrase_stats_by_syllable(
     min_phrases=50,
 )
 
-# 4) Colored by **total injection volume** (nL)
+# 4) Colored by **total injection volume** (nL) as a metadata category
 pmp.plot_compiled_phrase_stats_by_syllable(
     compiled_stats_path=compiled_csv,
     compiled_format="csv",
@@ -1325,6 +1406,108 @@ pmp.plot_compiled_phrase_stats_by_syllable(
     metadata_excel_path=excel_path,
     metadata_sheet_name=0,
     metadata_color_col="total_inj_volume",
+    metadata_volumes_dir=histology_volumes_dir,
+    mean_sd_k=1.0,
+    median_iqr_k=1.0,
+    variance_iqr_k=1.0,
+    min_phrases=50,
+)
+
+# 5) SECOND SET, Medial hit-type plots:
+#    bilateral / unilateral_L / unilateral_R shaded by **left hemisphere % lesion**.
+#    Titles will include "(bilateral/unilateral colored by % lesion)".
+pmp.plot_compiled_phrase_stats_by_syllable(
+    compiled_stats_path=compiled_csv,
+    compiled_format="csv",
+    id_col="Animal ID",
+    group_col="Group",
+    syllable_col="Syllable",
+    output_dir=compiled_csv.parent / "phrase_duration_line_plots_Medial_Lpct",
+    file_prefix="AreaX_phrase_durations_medial_shaded_by_L_pct",
+    show_plots=True,
+    color_by="metadata",
+    metadata_excel_path=excel_path,
+    metadata_sheet_name=0,
+    metadata_color_col="Medial Area X hit type",
+    metadata_volumes_dir=histology_volumes_dir,
+    lesion_color_mode="left",  # use left hemisphere lesion % for shading
+    category_color_map={
+        "bilateral": "red",     # base family color
+        "large lesion Area x not visible": "darkorange",
+        "large lesion, Area X not visible": "darkorange",
+        "unilateral_L": "blue",
+        "unilateral_R": "purple",
+        "sham saline injection": "black",
+        "miss": "black",
+        "unknown": "yellow",
+    },
+    mean_sd_k=1.0,
+    median_iqr_k=1.0,
+    variance_iqr_k=1.0,
+    min_phrases=50,
+)
+
+# 6) SECOND SET, Lateral hit-type plots:
+#    bilateral / unilateral_L / unilateral_R shaded by **right hemisphere % lesion**.
+#    Titles will include "(bilateral/unilateral colored by % lesion)".
+pmp.plot_compiled_phrase_stats_by_syllable(
+    compiled_stats_path=compiled_csv,
+    compiled_format="csv",
+    id_col="Animal ID",
+    group_col="Group",
+    syllable_col="Syllable",
+    output_dir=compiled_csv.parent / "phrase_duration_line_plots_Lateral_Rpct",
+    file_prefix="AreaX_phrase_durations_lateral_shaded_by_R_pct",
+    show_plots=True,
+    color_by="metadata",
+    metadata_excel_path=excel_path,
+    metadata_sheet_name=0,
+    metadata_color_col="Lateral Area X hit type",
+    metadata_volumes_dir=histology_volumes_dir,
+    lesion_color_mode="right",  # use right hemisphere lesion % for shading
+    category_color_map={
+        "bilateral": "red",
+        "large lesion Area x not visible": "darkorange",
+        "large lesion, Area X not visible": "darkorange",
+        "unilateral_L": "blue",
+        "unilateral_R": "purple",
+        "sham saline injection": "black",
+        "miss": "black",
+        "unknown": "yellow",
+    },
+    mean_sd_k=1.0,
+    median_iqr_k=1.0,
+    variance_iqr_k=1.0,
+    min_phrases=50,
+)
+
+# 7) OPTIONAL: Medial plots shaded by **average % lesion** (L/R avg).
+#    Titles will include "(bilateral/unilateral colored by % lesion)".
+pmp.plot_compiled_phrase_stats_by_syllable(
+    compiled_stats_path=compiled_csv,
+    compiled_format="csv",
+    id_col="Animal ID",
+    group_col="Group",
+    syllable_col="Syllable",
+    output_dir=compiled_csv.parent / "phrase_duration_line_plots_Medial_avgPct",
+    file_prefix="AreaX_phrase_durations_medial_shaded_by_avg_pct",
+    show_plots=True,
+    color_by="metadata",
+    metadata_excel_path=excel_path,
+    metadata_sheet_name=0,
+    metadata_color_col="Medial Area X hit type",
+    metadata_volumes_dir=histology_volumes_dir,
+    lesion_color_mode="avg",  # use average(L,R) lesion % for shading
+    category_color_map={
+        "bilateral": "red",
+        "large lesion Area x not visible": "darkorange",
+        "large lesion, Area X not visible": "darkorange",
+        "unilateral_L": "blue",
+        "unilateral_R": "purple",
+        "sham saline injection": "black",
+        "miss": "black",
+        "unknown": "yellow",
+    },
     mean_sd_k=1.0,
     median_iqr_k=1.0,
     variance_iqr_k=1.0,
