@@ -11,9 +11,12 @@ import numpy as np
 import pandas as pd
 
 from phrase_duration_pre_vs_post_grouped import (
-    run_batch_phrase_duration_from_excel,
+    run_phrase_duration_pre_vs_post_grouped,
     GroupedPlotsResult,
 )
+
+import merge_annotations_from_split_songs as mps
+
 
 __all__ = [
     "BirdsPhraseDurationStats",
@@ -65,20 +68,9 @@ class BirdsPhraseDurationStats:
             "Post_Mean_Above_Pre_Mean_Plus_1SD"
             "Post_Mean_Above_Pre_Mean_Plus_2SD"
 
-        Notes
-        -----
-        The pooled Pre mean/variance are computed exactly from the Early+Late
-        Pre group means/variances and N_phrases (standard pooled variance
-        formula). The pooled Pre median is an approximation based on group
-        medians and N_phrases; the Pre_IQR_ms is an approximate IQR assuming
-        a roughly normal distribution (IQR ≈ 1.349 * Std).
-
-        The additional Pre_Median_IQR_ms and Pre_Variance_IQR_ms2 columns
-        quantify how different the Pre groups are from each other in terms of
-        their medians and variances, respectively (IQR across Pre groups).
     per_animal_results : dict[str, GroupedPlotsResult]
         Mapping from animal ID -> full GroupedPlotsResult returned by
-        phrase_duration_pre_vs_post_grouped.run_batch_phrase_duration_from_excel.
+        phrase_duration_pre_vs_post_grouped.run_phrase_duration_pre_vs_post_grouped.
     """
     phrase_duration_stats_df: pd.DataFrame
     per_animal_results: Dict[str, GroupedPlotsResult]
@@ -107,60 +99,140 @@ def build_birds_phrase_duration_stats_df(
     metadata sheet and stack the per-bird phrase-duration stats into one
     concatenated DataFrame ("big_df").
 
-    In addition to the per-group statistics, this function computes, for each
-    (Animal ID, Syllable):
+    This version uses the *merged* annotations produced by
+    merge_annotations_from_split_songs.build_decoded_with_split_labels
+    (annotations_appended_df) rather than re-running the split-song merge
+    logic inside phrase_duration_pre_vs_post_grouped.
 
-        • a pooled "Pre" distribution combining Early Pre and Late Pre
-          (weighted by N_phrases), with:
-              - Pre_N_phrases
-              - Pre_Mean_ms
-              - Pre_Variance_ms2
-              - Pre_Std_ms
-              - Pre_Median_ms   (approximate pooled median based on group medians)
-              - Pre_IQR_ms      (approximate IQR ≈ 1.349 * Pre_Std_ms)
-              - Pre_Median_IQR_ms     (IQR across Pre group medians)
-              - Pre_Variance_IQR_ms2  (IQR across Pre group variances)
-
-        • comparison metrics between Post and pooled Pre:
-              - Post_vs_Pre_Delta_Mean_ms
-              - Post_vs_Pre_Mean_Ratio
-              - Post_vs_Pre_Delta_Variance_ms2
-              - Post_vs_Pre_Variance_Ratio
-              - Post_vs_Pre_Delta_Median_ms
-              - Post_vs_Pre_Median_Ratio
-
-        • boolean flags indicating increased mean/variance and whether the
-          Post mean lies outside the Pre mean ± 1 SD or ± 2 SD:
-              - Post_Mean_Increased
-              - Post_Variance_Increased
-              - Post_Mean_Above_Pre_Mean_Plus_1SD
-              - Post_Mean_Above_Pre_Mean_Plus_2SD
-
-    These derived columns are populated on the Post rows for each
-    (Animal ID, Syllable). Pre rows keep NaN / False in these columns.
+    Birds that cannot be processed (e.g., missing JSONs, empty annotations,
+    or KeyErrors from merge_annotations_from_split_songs) are skipped with a
+    warning, so that the batch can complete and the compiled CSV can be saved.
     """
     excel_path = Path(excel_path)
     json_root = Path(json_root)
 
-    # Run the existing batch helper from phrase_duration_pre_vs_post_grouped
-    batch_results: Dict[str, GroupedPlotsResult] = run_batch_phrase_duration_from_excel(
-        excel_path=excel_path,
-        json_root=json_root,
-        sheet_name=sheet_name,
-        id_col=id_col,
-        treatment_date_col=treatment_date_col,
-        grouping_mode=grouping_mode,
-        early_group_size=early_group_size,
-        late_group_size=late_group_size,
-        post_group_size=post_group_size,
-        restrict_to_labels=restrict_to_labels,
-        y_max_ms=y_max_ms,
-        show_plots=show_plots,
+    # Load metadata Excel
+    meta = pd.read_excel(excel_path, sheet_name=sheet_name)
+    if id_col not in meta.columns:
+        raise KeyError(f"id_col '{id_col}' not found in Excel sheet.")
+
+    # Deduplicate by animal ID so each bird is run only once
+    meta_unique = (
+        meta
+        .dropna(subset=[id_col])
+        .copy()
+    )
+    meta_unique[id_col] = meta_unique[id_col].astype(str).str.strip()
+    meta_unique = meta_unique[meta_unique[id_col] != ""]
+    meta_unique = (
+        meta_unique
+        .groupby(id_col, as_index=False)
+        .first()  # keep the first row per animal (treatment date etc.)
     )
 
-    # Stack per-bird phrase_duration_stats_df into one big DataFrame
+    # Normalize restrict_to_labels to a list of strings (or None)
+    if restrict_to_labels is not None:
+        restrict_arg: Optional[Sequence[str]] = [str(x) for x in restrict_to_labels]
+    else:
+        restrict_arg = None
+
+    batch_results: Dict[str, GroupedPlotsResult] = {}
     frames = []
-    for animal_id, res in batch_results.items():
+
+    for _, row in meta_unique.iterrows():
+        animal_id_str = str(row[id_col]).strip()
+        if not animal_id_str:
+            continue
+
+        # Treatment date (can be NaT / None)
+        tdate_val = row.get(treatment_date_col, None)
+        if pd.isna(tdate_val):
+            tdate_val = None
+        else:
+            tdate_val = pd.to_datetime(tdate_val, errors="coerce")
+
+        # JSONs are assumed to live in a per-animal subdirectory:
+        #   json_root / <animal_id> / <animal_id>_decoded_database.json
+        #   json_root / <animal_id> / <animal_id>_song_detection.json
+        animal_dir = json_root / animal_id_str
+        decoded_path = animal_dir / f"{animal_id_str}_decoded_database.json"
+        detect_path = animal_dir / f"{animal_id_str}_song_detection.json"
+
+        if not decoded_path.is_file() or not detect_path.is_file():
+            print(f"[WARN] {animal_id_str}: could not find both JSONs under {animal_dir}.")
+            print(f"       decoded: {decoded_path if decoded_path.is_file() else None}")
+            print(f"       detect : {detect_path if detect_path.is_file() else None}")
+            continue
+
+        print(
+            f"[RUN] {animal_id_str} | treatment_date={tdate_val} | "
+            f"decoded={decoded_path.name} | detect={detect_path.name}"
+        )
+
+        # ── 1) Build merged annotations (singles + merged songs) ─────────
+        try:
+            ann_res = mps.build_decoded_with_split_labels(
+                decoded_database_json=decoded_path,
+                song_detection_json=detect_path,
+                only_song_present=True,
+                compute_durations=True,
+                add_recording_datetime=True,
+                songs_only=True,
+                flatten_spec_params=True,
+                max_gap_between_song_segments=500,
+                segment_index_offset=0,
+                merge_repeated_syllables=True,
+                repeat_gap_ms=10.0,
+                repeat_gap_inclusive=False,
+            )
+        except KeyError as e:
+            # Typical case: annotations_df has no 'file_name' column because
+            # the organized_df is completely empty for this bird.
+            print(
+                f"[WARN] {animal_id_str}: failed to build merged annotations "
+                f"(KeyError: {e}); skipping this bird."
+            )
+            continue
+        except Exception as e:
+            print(
+                f"[WARN] {animal_id_str}: unexpected error while building merged "
+                f"annotations ({type(e).__name__}: {e}); skipping this bird."
+            )
+            continue
+
+        premerged_df = ann_res.annotations_appended_df.copy()
+        if premerged_df.empty:
+            print(f"[WARN] {animal_id_str}: annotations_appended_df is empty; skipping.")
+            continue
+
+        # ── 2) Run the pre/post grouping & phrase-duration stats on that df ──
+        outdir = animal_dir / "phrase_duration_pre_post_grouped"
+        outdir.mkdir(parents=True, exist_ok=True)
+
+        res = run_phrase_duration_pre_vs_post_grouped(
+            premerged_annotations_df=premerged_df,
+            premerged_annotations_path=None,
+            decoded_database_json=None,
+            song_detection_json=None,
+            max_gap_between_song_segments=500,
+            segment_index_offset=0,
+            merge_repeated_syllables=True,
+            repeat_gap_ms=10.0,
+            repeat_gap_inclusive=False,
+            output_dir=outdir,
+            treatment_date=tdate_val,
+            grouping_mode=grouping_mode,
+            early_group_size=early_group_size,
+            late_group_size=late_group_size,
+            post_group_size=post_group_size,
+            restrict_to_labels=restrict_arg,
+            y_max_ms=y_max_ms,
+            show_plots=show_plots,
+            animal_id_override=animal_id_str,
+        )
+
+        batch_results[animal_id_str] = res
+
         stats = getattr(res, "phrase_duration_stats_df", None)
         if stats is None or stats.empty:
             continue
@@ -186,7 +258,7 @@ def build_birds_phrase_duration_stats_df(
                     stats["N_phrases"] = np.nan
 
         # Track which bird each row comes from
-        stats[id_col] = animal_id
+        stats[id_col] = animal_id_str
         frames.append(stats)
 
     if frames:
@@ -391,7 +463,7 @@ def build_birds_phrase_duration_stats_df(
         per_animal_results=batch_results,
     )
 
-    
+
 """
 from pathlib import Path
 import importlib
@@ -399,11 +471,9 @@ import importlib
 import phrase_duration_birds_stats_df as pb
 importlib.reload(pb)  # pick up recent edits
 
-# Paths to your metadata Excel and JSON root
 excel_path = Path("/Volumes/my_own_SSD/updated_AreaX_outputs/Area_X_lesion_metadata.xlsx")
 json_root  = Path("/Volumes/my_own_SSD/updated_AreaX_outputs")
 
-# Run the batch phrase-duration analysis across all birds in the Excel sheet
 res = pb.build_birds_phrase_duration_stats_df(
     excel_path=excel_path,
     json_root=json_root,
@@ -419,12 +489,10 @@ res = pb.build_birds_phrase_duration_stats_df(
     show_plots=False,
 )
 
-# Big concatenated DataFrame with all the pre/post metrics
 big_df = res.phrase_duration_stats_df
 print("big_df shape:", big_df.shape)
 print(big_df.head())
 
-# Save to CSV for downstream plotting (e.g., phrase_and_metadata_plotting.py)
 out_csv = json_root / "compiled_phrase_duration_stats_with_prepost_metrics.csv"
 big_df.to_csv(out_csv, index=False)
 print(f"Saved big_df with metrics to: {out_csv}")

@@ -230,6 +230,18 @@ def append_annotations_using_detection(
     """
     ann = annotations_df.copy()
 
+    # Ensure we have a file_name column (robustness for future organizer tweaks)
+    if "file_name" not in ann.columns:
+        for alt in ("filename", "File Name", "file", "wav_file", "wav_path", "path"):
+            if alt in ann.columns:
+                ann["file_name"] = ann[alt]
+                break
+    if "file_name" not in ann.columns:
+        raise KeyError(
+            f"annotations_df must contain a 'file_name' column (or a recognized "
+            f"alternative); got columns: {list(ann.columns)}"
+        )
+
     # Canonical filename key for robust matching across naming schemes
     ann["_canonical_file"] = ann["file_name"].apply(_canonical_file_key)
 
@@ -490,7 +502,7 @@ def main():
             "use 1 here (or vice versa)."
         ),
     )
-    # New options for repeat coalescing
+    # Options for repeat coalescing
     p.add_argument(
         "--merge-repeats",
         action="store_true",
@@ -545,38 +557,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-"""
-from pathlib import Path
-import importlib
-
-import merge_annotations_from_split_songs as mps
-import phrase_duration_birds_stats_df as pb
-
-importlib.reload(mps)
-importlib.reload(pb)
-
-decoded = Path("/Volumes/my_own_SSD/updated_AreaX_outputs/USA5271/USA5271_decoded_database.json")
-detect  = Path("/Volumes/my_own_SSD/updated_AreaX_outputs/USA5271/USA5271_song_detection.json")
-
-ann = mps.build_decoded_with_split_labels(
-    decoded_database_json=decoded,
-    song_detection_json=detect,
-    only_song_present=True,
-    compute_durations=True,
-    add_recording_datetime=True,
-    songs_only=True,
-    flatten_spec_params=True,
-    max_gap_between_song_segments=500,
-    segment_index_offset=0,
-    merge_repeated_syllables=True,
-    repeat_gap_ms=10.0,
-    repeat_gap_inclusive=False,
-)
-
-df = ann.annotations_appended_df
-print("Merged annotations shape:", df.shape)
-print(df["Recording DateTime"].head())
-print(df["Recording DateTime"].isna().value_counts())
-"""

@@ -2,55 +2,85 @@
 """
 phrase_duration_balanced_syllable_usage.py
 
-Compute phrase-duration statistics for balanced syllable usage
-(Early-Pre, Late-Pre, Post groups) for one or many birds, using
-TweetyBERT decoded_database JSON files.
+Compute phrase-duration statistics for *balanced syllable usage*
+(Early-Pre, Late-Pre, Post groups) for one or many birds.
 
-The compiled, multi-bird output is written as a CSV with columns that
-match `compiled_phrase_duration_stats_with_prepost_metrics.csv`, so it
-can be dropped into existing downstream plotting code.
+UPDATED FEATURES
+----------------
+- When a song-detection JSON is available, split-up songs are merged using
+  `merge_annotations_from_split_songs.build_decoded_with_split_labels`,
+  and phrase occurrences are built from the *merged* annotations.
+
+- The batch-from-Excel function
+  `run_balanced_syllable_usage_from_metadata_excel` assumes a per-bird
+  folder layout (one subfolder per Animal ID under `decoded_root`)
+  containing both JSONs, and writes a compiled CSV of the results with
+  columns that match `compiled_phrase_duration_stats_with_prepost_metrics.csv`.
 
 Typical usage (Spyder console)
 ------------------------------
-Single bird (one decoded JSON):
+Single bird (recommended, using merged songs):
 
     from pathlib import Path
     import importlib
     import phrase_duration_balanced_syllable_usage as pbsu
     importlib.reload(pbsu)
 
-    decoded = Path("/path/to/USA5283_decoded_database.json")
-    tdate   = "2024-03-05"   # treatment date
+    decoded_root = Path("/Volumes/my_own_SSD/updated_AreaX_outputs")
+    bird_id      = "USA5283"
+
+    decoded_json   = decoded_root / bird_id / f"{bird_id}_decoded_database.json"
+    detection_json = decoded_root / bird_id / f"{bird_id}_song_detection.json"
+    tdate          = "2024-03-05"   # treatment date
 
     res = pbsu.run_phrase_duration_balanced_syllable_usage(
-        decoded_database_json=decoded,
+        decoded_database_json=decoded_json,
         treatment_date=tdate,
-        group_size=None,              # None → auto-balance (use as many phrases as possible)
+        group_size=None,              # None → auto-balance per syllable
         restrict_to_labels=[str(i) for i in range(26)],
+        animal_id=bird_id,
+        song_detection_json=detection_json,  # <- use merged songs
     )
 
     stats_df = res.phrase_duration_stats_df
     stats_df.head()
 
-Batch across birds from Excel metadata:
+Single bird (legacy JSON-only, no merged songs):
 
-    decoded_root = Path("/Volumes/my_own_ssd/2024_2025_Area_X_jsons_npzs/TweetyBERT_outputs")
-    excel_path   = Path("/Volumes/my_own_ssd/2024_2025_Area_X_jsons_npzs/Area_X_lesion_metadata.xlsx")
+    res = pbsu.run_phrase_duration_balanced_syllable_usage(
+        decoded_database_json=decoded_json,
+        treatment_date=tdate,
+        group_size=None,
+        restrict_to_labels=[str(i) for i in range(26)],
+        animal_id=bird_id,
+        song_detection_json=None,  # or omit this argument
+    )
+
+Batch across birds from Excel metadata (per-bird folders, merged songs):
+
+    from pathlib import Path
+    import importlib
+    import phrase_duration_balanced_syllable_usage as pbsu
+    importlib.reload(pbsu)
+
+    decoded_root = Path("/Volumes/my_own_SSD/updated_AreaX_outputs")
+    excel_path   = decoded_root / "Area_X_lesion_metadata.xlsx"
 
     folder_res = pbsu.run_balanced_syllable_usage_from_metadata_excel(
         excel_path=excel_path,
         decoded_root=decoded_root,
-        sheet_name=0,
+        sheet_name=0,                      # or a sheet name like "metadata"
         id_col="Animal ID",
         treatment_date_col="Treatment date",
-        group_size=None,   # None → auto-balance per (bird, syllable)
+        group_size=None,                   # None → auto-balance per syllable
         restrict_to_labels=[str(i) for i in range(26)],
-        glob_pattern="*decoded_database.json",
+        glob_pattern="*decoded_database.json",  # used for decoded JSON search
         compiled_filename="usage_balanced_phrase_duration_stats.csv",
     )
 
     compiled_df   = folder_res.compiled_stats_df
     compiled_path = folder_res.compiled_stats_path
+
     print(compiled_df.head())
     print("Saved compiled CSV to:", compiled_path)
 """
@@ -59,11 +89,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, Sequence, Union, Any
+from typing import Dict, Optional, Sequence, Union, Any, Tuple
 
 import json
 import numpy as np
 import pandas as pd
+
+import merge_annotations_from_split_songs as mps
 
 __all__ = [
     "BalancedSyllableUsageResult",
@@ -72,6 +104,7 @@ __all__ = [
     "run_phrase_duration_balanced_syllable_usage",
     "run_balanced_syllable_usage_from_metadata_excel",
 ]
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Dataclasses
@@ -86,7 +119,7 @@ class BalancedSyllableUsageResult:
     treatment_date: pd.Timestamp
     phrase_duration_stats_df: pd.DataFrame
     balanced_occurrences_df: pd.DataFrame
-    raw_phrases_df: pd.DataFrame
+    raw_phrases_df: pd.DataFrame  # one-row-per-phrase occurrences table
 
 
 @dataclass
@@ -110,27 +143,25 @@ def _normalize_label(label: Any) -> str:
     return str(label).strip()
 
 
+# ---- phrase-occurrence builders ---------------------------------------------
+
+
 def build_phrase_occurrence_table(
     decoded_database_json: Union[str, Path],
     restrict_to_labels: Optional[Sequence[Union[str, int]]] = None,
 ) -> pd.DataFrame:
     """
+    ORIGINAL JSON-BASED IMPLEMENTATION.
+
     Parse a TweetyBERT decoded_database JSON into a phrase-occurrence table
     with one row per (file, syllable occurrence).
 
-    Parameters
-    ----------
-    decoded_database_json : str or Path
-        Path to the TweetyBERT decoded_database JSON.
-    restrict_to_labels : sequence of hashable, optional
-        If provided, only these labels (after string conversion) are kept.
+    This is still used when `song_detection_json` is not provided to
+    `run_phrase_duration_balanced_syllable_usage`.
 
-    Returns
-    -------
-    df : pd.DataFrame
-        Columns include at least:
-            "file_name", "creation_datetime",
-            "Syllable", "onset_ms", "offset_ms", "duration_ms".
+    Returns a DataFrame with columns:
+        "file_name", "creation_datetime",
+        "Syllable", "onset_ms", "offset_ms", "duration_ms".
     """
     decoded_database_json = Path(decoded_database_json)
     with decoded_database_json.open("r", encoding="utf-8") as f:
@@ -223,6 +254,143 @@ def build_phrase_occurrence_table(
     if not pd.api.types.is_datetime64_any_dtype(df["creation_datetime"]):
         df["creation_datetime"] = pd.to_datetime(df["creation_datetime"], errors="coerce")
     return df
+
+
+def _build_phrase_occurrences_from_annotations(
+    annotations_df: pd.DataFrame,
+    restrict_to_labels: Optional[Sequence[Union[str, int]]] = None,
+) -> pd.DataFrame:
+    """
+    Build a phrase-occurrence table from the `annotations_appended_df`
+    produced by `merge_annotations_from_split_songs.build_decoded_with_split_labels`.
+
+    This is analogous to `build_phrase_occurrence_table`, but it operates on
+    the merged-song annotations instead of the raw JSON "results" list.
+
+    Returns DataFrame with columns:
+        "file_name", "creation_datetime",
+        "Syllable", "onset_ms", "offset_ms", "duration_ms".
+    """
+    if annotations_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "file_name",
+                "creation_datetime",
+                "Syllable",
+                "onset_ms",
+                "offset_ms",
+                "duration_ms",
+            ]
+        )
+
+    # Candidate columns for spans dict and datetime / filename
+    span_candidates = [
+        "syllable_onsets_offsets_ms_dict",
+        "syllable_onsets_offsets_ms",
+        "syllable_onsets_offsets",
+    ]
+    dt_candidates = [
+        "Recording DateTime",
+        "Recording datetime",
+        "Recording Datetime",
+        "recording_datetime",
+        "creation_datetime",
+    ]
+    fname_candidates = [
+        "file_name",
+        "Recording file name",
+        "filename",
+        "file",
+    ]
+
+    span_col = next((c for c in span_candidates if c in annotations_df.columns), None)
+    if span_col is None:
+        raise KeyError(
+            f"Could not find a spans column in annotations; looked for: {span_candidates} "
+            f"but columns are: {list(annotations_df.columns)}"
+        )
+
+    dt_col = next((c for c in dt_candidates if c in annotations_df.columns), None)
+    fname_col = next((c for c in fname_candidates if c in annotations_df.columns), None)
+
+    allowed_labels: Optional[set[str]] = None
+    if restrict_to_labels is not None:
+        allowed_labels = {str(x) for x in restrict_to_labels}
+
+    rows: list[dict[str, Any]] = []
+
+    for _, rec in annotations_df.iterrows():
+        # filename
+        if fname_col is not None:
+            fname = rec.get(fname_col, "")
+        else:
+            fname = ""
+        fname = "" if pd.isna(fname) else str(fname)
+
+        # datetime
+        cdate = rec.get(dt_col, None) if dt_col is not None else None
+        try:
+            creation_dt = pd.to_datetime(cdate) if cdate is not None else pd.NaT
+        except Exception:
+            creation_dt = pd.NaT
+
+        label_dict = rec.get(span_col, {})
+        if isinstance(label_dict, str):
+            # Sometimes stored as JSON string
+            try:
+                label_dict = json.loads(label_dict)
+            except Exception:
+                label_dict = {}
+        if not isinstance(label_dict, dict):
+            continue
+
+        for lab, intervals in label_dict.items():
+            lab_str = _normalize_label(lab)
+            if allowed_labels is not None and lab_str not in allowed_labels:
+                continue
+            if not isinstance(intervals, (list, tuple)):
+                continue
+            for itv in intervals:
+                if not (isinstance(itv, (list, tuple)) and len(itv) >= 2):
+                    continue
+                try:
+                    onset = float(itv[0])
+                    offset = float(itv[1])
+                except Exception:
+                    continue
+                dur = offset - onset
+                if not np.isfinite(dur) or dur <= 0:
+                    continue
+                rows.append(
+                    {
+                        "file_name": fname,
+                        "creation_datetime": creation_dt,
+                        "Syllable": lab_str,
+                        "onset_ms": onset,
+                        "offset_ms": offset,
+                        "duration_ms": dur,
+                    }
+                )
+
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "file_name",
+                "creation_datetime",
+                "Syllable",
+                "onset_ms",
+                "offset_ms",
+                "duration_ms",
+            ]
+        )
+
+    df = pd.DataFrame.from_records(rows)
+    if not pd.api.types.is_datetime64_any_dtype(df["creation_datetime"]):
+        df["creation_datetime"] = pd.to_datetime(df["creation_datetime"], errors="coerce")
+    return df
+
+
+# ---- baseline / balancing helpers -------------------------------------------
 
 
 def _compute_pre_baseline_stats(
@@ -577,7 +745,8 @@ def _build_phrase_duration_stats_single_bird(
     Parameters
     ----------
     raw_phrases_df : pd.DataFrame
-        Output of `build_phrase_occurrence_table` (one row per phrase occurrence).
+        Output of `build_phrase_occurrence_table` (or
+        `_build_phrase_occurrences_from_annotations`), one row per phrase.
     treatment_datetime : pd.Timestamp
         Treatment date/time; phrases with creation_datetime < this are "pre".
     group_size : int or None, optional
@@ -592,8 +761,8 @@ def _build_phrase_duration_stats_single_bird(
     -------
     stats_final : pd.DataFrame
         One row per (Syllable, Group) with columns matching the per-bird part
-        of `compiled_phrase_duration_stats_with_prepost_metrics.csv` (minus the
-        Animal ID column).
+        of `compiled_phrase_duration_stats_with_prepost_metrics.csv` (minus
+        the Animal ID column).
     """
     if raw_phrases_df.empty:
         # Empty schema with all the expected columns
@@ -704,14 +873,26 @@ def run_phrase_duration_balanced_syllable_usage(
     group_size: Optional[int] = None,
     restrict_to_labels: Optional[Sequence[Union[str, int]]] = None,
     animal_id: Optional[str] = None,
+    song_detection_json: Optional[Union[str, Path]] = None,
+    max_gap_between_song_segments: int = 500,
+    merge_repeated_syllables: bool = True,
+    repeat_gap_ms: float = 10.0,
+    repeat_gap_inclusive: bool = False,
 ) -> BalancedSyllableUsageResult:
     """
     Run balanced syllable-usage phrase-duration stats for a single bird.
 
     This function:
 
-      1) Reads the TweetyBERT decoded_database JSON.
-      2) Builds a one-row-per-phrase table using `build_phrase_occurrence_table`.
+      1) If `song_detection_json` is provided, uses
+         `merge_annotations_from_split_songs.build_decoded_with_split_labels`
+         to merge split-up songs and build a phrase-occurrence table from the
+         merged annotations.
+
+         Otherwise, falls back to reading the TweetyBERT decoded_database
+         JSON directly via `build_phrase_occurrence_table`.
+
+      2) Builds a one-row-per-phrase table.
       3) Splits occurrences into Early-Pre, Late-Pre, Post balanced groups
          per syllable.
       4) Computes per-group phrase-duration stats.
@@ -736,6 +917,18 @@ def run_phrase_duration_balanced_syllable_usage(
         If provided, only these labels (after string conversion) are included.
     animal_id : str, optional
         If provided, stored in the returned BalancedSyllableUsageResult.
+    song_detection_json : path-like or None, optional
+        If provided, used together with `decoded_database_json` to build
+        merged-song annotations via `build_decoded_with_split_labels`.
+        If None, the legacy JSON-only path is used.
+    max_gap_between_song_segments : int, default 500
+        Passed to `build_decoded_with_split_labels`.
+    merge_repeated_syllables : bool, default True
+        Passed to `build_decoded_with_split_labels`.
+    repeat_gap_ms : float, default 10.0
+        Passed to `build_decoded_with_split_labels`.
+    repeat_gap_inclusive : bool, default False
+        Passed to `build_decoded_with_split_labels`.
 
     Returns
     -------
@@ -745,16 +938,41 @@ def run_phrase_duration_balanced_syllable_usage(
                                       with pre-baseline + post-vs-pre metrics
                                       (no Animal ID column yet).
           - balanced_occurrences_df  : per-phrase balanced rows
-          - raw_phrases_df           : all phrase occurrences from JSON
+          - raw_phrases_df           : all phrase occurrences from JSON or
+                                       merged annotations
     """
     decoded_database_json = Path(decoded_database_json)
     t_datetime = pd.to_datetime(treatment_date)
 
     # Raw phrase occurrences across the whole recording set
-    raw_phrases_df = build_phrase_occurrence_table(
-        decoded_database_json=decoded_database_json,
-        restrict_to_labels=restrict_to_labels,
-    )
+    if song_detection_json is not None:
+        # Use merged songs via merge_annotations_from_split_songs
+        song_detection_json = Path(song_detection_json)
+        ann_res = mps.build_decoded_with_split_labels(
+            decoded_database_json=decoded_database_json,
+            song_detection_json=song_detection_json,
+            only_song_present=True,
+            compute_durations=True,
+            add_recording_datetime=True,
+            songs_only=True,
+            flatten_spec_params=True,
+            max_gap_between_song_segments=max_gap_between_song_segments,
+            segment_index_offset=0,
+            merge_repeated_syllables=merge_repeated_syllables,
+            repeat_gap_ms=repeat_gap_ms,
+            repeat_gap_inclusive=repeat_gap_inclusive,
+        )
+        annotations_df = ann_res.annotations_appended_df.copy()
+        raw_phrases_df = _build_phrase_occurrences_from_annotations(
+            annotations_df=annotations_df,
+            restrict_to_labels=restrict_to_labels,
+        )
+    else:
+        # Legacy JSON-only path
+        raw_phrases_df = build_phrase_occurrence_table(
+            decoded_database_json=decoded_database_json,
+            restrict_to_labels=restrict_to_labels,
+        )
 
     # Balanced per-group stats + baselines + comparisons
     phrase_stats_df = _build_phrase_duration_stats_single_bird(
@@ -794,40 +1012,88 @@ def run_phrase_duration_balanced_syllable_usage(
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def _find_decoded_json_for_animal(
+def _find_decoded_and_detection_json(
     decoded_root: Union[str, Path],
     animal_id: str,
-    glob_pattern: str = "*decoded_database.json",
-) -> Optional[Path]:
+    glob_pattern_decoded: str = "*decoded_database.json",
+    glob_pattern_detect: str = "*song_detection*.json",
+) -> Tuple[Optional[Path], Optional[Path]]:
     """
-    Search `decoded_root` recursively for a decoded_database JSON whose path
-    contains the given `animal_id`.
+    Search `decoded_root` for a decoded_database JSON and a song_detection
+    JSON for the given `animal_id`.
+
+    Preferred layout (per-bird subfolder):
+
+        decoded_root/
+            <animal_id>/
+                <animal_id>_decoded_database.json
+                <animal_id>_song_detection.json
+
+    Falls back to a recursive search under decoded_root if the per-bird
+    subfolder is not found.
 
     Filters out macOS "._" resource files.
 
-    Returns the first match (sorted lexicographically), or None if no match.
+    Returns
+    -------
+    decoded_path, detect_path : (Path or None, Path or None)
+        Each is the first match (sorted lexicographically), or None if no
+        match is found.
     """
     decoded_root = Path(decoded_root)
 
-    candidates: list[Path] = []
-    for p in decoded_root.rglob(glob_pattern):
-        if p.name.startswith("._"):
-            continue
-        # Match on any part of the path (simple but robust)
-        if animal_id in str(p):
-            candidates.append(p)
+    decoded_candidates: list[Path] = []
+    detect_candidates: list[Path] = []
 
-    if not candidates:
-        return None
-
-    candidates = sorted(candidates)
-    if len(candidates) > 1:
-        rels = [str(c.relative_to(decoded_root)) for c in candidates]
-        print(
-            f"[WARN] Multiple decoded JSON candidates for Animal ID '{animal_id}': {rels}. "
-            f"Using the first."
+    bird_dir = decoded_root / animal_id
+    if bird_dir.is_dir():
+        decoded_candidates.extend(
+            p
+            for p in bird_dir.glob(glob_pattern_decoded)
+            if not p.name.startswith("._")
         )
-    return candidates[0]
+        detect_candidates.extend(
+            p
+            for p in bird_dir.glob(glob_pattern_detect)
+            if not p.name.startswith("._")
+        )
+    else:
+        # Fallback: search entire tree for paths containing the animal_id
+        for p in decoded_root.rglob(glob_pattern_decoded):
+            if p.name.startswith("._"):
+                continue
+            if animal_id in str(p):
+                decoded_candidates.append(p)
+        for p in decoded_root.rglob(glob_pattern_detect):
+            if p.name.startswith("._"):
+                continue
+            if animal_id in str(p):
+                detect_candidates.append(p)
+
+    decoded_path = None
+    detect_path = None
+
+    if decoded_candidates:
+        decoded_candidates = sorted(decoded_candidates)
+        decoded_path = decoded_candidates[0]
+        if len(decoded_candidates) > 1:
+            rels = [str(c.relative_to(decoded_root)) for c in decoded_candidates]
+            print(
+                f"[WARN] Multiple decoded JSON candidates for Animal ID '{animal_id}': {rels}. "
+                f"Using the first."
+            )
+
+    if detect_candidates:
+        detect_candidates = sorted(detect_candidates)
+        detect_path = detect_candidates[0]
+        if len(detect_candidates) > 1:
+            rels = [str(c.relative_to(decoded_root)) for c in detect_candidates]
+            print(
+                f"[WARN] Multiple detection JSON candidates for Animal ID '{animal_id}': {rels}. "
+                f"Using the first."
+            )
+
+    return decoded_path, detect_path
 
 
 def run_balanced_syllable_usage_from_metadata_excel(
@@ -845,6 +1111,18 @@ def run_balanced_syllable_usage_from_metadata_excel(
     """
     Batch-run balanced syllable-usage phrase-duration stats for all birds
     listed in an Excel metadata sheet, and save a compiled CSV.
+
+    Assumes `decoded_root` contains one subfolder per Animal ID, each with
+    a decoded_database JSON and a song_detection JSON, e.g.:
+
+        decoded_root/
+            USA5283/
+                USA5283_decoded_database.json
+                USA5283_song_detection.json
+            USA5288/
+                USA5288_decoded_database.json
+                USA5288_song_detection.json
+            ...
 
     The output CSV has columns:
 
@@ -871,8 +1149,8 @@ def run_balanced_syllable_usage_from_metadata_excel(
         Excel metadata file containing at least the columns given by
         `id_col` and `treatment_date_col`.
     decoded_root : path-like
-        Root folder under which per-bird decoded_database JSONs live
-        in subdirectories.
+        Root folder under which per-bird decoded_database and
+        song_detection JSONs live in subdirectories.
     sheet_name : int or str, default 0
         Excel sheet name or index.
     id_col : str, default "Animal ID"
@@ -891,7 +1169,8 @@ def run_balanced_syllable_usage_from_metadata_excel(
         If provided, only these labels (after string conversion) are included.
     glob_pattern : str, default "*decoded_database.json"
         Pattern used when searching for decoded_database JSONs under
-        `decoded_root`.
+        `decoded_root`. (The detection JSON pattern is inferred as
+        "*song_detection*.json".)
     compiled_filename : str, default "usage_balanced_phrase_duration_stats.csv"
         Name of the compiled CSV file to save under `decoded_root`.
 
@@ -932,21 +1211,24 @@ def run_balanced_syllable_usage_from_metadata_excel(
             continue
         t_datetime = pd.to_datetime(tdate_raw)
 
-        decoded_path = _find_decoded_json_for_animal(
+        decoded_path, detect_path = _find_decoded_and_detection_json(
             decoded_root=decoded_root,
             animal_id=animal_id,
-            glob_pattern=glob_pattern,
+            glob_pattern_decoded=glob_pattern,
+            glob_pattern_detect="*song_detection*.json",
         )
-        if decoded_path is None:
+        if decoded_path is None or detect_path is None:
             print(
-                f"[WARN] No decoded_database JSON found for Animal ID '{animal_id}' "
-                f"under root '{decoded_root}'. Skipping."
+                f"[WARN] '{animal_id}': could not find both JSONs under {decoded_root / animal_id}.\n"
+                f"       decoded: {decoded_path}\n"
+                f"       detect : {detect_path}"
             )
             continue
 
         rel_dec = decoded_path.relative_to(decoded_root)
+        rel_det = detect_path.relative_to(decoded_root)
         print(
-            f"[RUN] {animal_id} | decoded={rel_dec} | treatment_date={t_datetime}"
+            f"[RUN] {animal_id} | decoded={rel_dec} | detect={rel_det} | treatment_date={t_datetime}"
         )
 
         single_res = run_phrase_duration_balanced_syllable_usage(
@@ -955,6 +1237,7 @@ def run_balanced_syllable_usage_from_metadata_excel(
             group_size=group_size,
             restrict_to_labels=restrict_to_labels,
             animal_id=animal_id,
+            song_detection_json=detect_path,
         )
 
         if single_res.phrase_duration_stats_df.empty:
@@ -1064,7 +1347,7 @@ import phrase_duration_balanced_syllable_usage as pbsu
 importlib.reload(pbsu)
 
 decoded_root = Path("/Volumes/my_own_SSD/updated_AreaX_outputs")
-excel_path   = Path("/Volumes/my_own_SSD/updated_AreaX_outputs/Area_X_lesion_metadata.xlsx")
+excel_path   = decoded_root / "Area_X_lesion_metadata.xlsx"
 
 folder_res = pbsu.run_balanced_syllable_usage_from_metadata_excel(
     excel_path=excel_path,
@@ -1072,9 +1355,9 @@ folder_res = pbsu.run_balanced_syllable_usage_from_metadata_excel(
     sheet_name=0,                      # or a sheet name like "metadata"
     id_col="Animal ID",
     treatment_date_col="Treatment date",
-    group_size=None,                   # None → auto-balance per syllable
+    group_size=None,                   # None → auto-balance per (bird, syllable)
     restrict_to_labels=[str(i) for i in range(26)],
-    glob_pattern="*decoded_database.json",
+    glob_pattern="*decoded_database.json",      # decoded JSON pattern
     compiled_filename="usage_balanced_phrase_duration_stats.csv",
 )
 
@@ -1084,6 +1367,9 @@ compiled_path = folder_res.compiled_stats_path
 print(compiled_df.head())
 print("Saved compiled CSV to:", compiled_path)
 
+# You can also grab one bird's result:
+per_animal = folder_res.per_animal_results
+print(per_animal.keys())  # dict of {animal_id: BalancedSyllableUsageResult}
 
 
 """
