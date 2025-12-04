@@ -412,8 +412,8 @@ import importlib
 import phrase_duration_birds_stats_df as pb
 importlib.reload(pb)  # pick up recent edits
 
-excel_path = Path("/Volumes/my_own_ssd/2024_2025_Area_X_jsons_npzs/Area_X_lesion_metadata.xlsx")
-json_root  = Path("/Volumes/my_own_ssd/2024_2025_Area_X_jsons_npzs/TweetyBERT_outputs/")
+excel_path = Path("/Volumes/my_own_SSD/updated_AreaX_outputs/Area_X_lesion_metadata.xlsx")
+json_root  = Path("/Volumes/my_own_SSD/updated_AreaX_outputs")
 
 res = pb.build_birds_phrase_duration_stats_df(
     excel_path=excel_path,

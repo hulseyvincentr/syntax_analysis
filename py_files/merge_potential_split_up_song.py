@@ -272,7 +272,7 @@ if __name__ == "__main__":
 from merge_potential_split_up_song import build_detected_and_merged_songs
 
 out = build_detected_and_merged_songs(
-    "/Volumes/my_own_ssd/2025_areax_lesion/R08_RC6_Comp2_song_detection.json",
+    "/Volumes/my_own_SSD/updated_AreaX_outputs/USA5271/USA5271_song_detection.json",
     max_gap_between_song_segments=500,
 )
 detected_song_segments = out["detected_song_segments"]

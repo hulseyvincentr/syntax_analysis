@@ -43,7 +43,11 @@ import numpy as np
 
 # ── Your modules (adjust names if your file names differ) ─────────────────────
 from merge_potential_split_up_song import build_detected_and_merged_songs
-from organized_decoded_serialTS_segments import build_organized_segments_with_durations
+from organized_decoded_serialTS_segments import (
+    build_organized_segments_with_durations,
+    parse_filename_with_excel_serial,
+    excel_serial_to_timestamp,
+)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -57,6 +61,7 @@ def _ensure_list(x) -> List[int]:
         return [int(x)]
     except Exception:
         return []
+
 
 def _compute_syllable_order(label_to_intervals: Dict[str, List[List[float]]]) -> List[str]:
     """Return labels ordered by onset, globally across all intervals."""
@@ -72,9 +77,12 @@ def _compute_syllable_order(label_to_intervals: Dict[str, List[List[float]]]) ->
     pairs.sort(key=lambda p: p[0])
     return [lab for _, lab in pairs]
 
-def _shift_and_extend(acc: Dict[str, List[List[float]]],
-                      piece: Dict[str, List[List[float]]],
-                      shift_ms: float) -> None:
+
+def _shift_and_extend(
+    acc: Dict[str, List[List[float]]],
+    piece: Dict[str, List[List[float]]],
+    shift_ms: float,
+) -> None:
     """Shift all intervals in `piece` by `shift_ms` and extend into `acc`."""
     if not isinstance(piece, dict):
         return
@@ -92,9 +100,11 @@ def _shift_and_extend(acc: Dict[str, List[List[float]]],
                 continue
             out.append([on, off])
 
+
 def _sort_intervals_inplace(d: Dict[str, List[List[float]]]) -> None:
     for lab, ivals in d.items():
         ivals.sort(key=lambda ab: (ab[0], ab[1] if len(ab) > 1 else ab[0]))
+
 
 def _coalesce_adjacent_intervals_by_label(
     d: Dict[str, List[List[float]]],
@@ -129,10 +139,11 @@ def _coalesce_adjacent_intervals_by_label(
         merged.append([cur_start, cur_end])
         d[lab] = merged
 
+
 def _durations_by_label(d: Dict[str, List[List[float]]]) -> Dict[str, List[float]]:
     out: Dict[str, List[float]] = {}
     for lab, ivals in (d or {}).items():
-        dur = []
+        dur: List[float] = []
         for itv in ivals:
             if not (isinstance(itv, (list, tuple)) and len(itv) >= 2):
                 continue
@@ -145,6 +156,45 @@ def _durations_by_label(d: Dict[str, List[List[float]]]) -> Dict[str, List[float
     return out
 
 
+def _canonical_file_key(name: Any) -> str:
+    """
+    Map any filename variant (old/new, with prefixes, underscores vs dots, etc.)
+    to a canonical base key using parse_filename_with_excel_serial.
+
+    We canonicalize to '<ANIMAL>_<EXCEL_SERIAL>' where EXCEL_SERIAL is the
+    numeric Excel serial formatted with 8 decimal places. That way, e.g.:
+
+      - 'USA5271_45342.27393766_2_20_7_36_33.wav'
+      - 'USA5271_45342_27393766_2_20_7_36_33.wav'
+      - '1__USA5271_45342_27393766_2_20_7_36_33_segment_0.wav'
+
+    all become 'USA5271_45342.27393766'.
+    """
+    if name is None or (isinstance(name, float) and pd.isna(name)):
+        return ""
+    s = str(name)
+
+    try:
+        animal_id, serial_val, _, file_stem = parse_filename_with_excel_serial(s)
+    except Exception:
+        animal_id, serial_val, file_stem = None, None, None
+
+    # Preferred: animal + numeric Excel serial, normalized to 8 decimal places
+    if animal_id is not None and serial_val is not None:
+        return f"{animal_id}_{float(serial_val):.8f}"
+
+    # Fallback: if parse failed but file_stem exists, use that
+    if file_stem:
+        return str(file_stem)
+
+    # Last resort: drop extension from raw string, or return raw
+    if "." in s:
+        base, ext = s.rsplit(".", 1)
+        if ext.lower() in {"wav", "flac", "mp3"}:
+            return base
+    return s
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Core merge
 # ──────────────────────────────────────────────────────────────────────────────
@@ -155,6 +205,7 @@ class MergeAnnotationsResult:
     detected_song_segments_df: pd.DataFrame
     detected_merged_songs_df: pd.DataFrame
     annotations_appended_df: pd.DataFrame
+
 
 def append_annotations_using_detection(
     *,
@@ -171,14 +222,16 @@ def append_annotations_using_detection(
     segments to append together. Times are shifted so the first segment in each group
     starts at 0 ms, and later segments are appended in timeline order.
 
-    Joins on:
-      detection filename  <-> annotations 'file_name'
-      detection segment_index (per part)  <-> annotations 'Segment' (+ offset if needed)
+    Joins on a canonical file key derived from the detection 'filename' and the
+    annotations 'file_name', plus the segment index (with optional offset).
 
     If `merge_repeated_syllables` is True, coalesces adjacent repeats of the same label
     when the between-interval gap is within the threshold (repeat_gap_ms).
     """
     ann = annotations_df.copy()
+
+    # Canonical filename key for robust matching across naming schemes
+    ann["_canonical_file"] = ann["file_name"].apply(_canonical_file_key)
 
     # 'Segment' can be float/nullable; make a safe view for matching
     if "Segment" in ann.columns:
@@ -190,26 +243,28 @@ def append_annotations_using_detection(
     seg_onset_map: Dict[Tuple[str, int], float] = {}
     if not detected_song_segments.empty:
         for _, r in detected_song_segments.iterrows():
-            fname = str(r.get("filename"))
+            fname_raw = str(r.get("filename"))
+            canon = _canonical_file_key(fname_raw)
             try:
                 sidx = int(r.get("segment_index"))
             except Exception:
                 continue
             if pd.notna(r.get("onset_ms")):
-                seg_onset_map[(fname, sidx)] = float(r["onset_ms"])
+                seg_onset_map[(canon, sidx)] = float(r["onset_ms"])
 
     rows_out: List[Dict[str, Any]] = []
 
     for _, det in detected_merged_songs.iterrows():
-        fname = str(det.get("filename"))
-        segs  = _ensure_list(det.get("segment_index"))
+        fname_raw = str(det.get("filename"))
+        fname_canon = _canonical_file_key(fname_raw)
+        segs = _ensure_list(det.get("segment_index"))
         if not segs:
             continue
 
-        # Compute baseline (first onset) from detection
-        onsets = []
+        # Compute baseline (first onset) from detection using canonical key
+        onsets: List[float] = []
         for s in segs:
-            key = (fname, s)
+            key = (fname_canon, s)
             if key in seg_onset_map:
                 onsets.append(seg_onset_map[key])
         baseline = min(onsets) if onsets else 0.0
@@ -223,7 +278,10 @@ def append_annotations_using_detection(
         # Walk segments in order and append with shift
         for s in segs:
             ann_seg = s + int(segment_index_offset)
-            match = ann.loc[(ann["file_name"] == fname) & (ann["_Segment_int"] == ann_seg)]
+            match = ann.loc[
+                (ann["_canonical_file"] == fname_canon)
+                & (ann["_Segment_int"] == ann_seg)
+            ]
             if match.empty:
                 missing_segments.append(s)
                 continue
@@ -231,9 +289,9 @@ def append_annotations_using_detection(
             mrow = match.sort_values("Recording DateTime", na_position="last").iloc[0]
             found_rows.append(mrow)
 
-            # shift using detection onset difference
+            # shift using detection onset difference (canonical key)
             shift = 0.0
-            key = (fname, s)
+            key = (fname_canon, s)
             if key in seg_onset_map:
                 shift = float(seg_onset_map[key]) - float(baseline)
 
@@ -264,11 +322,16 @@ def append_annotations_using_detection(
             durs = {}
 
         # Build output record: copy key identity/timestamps from the first available row
-        base = (found_rows[0] if found_rows else ann[(ann["file_name"] == fname)].head(1).squeeze())
-        rec: Dict[str, Any] = {}
+        if found_rows:
+            base = found_rows[0]
+        else:
+            # Fallback: try matching by canonical file only
+            base = ann[ann["_canonical_file"] == fname_canon].head(1).squeeze()
 
-        rec["file_name"] = fname
-        rec["Segment"]   = (segs[0] + int(segment_index_offset)) if len(segs) else None
+        rec: Dict[str, Any] = {}
+        # Use the original detection filename as the outward-facing name
+        rec["file_name"] = fname_raw
+        rec["Segment"] = (segs[0] + int(segment_index_offset)) if len(segs) else None
         rec["was_merged"] = len(segs) >= 2
         rec["merged_n_parts"] = len(segs)
         rec["merged_segment_indices"] = segs
@@ -296,8 +359,14 @@ def append_annotations_using_detection(
 
     # Sort by file_name and first segment index for readability
     if not out_df.empty:
-        out_df["_first_idx"] = out_df["merged_segment_indices"].apply(lambda L: L[0] if isinstance(L, list) and L else -1)
-        out_df = out_df.sort_values(["file_name", "_first_idx"]).drop(columns=["_first_idx"]).reset_index(drop=True)
+        out_df["_first_idx"] = out_df["merged_segment_indices"].apply(
+            lambda L: L[0] if isinstance(L, list) and L else -1
+        )
+        out_df = (
+            out_df.sort_values(["file_name", "_first_idx"])
+                  .drop(columns=["_first_idx"])
+                  .reset_index(drop=True)
+        )
 
     return out_df
 
@@ -316,7 +385,7 @@ def build_decoded_with_split_labels(
     merge_repeated_syllables: bool = False,
     repeat_gap_ms: float = 10.0,
     repeat_gap_inclusive: bool = False,
-):
+) -> MergeAnnotationsResult:
     """
     Full pipeline: detection → merged groups, annotations → per-segment df,
     then append annotations across merged segments using detection timing.
@@ -331,7 +400,7 @@ def build_decoded_with_split_labels(
         max_gap_between_song_segments=max_gap_between_song_segments,
     )
     detected_song_segments = det["detected_song_segments"]
-    detected_merged_songs  = det["detected_merged_songs"]
+    detected_merged_songs = det["detected_merged_songs"]
 
     # 2) Annotations organized per segment
     org = build_organized_segments_with_durations(
@@ -353,6 +422,35 @@ def build_decoded_with_split_labels(
         repeat_gap_inclusive=repeat_gap_inclusive,
     )
 
+    # ── Safety: ensure Recording DateTime exists and is datetime ─────────────
+    if "Recording DateTime" in appended_df.columns:
+        # If everything is missing, try to reconstruct from file_name via Excel serial
+        if appended_df["Recording DateTime"].isna().all():
+            for idx, fname in appended_df["file_name"].items():
+                _, serial_val, _, _ = parse_filename_with_excel_serial(str(fname))
+                ts = excel_serial_to_timestamp(serial_val) if serial_val is not None else None
+                if ts is not None:
+                    appended_df.at[idx, "Recording DateTime"] = ts
+        appended_df["Recording DateTime"] = pd.to_datetime(
+            appended_df["Recording DateTime"], errors="coerce"
+        )
+    else:
+        # Create from scratch if column is missing entirely
+        ts_list: List[Optional[pd.Timestamp]] = []
+        for fname in appended_df["file_name"]:
+            _, serial_val, _, _ = parse_filename_with_excel_serial(str(fname))
+            ts = excel_serial_to_timestamp(serial_val) if serial_val is not None else None
+            ts_list.append(ts)
+        appended_df["Recording DateTime"] = pd.to_datetime(ts_list, errors="coerce")
+
+    # ── Rebuild Date / Hour / Minute / Second from Recording DateTime ───────
+    if "Recording DateTime" in appended_df.columns:
+        dt = appended_df["Recording DateTime"]
+        appended_df["Date"] = dt.dt.normalize()
+        appended_df["Hour"] = dt.dt.hour.astype("Int64").astype(str).str.zfill(2)
+        appended_df["Minute"] = dt.dt.minute.astype("Int64").astype(str).str.zfill(2)
+        appended_df["Second"] = dt.dt.second.astype("Int64").astype(str).str.zfill(2)
+
     return MergeAnnotationsResult(
         organized_annotations_df=annotations_df,
         detected_song_segments_df=detected_song_segments,
@@ -370,24 +468,49 @@ def _prompt_if_missing(val: Optional[str], prompt: str) -> str:
         return val
     return input(prompt).strip()
 
+
 def main():
-    p = argparse.ArgumentParser(description="Append annotation segments for split-up songs using detection timing.")
+    p = argparse.ArgumentParser(
+        description="Append annotation segments for split-up songs using detection timing."
+    )
     p.add_argument("--song-detection", "-d", type=str, help="Path to song_detection JSON")
     p.add_argument("--annotations", "-a", type=str, help="Path to decoded annotations JSON")
-    p.add_argument("--max-gap-ms", type=int, default=500, help="Max gap between segments to consider 'split up'")
-    p.add_argument("--segment-index-offset", type=int, default=0,
-                   help="If detection segment indices are 0-based but annotations are 1-based, use 1 here (or vice versa).")
+    p.add_argument(
+        "--max-gap-ms",
+        type=int,
+        default=500,
+        help="Max gap between segments to consider 'split up'",
+    )
+    p.add_argument(
+        "--segment-index-offset",
+        type=int,
+        default=0,
+        help=(
+            "If detection segment indices are 0-based but annotations are 1-based, "
+            "use 1 here (or vice versa)."
+        ),
+    )
     # New options for repeat coalescing
-    p.add_argument("--merge-repeats", action="store_true",
-                   help="If set, coalesce adjacent repeats of the same syllable when tiny gaps exist.")
-    p.add_argument("--repeat-gap-ms", type=float, default=10.0,
-                   help="Max silence between same-label intervals to coalesce (default 10.0 ms).")
-    p.add_argument("--repeat-gap-inclusive", action="store_true",
-                   help="Use <= repeat-gap instead of < repeat-gap.")
+    p.add_argument(
+        "--merge-repeats",
+        action="store_true",
+        help="If set, coalesce adjacent repeats of the same syllable when tiny gaps exist.",
+    )
+    p.add_argument(
+        "--repeat-gap-ms",
+        type=float,
+        default=10.0,
+        help="Max silence between same-label intervals to coalesce (default 10.0 ms).",
+    )
+    p.add_argument(
+        "--repeat-gap-inclusive",
+        action="store_true",
+        help="Use <= repeat-gap instead of < repeat-gap.",
+    )
     args = p.parse_args()
 
     song_detection_json = _prompt_if_missing(args.song_detection, "Path to song_detection JSON: ")
-    annotations_json    = _prompt_if_missing(args.annotations,    "Path to decoded annotations JSON: ")
+    annotations_json = _prompt_if_missing(args.annotations, "Path to decoded annotations JSON: ")
 
     res = build_decoded_with_split_labels(
         decoded_database_json=annotations_json,
@@ -419,20 +542,25 @@ def main():
     print(f"  #detected rows (singles+merged): {len(res.detected_merged_songs_df)}")
     print(f"  #annotations (singles+merged) written: {len(res.annotations_appended_df)}")
 
+
 if __name__ == "__main__":
     main()
-    
+
 
 """
 from pathlib import Path
 import importlib
+
 import merge_annotations_from_split_songs as mps
+import phrase_duration_birds_stats_df as pb
+
 importlib.reload(mps)
+importlib.reload(pb)
 
-detect  = Path("/Volumes/my_own_ssd/2025_areax_lesion/R08_RC6_Comp2_song_detection.json")
-decoded = Path("/Volumes/my_own_ssd/2025_areax_lesion/TweetyBERT_Pretrain_LLB_AreaX_FallSong_R08_RC6_Comp2_decoded_database.json")
+decoded = Path("/Volumes/my_own_SSD/updated_AreaX_outputs/USA5271/USA5271_decoded_database.json")
+detect  = Path("/Volumes/my_own_SSD/updated_AreaX_outputs/USA5271/USA5271_song_detection.json")
 
-res = mps.build_decoded_with_split_labels(
+ann = mps.build_decoded_with_split_labels(
     decoded_database_json=decoded,
     song_detection_json=detect,
     only_song_present=True,
@@ -442,12 +570,13 @@ res = mps.build_decoded_with_split_labels(
     flatten_spec_params=True,
     max_gap_between_song_segments=500,
     segment_index_offset=0,
-    merge_repeated_syllables=True,   # ← NEW: enable coalescing
-    repeat_gap_ms=10.0,              # ← NEW: < 10 ms merges
-    repeat_gap_inclusive=False,      # use True to treat <= as mergeable
+    merge_repeated_syllables=True,
+    repeat_gap_ms=10.0,
+    repeat_gap_inclusive=False,
 )
 
-res.annotations_appended_df.to_csv(decoded.parent / "decoded_with_split_labels.csv", index=False)
-
-
+df = ann.annotations_appended_df
+print("Merged annotations shape:", df.shape)
+print(df["Recording DateTime"].head())
+print(df["Recording DateTime"].isna().value_counts())
 """

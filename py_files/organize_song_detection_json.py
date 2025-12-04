@@ -372,7 +372,7 @@ from organize_song_detection_json import (
 )
 
 detected_song_segments = build_detected_song_segments(
-    "/Volumes/my_own_ssd/2025_areax_lesion/R08_RC6_Comp2_song_detection.json",
+    "/Volumes/my_own_SSD/updated_AreaX_outputs/USA5271/USA5271_song_detection.json",
     max_gap_between_song_segments=500,
 )
 
