@@ -167,16 +167,13 @@ def build_birds_phrase_duration_stats_df(
 
         stats = stats.copy()
 
-        # NEW: ensure N_phrases exists for compatibility with plotting
-        # phrase_and_metadata_plotting expects an N_phrases (or n_phrases)
-        # column to do the min_phrases-based filtering.
+        # Ensure N_phrases exists for compatibility with plotting
         if "N_phrases" not in stats.columns:
             if "n_phrases" in stats.columns:
                 stats["N_phrases"] = stats["n_phrases"]
             elif "N" in stats.columns:
                 stats["N_phrases"] = stats["N"]
             else:
-                # If there is a raw durations list column, count elements
                 for cand in ["Durations_ms", "durations_ms", "Durations"]:
                     if cand in stats.columns:
                         stats["N_phrases"] = stats[cand].apply(
@@ -185,8 +182,6 @@ def build_birds_phrase_duration_stats_df(
                             else (len(v) if hasattr(v, "__len__") else np.nan)
                         )
                         break
-                # Final fallback: create column of NaN; N_phrases-based
-                # plots will just end up empty if min_phrases > 0.
                 if "N_phrases" not in stats.columns:
                     stats["N_phrases"] = np.nan
 
@@ -265,22 +260,18 @@ def build_birds_phrase_duration_stats_df(
     PRE_GROUPS = {"Early Pre", "Late Pre"}
     POST_GROUP = "Post"
 
-    # Group by animal + syllable to compare pre vs post within each
     group_keys = [id_col, "Syllable"]
     grouped = big_df.groupby(group_keys)
 
     for (animal_id_val, syll_val), idx in grouped.groups.items():
         sub = big_df.loc[idx]
 
-        # Extract pre and post rows
         pre_rows = sub[sub["Group"].isin(PRE_GROUPS)]
         post_rows = sub[sub["Group"] == POST_GROUP]
 
         if post_rows.empty or pre_rows.empty:
-            # Need both pre and post to compute comparisons
             continue
 
-        # Pre pooled N, mean, variance (weighted by N_phrases)
         n_pre = pre_rows["N_phrases"].fillna(0).astype(float).values
         mean_pre = pre_rows["Mean_ms"].astype(float).values
         var_pre = pre_rows["Variance_ms2"].astype(float).values
@@ -371,7 +362,6 @@ def build_birds_phrase_duration_stats_df(
             above_1sd = post_mean > (pre_mean + pre_std)
             above_2sd = post_mean > (pre_mean + 2.0 * pre_std)
 
-        # Assign these values back to the Post row(s) for this (animal, syllable)
         post_idx = post_rows.index
 
         big_df.loc[post_idx, "Pre_N_phrases"] = N_pre_total
@@ -401,20 +391,19 @@ def build_birds_phrase_duration_stats_df(
         per_animal_results=batch_results,
     )
 
-
+    
 """
-Example usage
--------------
-
 from pathlib import Path
 import importlib
 
 import phrase_duration_birds_stats_df as pb
 importlib.reload(pb)  # pick up recent edits
 
+# Paths to your metadata Excel and JSON root
 excel_path = Path("/Volumes/my_own_SSD/updated_AreaX_outputs/Area_X_lesion_metadata.xlsx")
 json_root  = Path("/Volumes/my_own_SSD/updated_AreaX_outputs")
 
+# Run the batch phrase-duration analysis across all birds in the Excel sheet
 res = pb.build_birds_phrase_duration_stats_df(
     excel_path=excel_path,
     json_root=json_root,
@@ -430,42 +419,15 @@ res = pb.build_birds_phrase_duration_stats_df(
     show_plots=False,
 )
 
+# Big concatenated DataFrame with all the pre/post metrics
 big_df = res.phrase_duration_stats_df
+print("big_df shape:", big_df.shape)
+print(big_df.head())
 
+# Save to CSV for downstream plotting (e.g., phrase_and_metadata_plotting.py)
 out_csv = json_root / "compiled_phrase_duration_stats_with_prepost_metrics.csv"
 big_df.to_csv(out_csv, index=False)
 print(f"Saved big_df with metrics to: {out_csv}")
 
-# Example: filter to Post rows where both mean & variance increased,
-# and Pre medians/variances are reasonably stable (small IQRs)
-interesting = big_df[
-    (big_df["Group"] == "Post")
-    & (big_df["Post_Mean_Increased"])
-    & (big_df["Post_Variance_Increased"])
-    # Example thresholds for filtering syllables by Pre stability:
-    # (tune these to taste)
-    & (big_df["Pre_Median_IQR_ms"] < 5_000)        # ms
-    & (big_df["Pre_Variance_IQR_ms2"] < 50_000_000)  # ms^2
-]
-
-print(
-    interesting[
-        [
-            "Animal ID",
-            "Syllable",
-            "Pre_Mean_ms",
-            "Mean_ms",
-            "Pre_Variance_ms2",
-            "Variance_ms2",
-            "Pre_Median_ms",
-            "Median_ms",
-            "Pre_IQR_ms",
-            "Pre_Median_IQR_ms",
-            "Pre_Variance_IQR_ms2",
-            "Post_vs_Pre_Delta_Mean_ms",
-            "Post_vs_Pre_Delta_Median_ms",
-        ]
-    ].head()
-)
 
 """

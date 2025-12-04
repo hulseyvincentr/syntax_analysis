@@ -1063,8 +1063,8 @@ import phrase_duration_balanced_syllable_usage as pbsu
 
 importlib.reload(pbsu)
 
-decoded_root = Path("/Volumes/my_own_ssd/2024_2025_Area_X_jsons_npzs/TweetyBERT_outputs")
-excel_path   = Path("/Volumes/my_own_ssd/2024_2025_Area_X_jsons_npzs/Area_X_lesion_metadata.xlsx")
+decoded_root = Path("/Volumes/my_own_SSD/updated_AreaX_outputs")
+excel_path   = Path("/Volumes/my_own_SSD/updated_AreaX_outputs/Area_X_lesion_metadata.xlsx")
 
 folder_res = pbsu.run_balanced_syllable_usage_from_metadata_excel(
     excel_path=excel_path,
