@@ -56,8 +56,8 @@ def plot_continuous_hit_type_scatter(
     Points from animals with Area X visible are colored by a continuous
     colormap (Blues/Purples) using the lesion percentage; points from animals
     where Area X was not visible (or lesion percentage is unavailable) are
-    plotted in discrete colors by hit-type category
-    (e.g., "large lesion Area x not visible", "sham saline injection").
+    plotted in discrete colors by hit-type category (e.g. sham vs
+    "large lesion Area x not visible").
     """
     # ------------------------------------------------------------------
     # 0. Load / validate DataFrame
@@ -160,8 +160,8 @@ def plot_continuous_hit_type_scatter(
     # Default discrete colors for non-visible / unquantified animals
     if discrete_color_map is None:
         discrete_color_map = {
+            # canonical key for any "large lesion ... not visible" variants
             "large lesion Area x not visible": "red",
-            "large lesion, Area X not visible": "red",
             "sham saline injection": "gold",
             "miss": "black",
             "unknown": "lightgray",
@@ -183,12 +183,30 @@ def plot_continuous_hit_type_scatter(
         lesion_pct_mode = "avg"
 
     def _is_visible(entry: Dict[str, Any]) -> bool:
+        """
+        Decide whether Area X is visible in histology.
+
+        • Any string starting with 'n' or containing 'not visible' → False
+        • Any string starting with 'y' or containing ' visible' (but not 'not visible') → True
+        """
         raw = entry.get(area_visible_col, "")
         if raw is None:
             return False
         s = str(raw).strip().lower()
-        # Accept "y", "yes", "visible", etc. as "visible"
-        return s.startswith("y") or "visible" in s
+
+        # Explicit negative cases first
+        if "not visible" in s:
+            return False
+        if s.startswith("n"):
+            return False
+
+        # Positive cases
+        if s.startswith("y"):
+            return True
+        if " visible" in s or s == "visible":
+            return True
+
+        return False
 
     def _get_lesion_pct(entry: Dict[str, Any]) -> float:
         def _to_float(x: Any) -> float:
@@ -209,6 +227,31 @@ def plot_continuous_hit_type_scatter(
             if not vals:
                 return float("nan")
             return float(np.mean(vals))
+
+    def _canonical_hit_type(cat_raw: Any) -> str:
+        """
+        Normalize hit-type strings so that variations of
+        'large lesion Area X not visible' all map to a canonical key,
+        and sham/miss/unknown are collapsed sensibly.
+        """
+        if cat_raw is None:
+            return "unknown"
+        s = str(cat_raw).strip()
+        if s == "":
+            return "unknown"
+
+        low = s.lower()
+
+        if "large" in low and "lesion" in low and "visible" in low:
+            # Covers e.g. 'large lesion Area x not visible',
+            # 'large lesion, Area X not visible', etc.
+            return "large lesion Area x not visible"
+        if "sham" in low:
+            return "sham saline injection"
+        if "miss" in low:
+            return "miss"
+
+        return s  # fall back to original label
 
     def _pretty_axes(ax: plt.Axes) -> None:
         for spine in ["top", "right"]:
@@ -316,14 +359,13 @@ def plot_continuous_hit_type_scatter(
                 y_vis.append(y_val)
                 c_vis.append(pct)
             else:
-                cat_raw = entry.get(hemi_hit_type_col, "unknown")
-                cat = "unknown" if cat_raw is None or str(cat_raw).strip() == "" else str(cat_raw)
+                raw_cat = entry.get(hemi_hit_type_col, "unknown")
+                cat = _canonical_hit_type(raw_cat)
                 if cat not in discrete_points:
                     discrete_points[cat] = ([], [])
                 discrete_points[cat][0].append(x_val)
                 discrete_points[cat][1].append(y_val)
 
-        # If absolutely everything ended up in discrete, that's fine.
         if not x_vis and not discrete_points:
             print(
                 f"[INFO] No data to plot for {metric_name} ({hemi_label}) "
@@ -350,16 +392,20 @@ def plot_continuous_hit_type_scatter(
 
         # 2) Discrete points
         legend_handles: list[Any] = []
-        legend_labels: list[str] = []
 
+        # Handle for continuous points (legend) – uses a clear marker
         if sc is not None:
-            # Legend handle for the continuous points (blue marker)
             handle_cont = mlines.Line2D(
-                [], [], color="blue", marker="o", linestyle="none",
-                label="Area X visible (colorbar = % lesion)"
+                [], [],
+                marker="o",
+                linestyle="none",
+                markersize=9,
+                markerfacecolor="none",
+                markeredgecolor="blue",
+                markeredgewidth=1.2,
+                label="Area X visible (see colorbar)",
             )
             legend_handles.append(handle_cont)
-            legend_labels.append(handle_cont.get_label())
 
         for cat, (xs, ys) in discrete_points.items():
             color = discrete_color_map.get(cat, "gray")
@@ -371,14 +417,19 @@ def plot_continuous_hit_type_scatter(
                 color=color,
                 edgecolors="black",
                 linewidths=0.4,
-                label=cat,
             )
             legend_handles.append(
                 mlines.Line2D(
-                    [], [], color=color, marker="o", linestyle="none", label=cat
+                    [], [],
+                    marker="o",
+                    linestyle="none",
+                    markersize=9,
+                    markerfacecolor=color,
+                    markeredgecolor="black",
+                    markeredgewidth=0.8,
+                    label=cat,
                 )
             )
-            legend_labels.append(cat)
 
         # Axes labels / title
         ax.set_xlabel(x_label)
@@ -428,20 +479,22 @@ def plot_continuous_hit_type_scatter(
 
         _pretty_axes(ax)
 
-        # Legend (add y=x handle as separate entry)
+        # Legend (add y=x handle)
         line_handle = mlines.Line2D(
             [], [], color="red", linestyle="--", label="y=x"
         )
         legend_handles.append(line_handle)
-        legend_labels.append("y=x")
 
         if legend_handles:
             ax.legend(
                 handles=legend_handles,
-                loc="center left",
-                bbox_to_anchor=(1.02, 0.5),
+                loc="upper left",
+                bbox_to_anchor=(0.02, 0.98),
                 borderaxespad=0.0,
-                frameon=False,
+                frameon=True,
+                facecolor="white",
+                framealpha=0.85,
+                fontsize=10,
             )
 
         # Colorbar for continuous points (if any)
@@ -463,7 +516,6 @@ def plot_continuous_hit_type_scatter(
     # ------------------------------------------------------------------
     # 6. Generate plots for Medial and Lateral hit types
     # ------------------------------------------------------------------
-    # x/y labels per metric
     metrics = [
         ("mean", mean_col, "Late Pre mean (ms)", "Post lesion mean (ms)"),
         ("median", median_col, "Late Pre median (ms)", "Post lesion median (ms)"),
@@ -481,7 +533,7 @@ def plot_continuous_hit_type_scatter(
             metric_name=metric_name,
             x_label=xlab,
             y_label=ylab,
-            cmap_name="Blues",  # shades of blue
+            cmap_name="Blues",
         )
         _scatter_for_metric(
             hemi_label="Lateral Area X",
@@ -490,22 +542,20 @@ def plot_continuous_hit_type_scatter(
             metric_name=metric_name,
             x_label=xlab,
             y_label=ylab,
-            cmap_name="Purples",  # distinguish lateral with a different colormap
+            cmap_name="Purples",
         )
 
     return df
 
 
 if __name__ == "__main__":
-    # Minimal CLI-style usage example (adjust paths as needed).
-    # This block will only run if you execute this file directly:
-    #   python phrase_and_metadata_continuous_plotting.py
     import argparse
 
     parser = argparse.ArgumentParser(
         description=(
             "Generate Late Pre vs Post scatterplots for phrase-duration metrics "
-            "with continuous % lesion coloring for Area X visible animals."
+            "with continuous % lesion coloring for Area X visible animals and "
+            "discrete colors for non-visible / unquantified cases."
         )
     )
     parser.add_argument(
@@ -554,7 +604,11 @@ if __name__ == "__main__":
     compiled_path = Path(args.compiled_stats_path)
     excel_path = Path(args.metadata_excel_path)
     out_dir = Path(args.output_dir) if args.output_dir is not None else None
-    volumes_dir = Path(args.metadata_volumes_dir) if args.metadata_volumes_dir is not None else None
+    volumes_dir = (
+        Path(args.metadata_volumes_dir)
+        if args.metadata_volumes_dir is not None
+        else None
+    )
 
     plot_continuous_hit_type_scatter(
         compiled_stats_path=compiled_path,
@@ -570,22 +624,23 @@ if __name__ == "__main__":
 """
 from pathlib import Path
 import importlib
-import phrase_and_metadata_continuous_plotting as pmc
-importlib.reload(pmc)
+import phrase_and_metadata_continuous_plotting as pmcp
+importlib.reload(pmcp)
 
-compiled_csv = Path("/Volumes/my_own_ssd/.../compiled_phrase_duration_stats_with_prepost_metrics.csv")
-excel_path   = Path("/Volumes/my_own_ssd/.../Area_X_lesion_metadata.xlsx")
-vol_dir      = Path("/Volumes/my_own_ssd/.../lesion_quantification_csvs_jsons")
+compiled_csv = Path("/Volumes/my_own_SSD/updated_AreaX_outputs/usage_balanced_phrase_duration_stats.csv")
+excel_path   = Path("/Volumes/my_own_SSD/updated_AreaX_outputs/Area_X_lesion_metadata.xlsx")
+histology_volumes_dir      = Path("/Volumes/my_own_SSD/histology_files/lesion_quantification_csvs_jsons")
 
-pmc.plot_continuous_hit_type_scatter(
+pmcp.plot_continuous_hit_type_scatter(
     compiled_stats_path=compiled_csv,
-    compiled_format="csv",
+    compiled_format="csv",                    # file is a CSV
     metadata_excel_path=excel_path,
-    metadata_volumes_dir=vol_dir,
-    output_dir=compiled_csv.parent / "continuous_hit_type_scatters",
-    min_phrases=50,
-    lesion_pct_mode="avg",
-    show_plots=True,
+    metadata_volumes_dir=histology_volumes_dir,
+    output_dir=compiled_csv.parent / "phrase_duration_continuous_scatter",
+    file_prefix="AreaX_continuous",          # prefix for all PNGs
+    min_phrases=50,                          # only plot syllables with ≥50 phrases
+    lesion_pct_mode="avg",                   # color by average(L,R) % lesion
+    show_plots=True,                         # also pop up the figures in Spyder
 )
 
 
