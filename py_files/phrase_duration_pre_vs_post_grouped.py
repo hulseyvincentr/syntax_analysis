@@ -16,7 +16,7 @@ from itertools import combinations
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import seaborn as sns
+import seaborn as sns 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # External merge builder (required to auto-merge)
@@ -1222,8 +1222,8 @@ Example interactive usage (single animal):
 from pathlib import Path
 import phrase_duration_pre_vs_post_grouped as pdpg
 
-detect  = Path("/Volumes/my_own_ssd/2024_2025_Area_X_jsons_npzs/USA5288/USA5288_song_detection.json")
-decoded = Path("/Volumes/my_own_ssd/2024_2025_Area_X_jsons_npzs/USA5288/USA5288_decoded_database.json")
+detect  = Path("/Volumes/my_own_SSD/updated_AreaX_outputs/USA5443/USA5443_song_detection.json")
+decoded = Path("/Volumes/my_own_SSD/updated_AreaX_outputs/USA5443/USA5443_decoded_database.json")
 
 outdir = decoded.parent / "figures" / "phrase_durations"
 outdir.mkdir(parents=True, exist_ok=True)
@@ -1237,9 +1237,9 @@ res = pdpg.run_phrase_duration_pre_vs_post_grouped(
     repeat_gap_ms=10.0,
     repeat_gap_inclusive=False,
     output_dir=outdir,
-    treatment_date="2024-04-09",
+    treatment_date="2024-04-30",
     grouping_mode="auto_balance",
-    restrict_to_labels=[str(i) for i in range(26)],
+    restrict_to_labels=None,
     y_max_ms=40000,
     show_plots=True,
 )

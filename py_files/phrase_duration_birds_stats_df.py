@@ -484,7 +484,7 @@ res = pb.build_birds_phrase_duration_stats_df(
     early_group_size=100,
     late_group_size=100,
     post_group_size=100,
-    restrict_to_labels=[str(i) for i in range(26)],
+    restrict_to_labels=None,
     y_max_ms=40000,
     show_plots=False,
 )

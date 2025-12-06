@@ -37,7 +37,7 @@ Single bird (recommended, using merged songs):
         decoded_database_json=decoded_json,
         treatment_date=tdate,
         group_size=None,              # None → auto-balance per syllable
-        restrict_to_labels=[str(i) for i in range(26)],
+        restrict_to_labels=None,
         animal_id=bird_id,
         song_detection_json=detection_json,  # <- use merged songs
     )
@@ -51,7 +51,7 @@ Single bird (legacy JSON-only, no merged songs):
         decoded_database_json=decoded_json,
         treatment_date=tdate,
         group_size=None,
-        restrict_to_labels=[str(i) for i in range(26)],
+        restrict_to_labels=None,
         animal_id=bird_id,
         song_detection_json=None,  # or omit this argument
     )
@@ -73,7 +73,7 @@ Batch across birds from Excel metadata (per-bird folders, merged songs):
         id_col="Animal ID",
         treatment_date_col="Treatment date",
         group_size=None,                   # None → auto-balance per syllable
-        restrict_to_labels=[str(i) for i in range(26)],
+        restrict_to_labels=None, #[str(i) for i in range(26)] if you just want the first 25 syllables
         glob_pattern="*decoded_database.json",  # used for decoded JSON search
         compiled_filename="usage_balanced_phrase_duration_stats.csv",
     )
@@ -1356,7 +1356,7 @@ folder_res = pbsu.run_balanced_syllable_usage_from_metadata_excel(
     id_col="Animal ID",
     treatment_date_col="Treatment date",
     group_size=None,                   # None → auto-balance per (bird, syllable)
-    restrict_to_labels=[str(i) for i in range(26)],
+    restrict_to_labels=None,
     glob_pattern="*decoded_database.json",      # decoded JSON pattern
     compiled_filename="usage_balanced_phrase_duration_stats.csv",
 )
