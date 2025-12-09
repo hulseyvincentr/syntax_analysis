@@ -1348,7 +1348,7 @@ importlib.reload(pbsu)
 
 decoded_root = Path("/Volumes/my_own_SSD/updated_AreaX_outputs")
 excel_path   = decoded_root / "Area_X_lesion_metadata.xlsx"
-
+mai
 folder_res = pbsu.run_balanced_syllable_usage_from_metadata_excel(
     excel_path=excel_path,
     decoded_root=decoded_root,

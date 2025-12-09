@@ -317,3 +317,23 @@ if __name__ == "__main__":
     example_metadata = example_root / "Area_X_lesion_metadata.xlsx"
     print("[INFO] NPZ_plot_wrapper.py loaded as a script. Edit __main__ if you want to test directly.")
     # NPZ_plot_wrapper(example_root, example_metadata)
+
+
+"""
+from pathlib import Path
+import importlib
+import NPZ_plot_wrapper as wrapper
+
+importlib.reload(wrapper)
+
+root = Path("/Volumes/my_own_SSD/updated_AreaX_outputs")
+metadata_excel = root / "Area_X_lesion_metadata.xlsx"
+
+wrapper.NPZ_plot_wrapper(
+    npz_or_root=root,
+    metadata_excel=metadata_excel,
+    repertoire_root=root / "Area_X_repertoire_figures",
+    spectrogram_length=1000,
+    num_sample_spectrograms=1,
+)
+"""

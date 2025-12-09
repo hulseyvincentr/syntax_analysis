@@ -161,8 +161,8 @@ import phrase_duration_birds_stats_df as pb
 importlib.reload(pb)  # pick up recent edits
 
 # Paths to your metadata and JSON/NPZ root
-excel_path = Path("/Users/mirandahulsey-vincent/Desktop/Area_X_lesion_metadata.xlsx")
-json_root  = Path("/Volumes/my_own_ssd/2024_2025_Area_X_jsons_npzs")
+excel_path = Path("/Volumes/my_own_SSD/updated_AreaX_outputs/Area_X_lesion_metadata.xlsx")
+json_root  = Path("/Volumes/my_own_SSD/updated_AreaX_outputs")
 
 # Run phrase_duration_pre_vs_post_grouped across all birds and build big_df
 res = pb.build_birds_phrase_duration_stats_df(

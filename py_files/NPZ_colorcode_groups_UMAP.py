@@ -14,7 +14,8 @@ Features
                 ^^^^^^^^^^^^^
                 Excel serial (days since 1899-12-30)
 
-- animal_id is inferred from the NPZ filename (e.g., "USA5443").
+- animal_id is inferred from the NPZ filename or parent folder
+  (e.g., "USA5443", "ZEBRA01", "CanaryA", etc.).
 
 - Treatment date & treatment type are looked up automatically from a
   metadata Excel sheet (e.g., Area_X_lesion_metadata.xlsx) with columns:
@@ -113,6 +114,65 @@ def is_valid_npz(path: Union[str, Path]) -> bool:
         return False
 
 
+def _infer_animal_id_from_path(
+    npz_path: Path,
+    metadata_keys: Optional[Sequence[str]] = None,
+) -> Optional[str]:
+    """
+    Infer an animal_id from an NPZ path.
+
+    Strategy
+    --------
+    1. Take the file stem (without .npz), e.g.
+           'BIRD123_45424.5463_segment_0' -> 'BIRD123'
+       i.e. everything before the first underscore.
+    2. Also consider the full stem and the parent folder name as candidates.
+    3. If metadata_keys are provided, return the first candidate that
+       appears in metadata_keys.
+    4. Otherwise, return the first non-empty candidate.
+
+    This allows IDs like 'USA5443', 'ZEBRA01', 'CanaryA', etc.,
+    as long as they match the 'Animal ID' entries in the metadata Excel.
+    """
+    candidates: list[str] = []
+
+    # File stem: e.g. 'BIRD123_45424.5463_segment_0' or 'BIRD123'
+    stem = npz_path.stem
+    if stem:
+        parts = stem.split("_")
+        # First token is typically the bird ID
+        candidates.append(parts[0].strip())
+        # Also consider the full stem
+        candidates.append(stem.strip())
+
+    # Parent folder name (e.g. 'BIRD123')
+    parent_name = npz_path.parent.name.strip()
+    if parent_name:
+        candidates.append(parent_name)
+        parent_parts = parent_name.split("_")
+        if parent_parts:
+            candidates.append(parent_parts[0].strip())
+
+    # De-duplicate while preserving order
+    seen = set()
+    unique_candidates: list[str] = []
+    for c in candidates:
+        if not c or c in seen:
+            continue
+        seen.add(c)
+        unique_candidates.append(c)
+
+    # If we know the valid IDs (metadata keys), prefer one of those
+    if metadata_keys is not None:
+        key_set = set(str(k) for k in metadata_keys)
+        for c in unique_candidates:
+            if c in key_set:
+                return c
+
+    # Fallback: just return the first candidate if any
+    return unique_candidates[0] if unique_candidates else None
+
+
 # ---------------------------------------------------------------------
 # Public helper: find earliest/latest recording dates from NPZ
 # ---------------------------------------------------------------------
@@ -192,7 +252,7 @@ def run_umap_overlap_from_npz(
     ----------
     npz_path : str or Path
         Path to USA####.npz file (TweetyBERT output). The filename
-        is used to infer animal_id via a pattern like "USA5443".
+        is used to infer animal_id (e.g. "USA5443", "ZEBRA01").
     date_range_before : sequence of 2 str
         Start and end date (inclusive) for the "before" dataset,
         e.g. ("2024-04-01", "2024-04-29").
@@ -221,11 +281,8 @@ def run_umap_overlap_from_npz(
     if date_range_before is None or date_range_after is None:
         raise ValueError("Please provide both date_range_before and date_range_after.")
 
-    # Infer animal_id from NPZ filename, e.g., "USA5443"
-    animal_id = "Unknown ID"
-    match = re.search(r"(USA\d{4})", npz_path.name)
-    if match:
-        animal_id = match.group(1)
+    # Infer animal_id from NPZ path (generic, not just USA####)
+    animal_id = _infer_animal_id_from_path(npz_path) or "Unknown ID"
 
     title_treatment_date = treatment_date or "Unknown treatment date"
     title_treatment_type = treatment_type or "Unknown treatment type"
@@ -577,7 +634,7 @@ def _find_npz_files(npz_or_root: Union[str, Path]) -> Sequence[Path]:
     for sub in sorted(p.iterdir()):
         if not sub.is_dir():
             continue
-        # Most common pattern: USA5337/USA5337.npz
+        # Most common pattern: USA5337/USA5337.npz (or any ID/ID.npz)
         candidate = sub / f"{sub.name}.npz"
         if candidate.is_file():
             npz_paths.append(candidate)
@@ -650,25 +707,21 @@ def run_umap_for_path(
 
     print(f"\nFound {len(npz_paths)} NPZ file(s) to process.\n")
 
+    metadata_keys = metadata.keys()
+
     for npz_path in npz_paths:
         npz_path = Path(npz_path)
-        # Infer animal_id from filename or parent folder
-        animal_id = None
-        match = re.search(r"(USA\d{4})", npz_path.name)
-        if match:
-            animal_id = match.group(1)
-        else:
-            # Try parent folder name
-            match_parent = re.search(r"(USA\d{4})", npz_path.parent.name)
-            if match_parent:
-                animal_id = match_parent.group(1)
+
+        # Infer animal_id generically from filename / parent folder,
+        # using metadata keys to choose the right candidate.
+        animal_id = _infer_animal_id_from_path(npz_path, metadata_keys=metadata_keys)
 
         if animal_id is None:
             print(f"[WARN] Could not infer animal_id from {npz_path}. Skipping.")
             continue
 
         if animal_id not in metadata:
-            print(f"[WARN] No metadata found for {animal_id} in Excel. Skipping.")
+            print(f"[WARN] No metadata found for inferred animal_id {animal_id!r} in Excel. Skipping.")
             continue
 
         meta = metadata[animal_id]
@@ -723,6 +776,9 @@ if __name__ == "__main__":
 
 
 """
+Example Spyder usage
+--------------------
+
 from pathlib import Path
 import importlib
 import NPZ_colorcode_groups_UMAP as umapmod
@@ -736,5 +792,4 @@ umapmod.run_umap_for_path(
     npz_or_root=root,
     metadata_excel=metadata_excel,
 )
-
 """

@@ -167,9 +167,9 @@ def plot_continuous_hit_type_scatter(
     if discrete_color_map is None:
         discrete_color_map = {
             # canonical key for any "large lesion ... not visible" variants
-            "large lesion Area x not visible": "red",
+            "large lesion Area x not visible": "black",
             "sham saline injection": "orange",  # sham = orange
-            "miss": "black",
+            "miss": "lightgray",
             "unknown": "lightgray",
         }
 
