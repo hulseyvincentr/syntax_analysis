@@ -1079,9 +1079,8 @@ if __name__ == "__main__":
         metadata_sheet_name=sheet_name,
         output_dir=out_dir,
         log_mode=args.log_mode,
-        show_plots=args.show_plots,
-    )
-
+        show_plots=args.show_plots,)
+    
     print("\n--- Paired t-test results (log-variance) ---")
     print(f"NMA lesions log-var t-test p-value: {res['p_nma']}")
     print(f"Sham saline log-var t-test p-value: {res['p_sham']}")
