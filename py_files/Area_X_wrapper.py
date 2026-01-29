@@ -7,19 +7,27 @@ Wrapper that:
   • Merges detected songs (durations) ONCE
 then runs analyses using those merged tables.
 
-NEW (batch mode):
-  • Optionally pass a JSON ROOT directory containing subfolders per animal_id
+Batch mode:
+  • Pass a JSON ROOT directory containing subfolders per animal_id
   • Provide an Excel metadata file to look up treatment dates
   • Iterate across all animal folders and run the full bundle per bird
+
+Transitions (NEW):
+  • Builds PRE and POST first-order transition matrices (counts + probabilities)
+  • Saves CSVs and 2 heatmap figures (PRE, POST)
+  • Also saves a change plot: Δ = POST − PRE
 """
 
 from __future__ import annotations
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Union, Any, Tuple, Iterable
+from collections import defaultdict
 
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 
 # --- Core builders (merge once) ---
 from merge_annotations_from_split_songs import build_decoded_with_split_labels
@@ -61,9 +69,7 @@ def _excel_serial_to_timestamp(x: Any) -> Optional[pd.Timestamp]:
     except Exception:
         pass
 
-    # Excel serials are often floats/ints like 45424.0
     if isinstance(x, (int, float, np.integer, np.floating)):
-        # Heuristic: Excel serials for modern dates are typically > 20000
         if float(x) > 1000:
             try:
                 return pd.to_datetime(float(x), unit="D", origin="1899-12-30").normalize()
@@ -103,12 +109,10 @@ def _pick_single_match(paths: List[Path], kind: str, animal_dir: Path) -> Path:
         raise FileNotFoundError(f"Could not find {kind} JSON in: {animal_dir}")
     if len(paths) == 1:
         return paths[0]
-    # If multiple, prefer ones that contain the folder name as prefix
     folder_id = animal_dir.name
     pref = [p for p in paths if p.name.startswith(folder_id + "_")]
     if len(pref) == 1:
         return pref[0]
-    # Otherwise pick shortest filename to reduce “backup copies” odds
     return sorted(paths, key=lambda p: len(p.name))[0]
 
 
@@ -117,15 +121,15 @@ def _find_required_jsons(animal_dir: Path) -> Tuple[Path, Path]:
     Find (decoded_database_json, song_detection_json) inside an animal folder.
     Robust to naming variations.
     """
-    # Common patterns
     decoded_candidates = list(animal_dir.glob("*decoded_database*.json")) + list(animal_dir.glob("*decoded*database*.json"))
     detect_candidates  = list(animal_dir.glob("*song_detection*.json")) + list(animal_dir.glob("*song*detect*.json"))
 
-    # Fallback: any json containing keywords
     if not decoded_candidates:
-        decoded_candidates = [p for p in animal_dir.glob("*.json") if ("decoded" in p.name.lower() and "database" in p.name.lower())]
+        decoded_candidates = [p for p in animal_dir.glob("*.json")
+                             if ("decoded" in p.name.lower() and "database" in p.name.lower())]
     if not detect_candidates:
-        detect_candidates = [p for p in animal_dir.glob("*.json") if ("song" in p.name.lower() and "detect" in p.name.lower())]
+        detect_candidates = [p for p in animal_dir.glob("*.json")
+                             if ("song" in p.name.lower() and "detect" in p.name.lower())]
 
     decoded_json = _pick_single_match(decoded_candidates, "decoded_database", animal_dir)
     detect_json  = _pick_single_match(detect_candidates, "song_detection", animal_dir)
@@ -144,20 +148,14 @@ def _auto_find_metadata_columns(df: pd.DataFrame) -> Tuple[str, str]:
     cols = list(df.columns)
     norm = {_normalize_colname(c): c for c in cols}
 
-    # Animal ID candidates
-    animal_keys = [
-        "animalid", "animal_id", "birdid", "bird_id", "id", "subjectid", "subject_id"
-    ]
-    # Treatment date candidates
-    date_keys = [
-        "treatmentdate", "treatment_date", "surgerydate", "surgery_date", "lesiondate", "lesion_date", "injdate", "inj_date"
-    ]
+    animal_keys = ["animalid", "animal_id", "birdid", "bird_id", "id", "subjectid", "subject_id"]
+    date_keys   = ["treatmentdate", "treatment_date", "surgerydate", "surgery_date",
+                   "lesiondate", "lesion_date", "injdate", "inj_date"]
 
     def _find(keys: List[str]) -> Optional[str]:
         for k in keys:
             if k in norm:
                 return norm[k]
-        # fuzzy contains
         for nk, orig in norm.items():
             for k in keys:
                 if k in nk:
@@ -204,10 +202,15 @@ def load_treatment_dates_from_excel(
         tval = row.get(treatment_date_col, None)
         if aid is None or (isinstance(aid, float) and np.isnan(aid)):
             continue
-        aid_str = str(aid).strip()
 
-        # Convert treatment date value
-        ts = None
+        # Normalize animal ID string a bit (helps with Excel floats like 5288.0)
+        if isinstance(aid, (int, np.integer)):
+            aid_str = str(int(aid))
+        elif isinstance(aid, (float, np.floating)) and np.isfinite(aid) and float(aid).is_integer():
+            aid_str = str(int(aid))
+        else:
+            aid_str = str(aid).strip()
+
         ts = _excel_serial_to_timestamp(tval)
         if ts is None:
             try:
@@ -223,6 +226,246 @@ def load_treatment_dates_from_excel(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# First-order transition matrices (PRE vs POST)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _try_int_for_sort(x: Any):
+    """Sort labels numerically when possible, otherwise lexicographically."""
+    try:
+        return int(x)
+    except Exception:
+        return str(x)
+
+
+def _as_str_labels(labels: Iterable[Any]) -> List[str]:
+    """Ensure all labels are strings (safe for DataFrame index/columns)."""
+    return [str(l) for l in labels]
+
+
+def build_first_order_transition_matrices(
+    organized_df: pd.DataFrame,
+    *,
+    order_column: str = "syllable_order",
+    restrict_to_labels: Optional[Iterable[str]] = None,
+    min_row_total: int = 0,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Build first-order transition **count** and **probability** matrices from a
+    DataFrame that contains a per-row list of syllable labels in temporal order.
+
+    Returns
+    -------
+    counts : pd.DataFrame
+        Square matrix of transition counts (rows=current, cols=next).
+    probs : pd.DataFrame
+        Row-normalized transition probabilities (sum(row) == 1 or 0 if empty/zeroed).
+    """
+    if order_column not in organized_df.columns:
+        raise KeyError(f"Expected column '{order_column}' in organized_df.")
+
+    transition_counts = defaultdict(lambda: defaultdict(int))
+
+    for order in organized_df[order_column]:
+        if isinstance(order, list) and len(order) > 1:
+            order_str = _as_str_labels(order)
+            for i in range(len(order_str) - 1):
+                curr_syll = order_str[i]
+                next_syll = order_str[i + 1]
+                transition_counts[curr_syll][next_syll] += 1
+
+    all_labels = set(transition_counts.keys()) | {s for d in transition_counts.values() for s in d}
+    all_labels = _as_str_labels(all_labels)
+
+    if restrict_to_labels is not None:
+        allowed = set(_as_str_labels(restrict_to_labels))
+        all_labels = [l for l in all_labels if l in allowed]
+
+    sorted_labels = sorted(all_labels, key=_try_int_for_sort)
+
+    counts = pd.DataFrame(0, index=sorted_labels, columns=sorted_labels, dtype=int)
+    for curr_syll, nexts in transition_counts.items():
+        if curr_syll not in counts.index:
+            continue
+        for next_syll, c in nexts.items():
+            if next_syll in counts.columns:
+                counts.loc[curr_syll, next_syll] = int(c)
+
+    if min_row_total > 0:
+        bad_rows = counts.sum(axis=1) < int(min_row_total)
+        counts.loc[bad_rows, :] = 0
+
+    row_sums = counts.sum(axis=1).replace(0, np.nan)
+    probs = counts.div(row_sums, axis=0).fillna(0)
+
+    return counts, probs
+
+
+def plot_transition_matrix(
+    mat: pd.DataFrame,
+    *,
+    title: Optional[str] = None,
+    xlabel: str = "Next Syllable",
+    ylabel: str = "Current Syllable",
+    figsize: Tuple[float, float] = (10, 8),
+    show: bool = True,
+    save_fig_path: Optional[Union[str, Path]] = None,
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
+    cmap: str = "Greys",
+    cbar_label: str = "Value",
+) -> None:
+    """
+    Plot a matrix as a heatmap using matplotlib.
+
+    For probability matrices, use vmin=0, vmax=1, cmap="Greys".
+    For delta matrices (can be negative), use cmap="bwr" and symmetric vmin/vmax.
+    """
+    plt.figure(figsize=figsize)
+    arr = mat.to_numpy(dtype=float)
+
+    if vmin is None:
+        vmin = float(np.nanmin(arr)) if arr.size else 0.0
+    if vmax is None:
+        vmax = float(np.nanmax(arr)) if arr.size else 1.0
+
+    plt.imshow(arr, aspect="equal", interpolation="nearest", cmap=cmap, vmin=vmin, vmax=vmax)
+    plt.colorbar(label=cbar_label)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    if title:
+        plt.title(title)
+
+    plt.xticks(ticks=np.arange(mat.shape[1]), labels=list(mat.columns), rotation=45, ha="right")
+    plt.yticks(ticks=np.arange(mat.shape[0]), labels=list(mat.index), rotation=0)
+
+    plt.tight_layout()
+
+    if save_fig_path:
+        save_fig_path = Path(save_fig_path)
+        save_fig_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(save_fig_path, dpi=300, bbox_inches="tight")
+
+    if show:
+        plt.show()
+    else:
+        plt.close()
+
+
+def _ensure_syllable_order_column(
+    df: pd.DataFrame,
+    *,
+    order_col: str = "syllable_order",
+    dict_col: str = "syllable_onsets_offsets_ms_dict",
+) -> pd.DataFrame:
+    """
+    Ensure df has a column 'order_col' with a list of syllable labels in temporal order per row.
+    If already present, returns df unchanged.
+    Otherwise tries to build from a dict like:
+        {label: [(onset_ms, offset_ms), ...], ...}
+    """
+    if order_col in df.columns:
+        return df
+
+    if dict_col not in df.columns:
+        raise KeyError(f"Need either '{order_col}' or '{dict_col}' to construct syllable orders.")
+
+    def _order_from_dict(d) -> List[str]:
+        if not isinstance(d, dict):
+            return []
+        events: List[Tuple[float, str]] = []
+        for lab, intervals in d.items():
+            if intervals is None:
+                continue
+            for iv in intervals:
+                if iv is None:
+                    continue
+                onset = None
+                if isinstance(iv, (list, tuple)) and len(iv) >= 1:
+                    onset = iv[0]
+                elif isinstance(iv, dict) and "onset_ms" in iv:
+                    onset = iv["onset_ms"]
+                if onset is None:
+                    continue
+                try:
+                    events.append((float(onset), str(lab)))
+                except Exception:
+                    continue
+        events.sort(key=lambda x: x[0])
+        return [lab for _, lab in events]
+
+    df = df.copy()
+    df[order_col] = df[dict_col].apply(_order_from_dict)
+    return df
+
+
+def _build_pre_post_transition_matrices(
+    merged_annotations_df: pd.DataFrame,
+    *,
+    treatment_date: pd.Timestamp,
+    datetime_col_candidates: Tuple[str, ...] = ("Recording DateTime", "recording_datetime"),
+    order_col: str = "syllable_order",
+    dict_col: str = "syllable_onsets_offsets_ms_dict",
+    restrict_to_labels: Optional[Iterable[str]] = None,
+    min_row_total: int = 0,
+) -> Dict[str, pd.DataFrame]:
+    """
+    Returns dict:
+      pre_counts, pre_probs, post_counts, post_probs
+    All reindexed to the same label union.
+    """
+    df = merged_annotations_df.copy()
+
+    dt_col = None
+    for c in datetime_col_candidates:
+        if c in df.columns:
+            dt_col = c
+            break
+    if dt_col is None:
+        raise KeyError(f"Need a datetime column to split pre/post. Looked for {datetime_col_candidates}.")
+
+    df[dt_col] = pd.to_datetime(df[dt_col], errors="coerce")
+    df = df.dropna(subset=[dt_col])
+
+    df = _ensure_syllable_order_column(df, order_col=order_col, dict_col=dict_col)
+    df = df[df[order_col].apply(lambda x: isinstance(x, list) and len(x) > 1)]
+
+    pre_df = df[df[dt_col] < treatment_date]
+    post_df = df[df[dt_col] >= treatment_date]
+
+    pre_counts, pre_probs = build_first_order_transition_matrices(
+        pre_df,
+        order_column=order_col,
+        restrict_to_labels=restrict_to_labels,
+        min_row_total=min_row_total,
+    )
+    post_counts, post_probs = build_first_order_transition_matrices(
+        post_df,
+        order_column=order_col,
+        restrict_to_labels=restrict_to_labels,
+        min_row_total=min_row_total,
+    )
+
+    all_labels = sorted(set(pre_counts.index) | set(post_counts.index), key=_try_int_for_sort)
+
+    pre_counts = pre_counts.reindex(index=all_labels, columns=all_labels, fill_value=0)
+    post_counts = post_counts.reindex(index=all_labels, columns=all_labels, fill_value=0)
+
+    def _counts_to_probs(counts: pd.DataFrame) -> pd.DataFrame:
+        row_sums = counts.sum(axis=1).replace(0, np.nan)
+        return counts.div(row_sums, axis=0).fillna(0)
+
+    pre_probs = _counts_to_probs(pre_counts)
+    post_probs = _counts_to_probs(post_counts)
+
+    return {
+        "pre_counts": pre_counts,
+        "pre_probs": pre_probs,
+        "post_counts": post_counts,
+        "post_probs": post_probs,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Dataclasses for outputs
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -232,19 +475,22 @@ class DurationPlotsOut:
     three_group_path: Optional[str]
     three_group_stats: Dict[str, Any]
 
+
 @dataclass
 class HeatmapOut:
-    path_v1: Optional[str]      # vmax=1.0
-    path_vmax: Optional[str]    # vmax=max observed
+    path_v1: Optional[str]
+    path_vmax: Optional[str]
     vmax_max: float
+
 
 @dataclass
 class TTEPlotsOut:
     timecourse_path: Optional[str]
-    three_group_path: Optional[str]         # clean (no stats panel)
-    three_group_stats_path: Optional[str]   # right-hand stats panel
+    three_group_path: Optional[str]
+    three_group_stats_path: Optional[str]
     prepost_p_value: Optional[float]
     prepost_test: Optional[str]
+
 
 @dataclass
 class PhraseDurationPlotsOut:
@@ -252,11 +498,24 @@ class PhraseDurationPlotsOut:
     syllable_labels: List[str]
     y_limits: Tuple[float, float]
 
+
 @dataclass
 class DailyPhraseDurationOut:
     output_dir: Optional[str]
     num_plots: int
     sample_paths: List[str]
+
+
+@dataclass
+class TransitionMatricesOut:
+    pre_counts_csv: Optional[str]
+    pre_probs_csv: Optional[str]
+    post_counts_csv: Optional[str]
+    post_probs_csv: Optional[str]
+    pre_probs_fig: Optional[str]
+    post_probs_fig: Optional[str]
+    delta_probs_fig: Optional[str]  # Δ = POST − PRE
+
 
 @dataclass
 class AreaXMetaResult:
@@ -266,7 +525,7 @@ class AreaXMetaResult:
     last_syllable_counts: Dict[str, int]
 
     targets_used: List[str]
-    per_target_outputs: Dict[str, Optional[str]]  # label -> path
+    per_target_outputs: Dict[str, Optional[str]]
 
     duration_plots: DurationPlotsOut
     heatmaps: HeatmapOut
@@ -275,6 +534,7 @@ class AreaXMetaResult:
     phrase_duration_plots: PhraseDurationPlotsOut
 
     tte_plots: TTEPlotsOut
+    transition_matrices: TransitionMatricesOut
 
     merged_annotations_df: pd.DataFrame
     merged_detected_df: pd.DataFrame
@@ -286,12 +546,6 @@ class AreaXMetaResult:
 
 @dataclass
 class AreaXBatchResult:
-    """
-    Results of running across a json_root_dir.
-    - results: animal_id -> AreaXMetaResult (only for successes)
-    - summary_df: one row per attempted animal with status + key paths
-    - errors: animal_id -> error string (only for failures)
-    """
     results: Dict[str, AreaXMetaResult]
     summary_df: pd.DataFrame
     errors: Dict[str, str]
@@ -308,15 +562,15 @@ def run_area_x_meta_bundle(
     treatment_date: Union[str, pd.Timestamp],
     base_output_dir: Optional[Union[str, Path]] = None,
 
-    # ---- annotations merge (for syllable analyses) ----
+    # ---- annotations merge ----
     max_gap_between_song_segments: int = 500,
     segment_index_offset: int = 0,
     merge_repeated_syllables: bool = True,
     repeat_gap_ms: float = 10.0,
     repeat_gap_inclusive: bool = False,
 
-    # ---- detection merge (for duration analyses) ----
-    merged_song_gap_ms: Optional[int] = 500,   # None/0 to skip merging
+    # ---- detection merge ----
+    merged_song_gap_ms: Optional[int] = 500,
 
     # ---- last-syllable knobs ----
     top_k_last_labels: int = 15,
@@ -324,7 +578,7 @@ def run_area_x_meta_bundle(
     last_pies_filename: str = "last_syllable_pies.png",
 
     # ---- preceder/successor knobs ----
-    target_labels: Optional[List[str]] = None,  # None → auto from balanced pools
+    target_labels: Optional[List[str]] = None,
     top_k_targets: int = 8,
     top_k_preceders: int = 12,
     top_k_successors: int = 12,
@@ -347,6 +601,14 @@ def run_area_x_meta_bundle(
     tte_min_songs_per_day: int = 1,
     tte_treatment_in: str = "post",  # "post", "pre", or "exclude"
 
+    # ---- transitions knobs ----
+    compute_transitions: bool = True,
+    transitions_order_col: str = "syllable_order",
+    transitions_dict_col: str = "syllable_onsets_offsets_ms_dict",
+    transitions_restrict_to_labels: Optional[List[str]] = None,
+    transitions_min_row_total: int = 0,
+    transitions_make_delta_plot: bool = True,
+
     # ---- display ----
     show: bool = True,
 ) -> AreaXMetaResult:
@@ -355,7 +617,6 @@ def run_area_x_meta_bundle(
     decoded_annotations_json = Path(decoded_annotations_json)
     tdate = _as_timestamp(treatment_date)
 
-    # Base outdir default
     if base_output_dir is None:
         base_output_dir = decoded_annotations_json.parent
     base_output_dir = Path(base_output_dir)
@@ -367,7 +628,8 @@ def run_area_x_meta_bundle(
     pd_dir   = base_output_dir / "phrase_durations"
     pd_daily_dir = base_output_dir / "phrase_duration_daily"
     tte_dir  = base_output_dir / "tte"
-    for d in (last_dir, pps_dir, dur_dir, hm_dir, pd_dir, pd_daily_dir, tte_dir):
+    trans_dir = base_output_dir / "first_order_transitions"
+    for d in (last_dir, pps_dir, dur_dir, hm_dir, pd_dir, pd_daily_dir, tte_dir, trans_dir):
         d.mkdir(parents=True, exist_ok=True)
 
     # ── MERGE ONCE: decoded annotations ──
@@ -387,6 +649,108 @@ def run_area_x_meta_bundle(
     )
     merged_annotations_df = ann.annotations_appended_df.copy()
 
+    # Standardize datetime column name once
+    if "Recording DateTime" not in merged_annotations_df.columns and "recording_datetime" in merged_annotations_df.columns:
+        merged_annotations_df = merged_annotations_df.rename(columns={"recording_datetime": "Recording DateTime"})
+
+    # Infer animal ID once for consistent naming across analyses
+    _animal_id = (
+        shlin._infer_animal_id(merged_annotations_df, decoded_annotations_json)
+        or decoded_annotations_json.stem
+        or "unknown_animal"
+    )
+
+    # ──────────────────────────────────────────────────────────
+    # (NEW) First-order transitions: PRE, POST, and Δ(POST − PRE)
+    # ──────────────────────────────────────────────────────────
+    if (not compute_transitions) or merged_annotations_df.empty:
+        transitions_out = TransitionMatricesOut(
+            pre_counts_csv=None, pre_probs_csv=None,
+            post_counts_csv=None, post_probs_csv=None,
+            pre_probs_fig=None, post_probs_fig=None,
+            delta_probs_fig=None,
+        )
+    else:
+        try:
+            trans = _build_pre_post_transition_matrices(
+                merged_annotations_df,
+                treatment_date=tdate,
+                datetime_col_candidates=("Recording DateTime", "recording_datetime"),
+                order_col=transitions_order_col,
+                dict_col=transitions_dict_col,
+                restrict_to_labels=transitions_restrict_to_labels,
+                min_row_total=transitions_min_row_total,
+            )
+
+            pre_counts_path  = trans_dir / f"{_animal_id}_pre_counts.csv"
+            pre_probs_path   = trans_dir / f"{_animal_id}_pre_probs.csv"
+            post_counts_path = trans_dir / f"{_animal_id}_post_counts.csv"
+            post_probs_path  = trans_dir / f"{_animal_id}_post_probs.csv"
+
+            trans["pre_counts"].to_csv(pre_counts_path)
+            trans["pre_probs"].to_csv(pre_probs_path)
+            trans["post_counts"].to_csv(post_counts_path)
+            trans["post_probs"].to_csv(post_probs_path)
+
+            # Exactly one PRE and one POST figure (probabilities)
+            pre_fig = trans_dir / f"{_animal_id}_pre_probs.png"
+            post_fig = trans_dir / f"{_animal_id}_post_probs.png"
+
+            plot_transition_matrix(
+                trans["pre_probs"],
+                title=f"{_animal_id} PRE lesion transitions (Treatment {tdate.date()})",
+                show=show,
+                save_fig_path=pre_fig,
+                vmin=0.0, vmax=1.0,
+                cmap="Greys",
+                cbar_label="Transition Probability",
+            )
+            plot_transition_matrix(
+                trans["post_probs"],
+                title=f"{_animal_id} POST lesion transitions (Treatment {tdate.date()})",
+                show=show,
+                save_fig_path=post_fig,
+                vmin=0.0, vmax=1.0,
+                cmap="Greys",
+                cbar_label="Transition Probability",
+            )
+
+            # Exactly one delta plot: POST − PRE
+            delta_fig = None
+            if transitions_make_delta_plot:
+                delta = trans["post_probs"] - trans["pre_probs"]  # POST − PRE (requested)
+                vlim = float(np.nanmax(np.abs(delta.to_numpy()))) if delta.size else 1.0
+                vlim = vlim if np.isfinite(vlim) and vlim > 0 else 1.0
+
+                delta_fig = trans_dir / f"{_animal_id}_delta_post_minus_pre.png"
+                plot_transition_matrix(
+                    delta,
+                    title=f"{_animal_id} Δ transitions (POST − PRE) (Treatment {tdate.date()})",
+                    show=show,
+                    save_fig_path=delta_fig,
+                    vmin=-vlim, vmax=vlim,
+                    cmap="bwr",
+                    cbar_label="Δ Transition Probability (Post−Pre)",
+                )
+
+            transitions_out = TransitionMatricesOut(
+                pre_counts_csv=str(pre_counts_path),
+                pre_probs_csv=str(pre_probs_path),
+                post_counts_csv=str(post_counts_path),
+                post_probs_csv=str(post_probs_path),
+                pre_probs_fig=str(pre_fig),
+                post_probs_fig=str(post_fig),
+                delta_probs_fig=(None if delta_fig is None else str(delta_fig)),
+            )
+        except Exception as e:
+            print(f"[WARN] Transition matrices failed for {_animal_id}: {repr(e)}")
+            transitions_out = TransitionMatricesOut(
+                pre_counts_csv=None, pre_probs_csv=None,
+                post_counts_csv=None, post_probs_csv=None,
+                pre_probs_fig=None, post_probs_fig=None,
+                delta_probs_fig=None,
+            )
+
     # ── MERGE ONCE: detected songs (durations) ──
     if merged_song_gap_ms and int(merged_song_gap_ms) > 0:
         det = build_detected_and_merged_songs(
@@ -401,10 +765,6 @@ def run_area_x_meta_bundle(
         merged_detected_df = sdc._prepare_table(song_detection_json, merge_gap_ms=None, songs_only=True)
         _dur_title_suffix = "(Unmerged segments)"
 
-    # Infer animal ID once for consistent naming across analyses
-    _animal_id = (shlin._infer_animal_id(merged_annotations_df, decoded_annotations_json)
-                  or decoded_annotations_json.stem or "unknown_animal")
-
     # ──────────────────────────────────────────────────────────
     # 1) LAST-SYLLABLE PLOTS
     # ──────────────────────────────────────────────────────────
@@ -418,44 +778,61 @@ def run_area_x_meta_bundle(
         post_df  = merged_annotations_df.copy()
     else:
         dfA = merged_annotations_df.copy()
-        if "Recording DateTime" not in dfA.columns and "recording_datetime" in dfA.columns:
-            dfA = dfA.rename(columns={"recording_datetime": "Recording DateTime"})
-
+    
         early_df, late_df, post_df, n_bal = lsp._split_pre_post_balanced(dfA, tdate)
-
+    
         last_early = lsp._extract_last_syllables(early_df)
         last_late  = lsp._extract_last_syllables(late_df)
         last_post  = lsp._extract_last_syllables(post_df)
-
-        counts_by_group, label_order = lsp._counts_by_group(last_early, last_late, last_post, top_k=top_k_last_labels)
+    
+        counts_by_group, label_order = lsp._counts_by_group(
+            last_early, last_late, last_post, top_k=top_k_last_labels
+        )
         n_by_group = {
             "Early Pre": int(last_early.shape[0]),
             "Late Pre":  int(last_late.shape[0]),
             "Post":      int(last_post.shape[0]),
         }
-
+    
         title_base = f"Last syllables per song (balanced groups; Treatment {tdate.date()})"
         hist_title = title_base + f"\n(Top {top_k_last_labels} labels)"
         pies_title = "Last syllables: Early-Pre / Late-Pre / Post"
-
+    
         last_hist_path_p = (last_dir / last_hist_filename)
         last_pies_path_p = (last_dir / last_pies_filename)
-
+    
+        # Histogram (unchanged)
         _ = lsp._plot_histogram(
             counts_by_group, label_order, hist_title,
             n_by_group=n_by_group, output_path=last_hist_path_p, show=show
         )
+    
+        # Pies: NEW REQUIRED ARG in your lsp._plot_pies signature
+        # Build a LUT the same way last_syllable_plots does internally.
+        if hasattr(lsp, "_build_label_color_lut_from_df"):
+            color_lut = lsp._build_label_color_lut_from_df(dfA)
+        else:
+            # ultra-safe fallback
+            color_lut = {str(-1): "#7f7f7f"}
+    
         _ = lsp._plot_pies(
             counts_by_group, label_order, pies_title,
-            n_by_group=n_by_group, output_path=last_pies_path_p, show=show
+            n_by_group=n_by_group,
+            color_lut=color_lut,                 # <-- FIX
+            output_path=last_pies_path_p, show=show
         )
-
+    
         last_label_order = list(label_order)
-        last_counts = {"balanced_n": int(n_bal),
-                       "early_n": n_by_group["Early Pre"], "late_n": n_by_group["Late Pre"], "post_n": n_by_group["Post"]}
-
+        last_counts = {
+            "balanced_n": int(n_bal),
+            "early_n": n_by_group["Early Pre"],
+            "late_n": n_by_group["Late Pre"],
+            "post_n": n_by_group["Post"],
+        }
+    
         last_hist_path = str(last_hist_path_p)
         last_pies_path = str(last_pies_path_p)
+
 
     # ──────────────────────────────────────────────────────────
     # 2) PRECEDER + SUCCESSOR PANELS
@@ -465,8 +842,6 @@ def run_area_x_meta_bundle(
 
     if not merged_annotations_df.empty:
         dfB = merged_annotations_df.copy()
-        if "Recording DateTime" not in dfB.columns and "recording_datetime" in dfB.columns:
-            dfB = dfB.rename(columns={"recording_datetime": "Recording DateTime"})
         e_df, l_df, p_df, _ = pps._balanced_split_by_treatment(dfB, tdate)
 
         if target_labels is None:
@@ -479,14 +854,26 @@ def run_area_x_meta_bundle(
         title_suffix = f"(balanced Early-Pre / Late-Pre / Post; Treatment {tdate.date()})"
 
         for tgt in targets:
-            e_pre_raw = pps._preceder_counts_for_target(e_df, tgt, include_start=include_start_as_preceder, start_token=start_token)
-            l_pre_raw = pps._preceder_counts_for_target(l_df, tgt, include_start=include_start_as_preceder, start_token=start_token)
-            p_pre_raw = pps._preceder_counts_for_target(p_df, tgt, include_start=include_start_as_preceder, start_token=start_token)
+            e_pre_raw = pps._preceder_counts_for_target(
+                e_df, tgt, include_start=include_start_as_preceder, start_token=start_token
+            )
+            l_pre_raw = pps._preceder_counts_for_target(
+                l_df, tgt, include_start=include_start_as_preceder, start_token=start_token
+            )
+            p_pre_raw = pps._preceder_counts_for_target(
+                p_df, tgt, include_start=include_start_as_preceder, start_token=start_token
+            )
             order_pre = pps._unified_order(top_k_preceders, e_pre_raw, l_pre_raw, p_pre_raw)
 
-            e_suc_raw = pps._successor_counts_for_target(e_df, tgt, include_end=include_end_as_successor, end_token=end_token)
-            l_suc_raw = pps._successor_counts_for_target(l_df, tgt, include_end=include_end_as_successor, end_token=end_token)
-            p_suc_raw = pps._successor_counts_for_target(p_df, tgt, include_end=include_end_as_successor, end_token=end_token)
+            e_suc_raw = pps._successor_counts_for_target(
+                e_df, tgt, include_end=include_end_as_successor, end_token=end_token
+            )
+            l_suc_raw = pps._successor_counts_for_target(
+                l_df, tgt, include_end=include_end_as_successor, end_token=end_token
+            )
+            p_suc_raw = pps._successor_counts_for_target(
+                p_df, tgt, include_end=include_end_as_successor, end_token=end_token
+            )
             order_suc = pps._unified_order(top_k_successors, e_suc_raw, l_suc_raw, p_suc_raw)
 
             order_pre_hist = pps._order_with_optional_other(
@@ -507,8 +894,10 @@ def run_area_x_meta_bundle(
             )
 
             def _prep_counts(raw_s: pd.Series, order_for_hist: List[str], order_for_pie: List[str]):
-                s_hist = pps._apply_other_bin(raw_s, order_for_hist, include_other=include_other_in_hist, other_label=other_label)
-                s_pie  = pps._apply_other_bin(raw_s, order_for_pie,  include_other=True,              other_label=other_label)
+                s_hist = pps._apply_other_bin(raw_s, order_for_hist,
+                                             include_other=include_other_in_hist, other_label=other_label)
+                s_pie  = pps._apply_other_bin(raw_s, order_for_pie,
+                                             include_other=True, other_label=other_label)
                 return s_hist, s_pie
 
             e_pre_hist, e_pre_pie = _prep_counts(e_pre_raw, order_pre_hist, order_pre_pie)
@@ -519,8 +908,12 @@ def run_area_x_meta_bundle(
             l_suc_hist, l_suc_pie = _prep_counts(l_suc_raw, order_suc_hist, order_suc_pie)
             p_suc_hist, p_suc_pie = _prep_counts(p_suc_raw, order_suc_hist, order_suc_pie)
 
-            n_pre_by_group = {g: int(v.sum()) for g, v in {"Early Pre": e_pre_pie, "Late Pre": l_pre_pie, "Post": p_pre_pie}.items()}
-            n_suc_by_group = {g: int(v.sum()) for g, v in {"Early Pre": e_suc_pie, "Late Pre": l_suc_pie, "Post": p_suc_pie}.items()}
+            n_pre_by_group = {g: int(v.sum()) for g, v in {
+                "Early Pre": e_pre_pie, "Late Pre": l_pre_pie, "Post": p_pre_pie
+            }.items()}
+            n_suc_by_group = {g: int(v.sum()) for g, v in {
+                "Early Pre": e_suc_pie, "Late Pre": l_suc_pie, "Post": p_suc_pie
+            }.items()}
 
             def _pick_order(d: Dict[str, pd.Series]) -> List[str]:
                 for g in ["Early Pre", "Late Pre", "Post"]:
@@ -550,9 +943,9 @@ def run_area_x_meta_bundle(
     # ──────────────────────────────────────────────────────────
     # 3) SONG-DURATION PLOTS
     # ──────────────────────────────────────────────────────────
-    pre_df, post_df = sdc._split_pre_post(merged_detected_df, treatment_date=tdate)
+    pre_df, post_df2 = sdc._split_pre_post(merged_detected_df, treatment_date=tdate)
     pre_s  = sdc._durations_seconds(pre_df)
-    post_s = sdc._durations_seconds(post_df)
+    post_s = sdc._durations_seconds(post_df2)
 
     dur_prepost_path = dur_dir / "song_duration_pre_post.png"
     _ = sdc.plot_pre_post_boxplot(
@@ -564,7 +957,7 @@ def run_area_x_meta_bundle(
         title=f"Song durations Pre vs Post (Treatment: {tdate.date()})\n{_dur_title_suffix}",
     )
 
-    e3, l3, p3, _n = sdc._split_three_groups_balanced(pre_df, post_df)
+    e3, l3, p3, _n = sdc._split_three_groups_balanced(pre_df, post_df2)
     eS, lS, pS = sdc._durations_seconds(e3), sdc._durations_seconds(l3), sdc._durations_seconds(p3)
 
     dur_three_path = dur_dir / "song_duration_three_group.png"
@@ -595,10 +988,9 @@ def run_area_x_meta_bundle(
         dfH = merged_annotations_df.copy()
 
         if "Date" not in dfH.columns:
-            dt_col = "Recording DateTime" if "Recording DateTime" in dfH.columns else "recording_datetime"
-            if dt_col not in dfH.columns:
-                raise ValueError("No datetime column found to derive 'Date' (expected 'Recording DateTime' or 'recording_datetime').")
-            dfH["Date"] = pd.to_datetime(dfH[dt_col]).dt.date
+            if "Recording DateTime" not in dfH.columns:
+                raise ValueError("No datetime column found to derive 'Date' (expected 'Recording DateTime').")
+            dfH["Date"] = pd.to_datetime(dfH["Recording DateTime"]).dt.date
 
         label_col = "syllable_onsets_offsets_ms_dict"
         syllable_labels = _collect_unique_labels_sorted(dfH, label_col)
@@ -743,6 +1135,7 @@ def run_area_x_meta_bundle(
         daily_phrase_duration=daily_out,
         phrase_duration_plots=pd_out,
         tte_plots=tte_out,
+        transition_matrices=transitions_out,
         merged_annotations_df=merged_annotations_df,
         merged_detected_df=merged_detected_df,
         early_df=early_df,
@@ -752,7 +1145,7 @@ def run_area_x_meta_bundle(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# NEW: Batch runner (root directory mode)
+# Batch runner (root directory mode)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def run_area_x_meta_bundle_root(
@@ -772,20 +1165,6 @@ def run_area_x_meta_bundle_root(
     Iterate over subfolders in json_root_dir (each folder name is animal_id),
     look up treatment date from metadata_excel, find required JSONs, and run
     run_area_x_meta_bundle() for each animal.
-
-    Parameters
-    ----------
-    json_root_dir : directory containing subfolders per animal_id.
-    metadata_excel : path to Area_X_lesion_metadata.xlsx (or similar).
-    base_output_root : if provided, outputs go to base_output_root/animal_id.
-                       if None, outputs go to animal_dir/'figures'.
-    animals : optional whitelist of animal IDs (folder names) to run.
-    show : show plots during batch run (default False).
-    kwargs : forwarded to run_area_x_meta_bundle (merge knobs, plot knobs, etc.)
-
-    Returns
-    -------
-    AreaXBatchResult
     """
     json_root_dir = Path(json_root_dir)
     metadata_excel = Path(metadata_excel)
@@ -803,7 +1182,6 @@ def run_area_x_meta_bundle_root(
         animal_dirs = [d for d in animal_dirs if d.name in wanted]
 
     results: Dict[str, AreaXMetaResult] = {}
-    errors: Dict[str, str] = []
     rows: List[Dict[str, Any]] = []
     error_map: Dict[str, str] = {}
 
@@ -853,6 +1231,9 @@ def run_area_x_meta_bundle_root(
                 "dur_prepost": res.duration_plots.pre_post_path,
                 "heatmap_v1": res.heatmaps.path_v1,
                 "phrase_daily_dir": res.daily_phrase_duration.output_dir,
+                "trans_pre_probs_fig": res.transition_matrices.pre_probs_fig,
+                "trans_post_probs_fig": res.transition_matrices.post_probs_fig,
+                "trans_delta_fig": res.transition_matrices.delta_probs_fig,
             })
             rows.append(row)
 
@@ -909,8 +1290,13 @@ if __name__ == "__main__":
     # Common merge + plot knobs (forwarded)
     p.add_argument("--ann-gap-ms", type=int, default=500)
     p.add_argument("--seg-offset", type=int, default=0)
-    p.add_argument("--merge-repeats", action="store_true",
-                   help="If set, merge repeated syllables (function default is True; pass this in batch if desired).")
+
+    # Tri-state booleans so CLI defaults don't override function defaults
+    p.add_argument("--merge-repeats", dest="merge_repeats", action="store_true", default=None,
+                   help="Force merge repeated syllables ON.")
+    p.add_argument("--no-merge-repeats", dest="merge_repeats", action="store_false", default=None,
+                   help="Force merge repeated syllables OFF.")
+
     p.add_argument("--repeat-gap-ms", type=float, default=10.0)
     p.add_argument("--repeat-gap-inclusive", action="store_true")
 
@@ -924,16 +1310,37 @@ if __name__ == "__main__":
 
     p.add_argument("--include-start", action="store_true")
     p.add_argument("--include-end", action="store_true")
-    p.add_argument("--include-other", action="store_true")
-    p.add_argument("--include-other-in-hist", action="store_true")
+
+    p.add_argument("--include-other", dest="include_other", action="store_true", default=None,
+                   help="Force include 'Other' bin ON.")
+    p.add_argument("--no-include-other", dest="include_other", action="store_false", default=None,
+                   help="Force include 'Other' bin OFF.")
+
+    p.add_argument("--include-other-in-hist", dest="include_other_in_hist", action="store_true", default=None,
+                   help="Force include 'Other' in hist ON.")
+    p.add_argument("--no-include-other-in-hist", dest="include_other_in_hist", action="store_false", default=None,
+                   help="Force include 'Other' in hist OFF.")
+
     p.add_argument("--other-label", type=str, default="Other")
 
     p.add_argument("--heatmap-cmap", type=str, default="Greys")
-    p.add_argument("--nearest-match", action="store_true")
+
+    p.add_argument("--nearest-match", dest="nearest_match", action="store_true", default=None,
+                   help="Force nearest-match day alignment ON.")
+    p.add_argument("--no-nearest-match", dest="nearest_match", action="store_false", default=None,
+                   help="Force nearest-match day alignment OFF.")
+
     p.add_argument("--max-days-off", type=int, default=1)
 
     p.add_argument("--tte-min-songs-per-day", type=int, default=1)
     p.add_argument("--tte-treatment-in", type=str, default="post", choices=["post", "pre", "exclude"])
+
+    # Transitions
+    p.add_argument("--no-transitions", action="store_true", help="Disable PRE/POST transition matrices.")
+    p.add_argument("--trans-min-row-total", type=int, default=0,
+                   help="Zero out sparse transition rows if < N outgoing.")
+    p.add_argument("--trans-no-delta", action="store_true",
+                   help="Disable delta (POST-PRE) transition plot.")
 
     p.add_argument("--show", action="store_true", help="Show plots during run (default off).")
 
@@ -946,10 +1353,9 @@ if __name__ == "__main__":
     except Exception:
         sheet_name = args.sheet_name
 
-    common_kwargs = dict(
+    common_kwargs: Dict[str, Any] = dict(
         max_gap_between_song_segments=args.ann_gap_ms,
         segment_index_offset=args.seg_offset,
-        merge_repeated_syllables=args.merge_repeats,  # NOTE: store_true default False
         repeat_gap_ms=args.repeat_gap_ms,
         repeat_gap_inclusive=args.repeat_gap_inclusive,
         merged_song_gap_ms=args.merged_song_gap_ms,
@@ -959,15 +1365,25 @@ if __name__ == "__main__":
         top_k_successors=args.top_k_successors,
         include_start_as_preceder=args.include_start,
         include_end_as_successor=args.include_end,
-        include_other_bin=args.include_other,
-        include_other_in_hist=args.include_other_in_hist,
         other_label=args.other_label,
         heatmap_cmap=args.heatmap_cmap,
-        nearest_match=args.nearest_match,
         max_days_off=args.max_days_off,
         tte_min_songs_per_day=args.tte_min_songs_per_day,
         tte_treatment_in=args.tte_treatment_in,
+        compute_transitions=(not args.no_transitions),
+        transitions_min_row_total=args.trans_min_row_total,
+        transitions_make_delta_plot=(not args.trans_no_delta),
     )
+
+    # Only override function defaults when user explicitly set tri-state flags
+    if args.merge_repeats is not None:
+        common_kwargs["merge_repeated_syllables"] = bool(args.merge_repeats)
+    if args.include_other is not None:
+        common_kwargs["include_other_bin"] = bool(args.include_other)
+    if args.include_other_in_hist is not None:
+        common_kwargs["include_other_in_hist"] = bool(args.include_other_in_hist)
+    if args.nearest_match is not None:
+        common_kwargs["nearest_match"] = bool(args.nearest_match)
 
     if args.json_root is not None:
         # Batch mode
@@ -1018,9 +1434,14 @@ if __name__ == "__main__":
         print("[OK] TTE 3-group (clean):", res.tte_plots.three_group_path)
         print("[OK] TTE 3-group (stats):", res.tte_plots.three_group_stats_path)
         print("[OK] TTE pre/post p-value:", res.tte_plots.prepost_p_value, res.tte_plots.prepost_test)
+        print("[OK] Transitions PRE probs fig:", res.transition_matrices.pre_probs_fig)
+        print("[OK] Transitions POST probs fig:", res.transition_matrices.post_probs_fig)
+        print("[OK] Transitions Δ (POST−PRE) fig:", res.transition_matrices.delta_probs_fig)
 
 
 """
+# Example usage (Spyder / IPython)
+
 from pathlib import Path
 import importlib
 import Area_X_wrapper as axw
@@ -1039,6 +1460,9 @@ batch = axw.run_area_x_meta_bundle_root(
     merge_repeated_syllables=True,
     merged_song_gap_ms=500,
     tte_min_songs_per_day=5,
+    compute_transitions=True,
+    transitions_min_row_total=0,
+    transitions_make_delta_plot=True,
 )
 
 batch.summary_df.head()
