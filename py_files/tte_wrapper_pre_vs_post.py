@@ -8,44 +8,22 @@ Wrapper around tte_by_day.TTE_by_day to:
 1) Run TTE_by_day on all birds found under a root directory.
 2) Collect daily aggregated TTE per bird.
 3) Build:
-    - A multi-bird TTE vs days-from-lesion time-course plot.
+    - Multi-bird TTE vs days-from-lesion BROKEN x-axis plot (colored by bird)
+    - Multi-bird TTE vs days-from-lesion BROKEN x-axis plot (colored by treatment group: Sham vs NMA)
     - Grouped pre vs post paired boxplots (one subplot per treatment type).
 
-Assumptions
------------
-- Each bird has at least one file matching "*_decoded_database.json"
-  somewhere under `decoded_root` (searched recursively).
-
-- A treatment date must be available per bird, either via:
-    * metadata_excel with columns "Animal ID", "Treatment date",
-      and "Treatment type", or
-    * an explicit bird_treatment_dates dict: {"USA5283": "2024-03-05", ...}
-
-- A song-detection JSON is optional but recommended. The wrapper searches
-  for (in order):
-    * "<stem>_song_detection.json" in the same folder as the decoded JSON
-      (where stem is everything before "_decoded_database.json").
-    * If not found, any "*song_detection*.json" in the same folder if there
-      is exactly one candidate.
-
-The per-bird daily TTE is taken from TTE_by_day.results_df["agg_TTE"].
-For the cross-bird pre/post plot, each bird contributes:
-    pre_mean  = mean(agg_TTE on days < lesion date)
-    post_mean = mean(agg_TTE on days >= lesion date),
-
-Plots are stratified by the metadata "Treatment type" (e.g.,
-"Bilateral NMA lesion injections" vs "Bilateral saline sham injection").
+Key updates (this edit):
+- Remove numeric labels over points (n_songs labels OFF).
+- Use dot markers instead of 'x'.
+- Move legends to the RIGHT of the figure (outside the data area).
+- Add a second plot colored by Sham vs NMA lesion.
 
 Outputs
 -------
 TTEWrapperResult with:
-- per_bird:           list of per-bird daily results
-- combined_daily_df:  daily TTE across all birds
-- prepost_summary_df: one row per bird with pre/post means + treatment_type
-- multi_bird_timecourse_path: path to time-course PNG
-- prepost_boxplot_path:       path to grouped boxplot PNG
-- prepost_p_value:    overall Wilcoxon p (all birds pooled)
-- group_p_values:     dict {treatment_type -> Wilcoxon p for that group}
+- multi_bird_timecourse_path:                per-bird colors plot
+- multi_bird_timecourse_by_group_path:       treatment-group colors plot
+- prepost_boxplot_path:                      grouped pre/post boxplots
 """
 
 from __future__ import annotations
@@ -92,18 +70,19 @@ class BirdDailyTTEResult:
     treatment_date: pd.Timestamp
     treatment_type: Optional[str]
     tte_result: TTEByDayResult
-    daily_df: pd.DataFrame  # results_df with extra columns: animal_id, days_from_lesion, treatment_type
+    daily_df: pd.DataFrame  # results_df + animal_id + days_from_lesion + treatment_type + treatment_group
 
 
 @dataclass
 class TTEWrapperResult:
     per_bird: List[BirdDailyTTEResult]
-    combined_daily_df: pd.DataFrame  # all birds, one row per day
-    prepost_summary_df: pd.DataFrame  # one row per bird (pre_mean, post_mean, treatment_type)
-    multi_bird_timecourse_path: Optional[Path]
+    combined_daily_df: pd.DataFrame
+    prepost_summary_df: pd.DataFrame
+    multi_bird_timecourse_path: Optional[Path]                 # colored by bird
+    multi_bird_timecourse_by_group_path: Optional[Path]        # colored by Sham vs NMA
     prepost_boxplot_path: Optional[Path]
-    prepost_p_value: Optional[float]             # overall (all birds) paired p-value
-    group_p_values: Dict[str, Optional[float]]   # per-treatment-type p-values
+    prepost_p_value: Optional[float]
+    group_p_values: Dict[str, Optional[float]]
 
 
 # ---------------------------------------------------------------------
@@ -117,18 +96,14 @@ def _load_treatment_info_from_metadata(
         bird_to_date: {animal_id -> treatment_date}
         bird_to_type: {animal_id -> treatment_type}
 
-    This first tries organize_metadata_excel.build_areax_metadata if available.
-    If that fails, it falls back to reading the Excel directly with pandas.
+    Tries build_areax_metadata if available; else reads Excel with pandas.
     """
     metadata_excel = Path(metadata_excel)
 
     def _from_df(dfm: pd.DataFrame) -> Tuple[Dict[str, Union[str, pd.Timestamp]], Dict[str, Optional[str]]]:
-        if "Animal ID" in dfm.columns:
-            id_col = "Animal ID"
-        else:
-            id_col = dfm.columns[0]
+        id_col = "Animal ID" if "Animal ID" in dfm.columns else dfm.columns[0]
 
-        # Find date column
+        # date col
         tcol = None
         for cand in ["Treatment date", "Treatment_date", "treatment_date"]:
             if cand in dfm.columns:
@@ -137,7 +112,7 @@ def _load_treatment_info_from_metadata(
         if tcol is None:
             raise KeyError("Could not find a 'Treatment date' column in metadata Excel.")
 
-        # Find treatment type column (optional but strongly expected)
+        # type col (optional)
         type_col = None
         for cand in ["Treatment type", "Treatment_type", "treatment_type"]:
             if cand in dfm.columns:
@@ -147,14 +122,13 @@ def _load_treatment_info_from_metadata(
         bird_to_date: Dict[str, Union[str, pd.Timestamp]] = {}
         bird_to_type: Dict[str, Optional[str]] = {}
 
-        # We may have multiple rows per animal (one per injection); just take the first non-NA
         for aid, sub in dfm.groupby(id_col):
             aid_str = str(aid)
-            # treatment date
+
             tvals = sub[tcol].dropna()
             if len(tvals) > 0:
                 bird_to_date[aid_str] = tvals.iloc[0]
-            # treatment type
+
             if type_col is not None:
                 type_vals = sub[type_col].dropna()
                 bird_to_type[aid_str] = type_vals.iloc[0] if len(type_vals) > 0 else None
@@ -163,7 +137,6 @@ def _load_treatment_info_from_metadata(
 
         return bird_to_date, bird_to_type
 
-    # Try using build_areax_metadata if available
     if build_areax_metadata is not None:
         try:
             meta = build_areax_metadata(metadata_excel)  # type: ignore
@@ -174,7 +147,7 @@ def _load_treatment_info_from_metadata(
                     if not isinstance(info, dict):
                         continue
                     aid_str = str(aid)
-                    # date
+
                     date_val = None
                     for key in ["Treatment date", "Treatment_date", "treatment_date"]:
                         if key in info and pd.notna(info[key]):
@@ -182,7 +155,7 @@ def _load_treatment_info_from_metadata(
                             break
                     if date_val is not None:
                         bird_to_date[aid_str] = date_val
-                    # type
+
                     type_val = None
                     for key in ["Treatment type", "Treatment_type", "treatment_type"]:
                         if key in info and pd.notna(info[key]):
@@ -194,29 +167,23 @@ def _load_treatment_info_from_metadata(
                 dfm = pd.DataFrame(meta)
                 return _from_df(dfm)
         except Exception:
-            # Fall through to direct Excel read
             pass
 
-    # Fallback: read Excel directly
     dfm = pd.read_excel(metadata_excel)
     return _from_df(dfm)
 
 
 def _find_detection_for_decoded(decoded_path: Path) -> Optional[Path]:
-    """
-    Try to find the matching *_song_detection.json for a given *_decoded_database.json.
-    """
+    """Try to find matching *_song_detection.json for a *_decoded_database.json."""
     parent = decoded_path.parent
     name = decoded_path.name
 
-    # 1) Direct string replacement
     if name.endswith("_decoded_database.json"):
         stem = name[: -len("_decoded_database.json")]
         candidate = parent / f"{stem}_song_detection.json"
         if candidate.exists():
             return candidate
 
-    # 2) Any "*song_detection*.json" in the same folder, if unique
     candidates = list(parent.glob("*song_detection*.json"))
     if len(candidates) == 1:
         return candidates[0]
@@ -224,37 +191,282 @@ def _find_detection_for_decoded(decoded_path: Path) -> Optional[Path]:
 
 
 def _infer_animal_id_from_path(decoded_path: Path) -> str:
-    """
-    Infer an animal_id from the decoded JSON path, using the same logic
-    as tte_by_day._extract_id_from_text where possible.
-    """
+    """Infer an animal_id from decoded path using tte_by_day's regex helper."""
     text = decoded_path.stem
     mid = _extract_id_from_text(text)
     if mid:
         return mid
-    # fallback: first chunk before "_"
     return text.split("_")[0]
 
 
 def _compute_pre_post_means(
     daily_df: pd.DataFrame, treatment_date: pd.Timestamp
 ) -> Tuple[Optional[float], Optional[float]]:
-    """
-    Given one bird's daily_df, compute:
-        pre_mean  = mean(agg_TTE on days < treatment_date)
-        post_mean = mean(agg_TTE on days >= treatment_date)
-    Returns (pre_mean, post_mean), each possibly None if no days in that side.
-    """
+    """Bird-level mean of daily agg_TTE pre (< tx) and post (>= tx)."""
     tx = pd.Timestamp(treatment_date)
-    pre_mask = daily_df["day"] < tx
-    post_mask = daily_df["day"] >= tx
-
-    pre_vals = daily_df.loc[pre_mask, "agg_TTE"]
-    post_vals = daily_df.loc[post_mask, "agg_TTE"]
-
+    pre_vals = daily_df.loc[daily_df["day"] < tx, "agg_TTE"]
+    post_vals = daily_df.loc[daily_df["day"] >= tx, "agg_TTE"]
     pre_mean = float(pre_vals.mean()) if len(pre_vals) > 0 else None
     post_mean = float(post_vals.mean()) if len(post_vals) > 0 else None
     return pre_mean, post_mean
+
+
+def _treatment_group_from_type(treatment_type: Optional[str]) -> str:
+    """
+    Collapse free-form 'Treatment type' into:
+      - 'Sham' (saline/sham/control)
+      - 'NMA'  (NMA lesion)
+      - 'Unknown' otherwise
+    """
+    if treatment_type is None or (isinstance(treatment_type, float) and pd.isna(treatment_type)):
+        return "Unknown"
+    s = str(treatment_type).lower()
+    if ("sham" in s) or ("saline" in s) or ("control" in s):
+        return "Sham"
+    if "nma" in s:
+        return "NMA"
+    return "Unknown"
+
+
+# -----------------------------
+# Broken x-axis plotting helpers
+# -----------------------------
+def _infer_x_segments_from_days(
+    days_from_lesion: Union[pd.Series, np.ndarray, List[int]],
+    *,
+    gap_threshold: int = 3,
+    force_zero_split: bool = True,
+) -> List[Tuple[int, int]]:
+    """Split x into segments when gaps exceed gap_threshold; also split at 0 (pre/post)."""
+    xs = []
+    for v in list(days_from_lesion):
+        if pd.isna(v):
+            continue
+        try:
+            xs.append(int(v))
+        except Exception:
+            continue
+    if not xs:
+        return []
+    xs = sorted(set(xs))
+
+    has_neg = any(x < 0 for x in xs)
+    has_pos = any(x > 0 for x in xs)
+
+    segments: List[Tuple[int, int]] = []
+    start = xs[0]
+    prev = xs[0]
+
+    for x in xs[1:]:
+        if force_zero_split and has_neg and has_pos and (prev < 0) and (x > 0):
+            segments.append((start, 0))
+            start = x
+        elif (x - prev) > gap_threshold:
+            segments.append((start, prev))
+            start = x
+        prev = x
+
+    segments.append((start, prev))
+
+    if force_zero_split and has_neg and has_pos:
+        fixed: List[Tuple[int, int]] = []
+        for a, b in segments:
+            if a < 0 and b > 0:
+                fixed.append((a, 0))
+                fixed.append((1, b))
+            else:
+                fixed.append((a, b))
+        segments = fixed
+
+    return segments
+
+
+def _add_x_break_marks(ax_left, ax_right, *, size: float = 0.015, lw: float = 1.5):
+    """Draw diagonal '//' marks between adjacent axes."""
+    kwargs = dict(transform=ax_left.transAxes, color="k", clip_on=False, linewidth=lw)
+    ax_left.plot((1 - size, 1 + size), (-size, +size), **kwargs)
+    ax_left.plot((1 - size, 1 + size), (-2 * size, 0), **kwargs)
+
+    kwargs = dict(transform=ax_right.transAxes, color="k", clip_on=False, linewidth=lw)
+    ax_right.plot((-size, +size), (-size, +size), **kwargs)
+    ax_right.plot((-size, +size), (-2 * size, 0), **kwargs)
+
+
+def _plot_all_birds_broken_x(
+    combined_daily: pd.DataFrame,
+    *,
+    fig_dir: Path,
+    out_name: str,
+    title: str,
+    color_mode: str = "bird",  # "bird" or "treatment_group"
+    ycol: str = "agg_TTE",
+    xcol: str = "days_from_lesion",
+    gap_threshold: int = 3,
+    marker: str = "o",         # dot marker
+    markersize: float = 4.5,
+    linewidth: float = 1.8,
+    show: bool = True,
+) -> Optional[Path]:
+    """
+    Broken-x multi-bird plot:
+      - color_mode="bird": each bird gets its own color, legend lists birds
+      - color_mode="treatment_group": birds colored by Sham vs NMA (legend lists groups)
+    """
+    if combined_daily.empty:
+        return None
+
+    segments = _infer_x_segments_from_days(combined_daily[xcol], gap_threshold=gap_threshold, force_zero_split=True)
+    if not segments:
+        return None
+
+    # widths proportional to span
+    widths = []
+    for a, b in segments:
+        span = max(1, abs(b - a) + 1)
+        widths.append(max(1.2, min(10.0, float(span))))
+
+    fig, axes = plt.subplots(
+        1,
+        len(segments),
+        figsize=(max(10, 1.2 * sum(widths)), 4.8),
+        sharey=True,
+        gridspec_kw={"width_ratios": widths, "wspace": 0.05},
+    )
+    if len(segments) == 1:
+        axes = [axes]
+
+    yvals = pd.to_numeric(combined_daily[ycol], errors="coerce").dropna()
+    if len(yvals) == 0:
+        return None
+    y_min = float(yvals.min())
+    y_max = float(yvals.max())
+    pad = 0.12 * (y_max - y_min) if y_max > y_min else 0.1
+    y_lo = max(0.0, y_min - pad)
+    y_hi = y_max + pad
+
+    # axis formatting
+    for si, ((xmin, xmax), ax) in enumerate(zip(segments, axes)):
+        if xmin == xmax:
+            ax.set_xlim(xmin - 0.5, xmax + 0.5)
+            ax.set_xticks([xmin])
+            ax.set_xticklabels([str(xmin)])
+        else:
+            ax.set_xlim(xmin, xmax)
+            xticks = list(range(xmin, xmax + 1))
+            ax.set_xticks(xticks)
+            ax.set_xticklabels([str(t) for t in xticks])
+
+        ax.set_ylim(y_lo, y_hi)
+        ax.grid(axis="y", linewidth=1.0, alpha=0.35)
+        ax.grid(axis="x", visible=False)
+
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+        ax.tick_params(top=False, right=False)
+
+        if si > 0:
+            ax.spines["left"].set_visible(False)
+            ax.tick_params(labelleft=False, left=False)
+
+    # breaks
+    for i in range(len(axes) - 1):
+        axes[i].spines["right"].set_visible(False)
+        axes[i + 1].spines["left"].set_visible(False)
+        _add_x_break_marks(axes[i], axes[i + 1], size=0.015, lw=1.5)
+
+    # color maps
+    birds = sorted(combined_daily["animal_id"].astype(str).unique().tolist())
+
+    if color_mode == "bird":
+        color_cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+        bird_color = {bid: color_cycle[i % len(color_cycle)] for i, bid in enumerate(birds)}
+        legend_handles = []
+        legend_labels = []
+    else:
+        # group coloring
+        group_color = {"NMA": "tab:blue", "Sham": "tab:orange", "Unknown": "0.5"}
+        legend_handles = {}
+        legend_labels = []
+
+    # plot per bird per segment (don’t connect across breaks)
+    for bid in birds:
+        dfb = combined_daily[combined_daily["animal_id"].astype(str) == bid].copy()
+        dfb = dfb.sort_values(xcol)
+
+        if color_mode == "bird":
+            col = bird_color[bid]
+            label_for_legend = bid
+        else:
+            grp = _treatment_group_from_type(dfb["treatment_type"].iloc[0] if "treatment_type" in dfb.columns else None)
+            col = group_color.get(grp, "0.5")
+            label_for_legend = grp
+
+        first_segment_for_this_line = True
+
+        for (xmin, xmax), ax in zip(segments, axes):
+            seg = dfb[(dfb[xcol].astype(int) >= xmin) & (dfb[xcol].astype(int) <= xmax)].copy()
+            if seg.empty:
+                continue
+
+            x = seg[xcol].astype(int).to_numpy()
+            y = pd.to_numeric(seg[ycol], errors="coerce").to_numpy()
+
+            ln = ax.plot(
+                x,
+                y,
+                marker=marker,
+                linestyle="-",
+                linewidth=linewidth,
+                markersize=markersize,
+                color=col,
+                label=None,
+            )[0]
+
+            # collect legend handles once
+            if first_segment_for_this_line:
+                if color_mode == "bird":
+                    legend_handles.append(ln)
+                    legend_labels.append(label_for_legend)
+                else:
+                    # one handle per group
+                    if label_for_legend not in legend_handles:
+                        legend_handles[label_for_legend] = ln
+                first_segment_for_this_line = False
+
+    # lesion line at 0 + labels
+    for (xmin, xmax), ax in zip(segments, axes):
+        if xmin <= 0 <= xmax or xmax == 0:
+            ax.axvline(0, linestyle="--", linewidth=1.5, color="0.6")
+            ax.text(0, y_hi, "pre lesion", rotation=90, va="top", ha="right", fontsize=10, color="k")
+            ax.text(0, y_hi, "\npost lesion", rotation=90, va="top", ha="left", fontsize=10, color="k")
+            break
+
+    # Titles/labels
+    axes[0].set_ylabel("Transition Entropy")
+    fig.supxlabel("Days post lesion")
+    fig.suptitle(title, y=1.02)
+
+    # Legend OUTSIDE to the right
+    if color_mode == "bird":
+        handles = legend_handles
+        labels = legend_labels
+    else:
+        # preserve order
+        order = ["NMA", "Sham", "Unknown"]
+        handles = [legend_handles[g] for g in order if g in legend_handles]
+        labels = [g for g in order if g in legend_handles]
+
+    # leave space on the right for legend
+    fig.tight_layout(rect=[0, 0, 0.84, 1.0])
+    fig.legend(handles, labels, loc="center left", bbox_to_anchor=(0.86, 0.5), frameon=True, title=None)
+
+    out_path = fig_dir / out_name
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+    return out_path
 
 
 # ---------------------------------------------------------------------
@@ -268,7 +480,6 @@ def tte_wrapper_pre_vs_post(
     fig_dir: Optional[Union[str, Path]] = None,
     min_songs_per_day: int = 1,
     show: bool = True,
-    label_n_songs: bool = False,
     # merge / detection knobs (forwarded to TTE_by_day)
     ann_gap_ms: int = 500,
     seg_offset: int = 0,
@@ -277,54 +488,14 @@ def tte_wrapper_pre_vs_post(
     repeat_gap_inclusive: bool = False,
     dur_merge_gap_ms: int = 500,
     treatment_in: str = "post",
+    # broken x-axis behavior
+    x_gap_threshold: int = 3,
 ) -> TTEWrapperResult:
     """
     Run TTE_by_day for all birds under decoded_root, then build:
-        1) Multi-bird TTE time-course figure.
-        2) Grouped bird-level pre vs post paired boxplots.
-
-    Parameters
-    ----------
-    decoded_root : str or Path
-        Root directory containing *_decoded_database.json files
-        (searched recursively with rglob).
-
-    metadata_excel : str or Path, optional
-        Path to Area X metadata Excel. Used to populate:
-            - bird -> treatment date mapping
-            - bird -> treatment type mapping
-
-    bird_treatment_dates : dict, optional
-        Explicit mapping {animal_id: treatment_date}. Entries here override
-        metadata-derived dates if both are provided.
-
-    fig_dir : str or Path, optional
-        Directory to write the multi-bird figures. If None, a folder
-        "tte_wrapper_figures" is created as a *sibling* of decoded_root,
-        i.e., decoded_root.parent / "tte_wrapper_figures". This keeps
-        figures out of the data tree.
-
-    min_songs_per_day : int, default 1
-        Forwarded to TTE_by_day.
-
-    show : bool, default True
-        Whether to show the combined figures (per-bird figures are
-        controlled by TTE_by_day(show=...)).
-
-    label_n_songs : bool, default False
-        If True and 'n_songs' is present in TTE_by_day output, label each
-        point in the time-course plot with the number of songs that day.
-        Default False (no labels) for a cleaner plot.
-
-    ann_gap_ms, seg_offset, merge_repeats, repeat_gap_ms,
-    repeat_gap_inclusive, dur_merge_gap_ms, treatment_in :
-        Forwarded to TTE_by_day for each bird.
-
-    Returns
-    -------
-    TTEWrapperResult
-        Holds per-bird results, combined daily_df, combined pre/post
-        summary, plot paths, and p-values.
+      1) broken-x all-birds plot colored by BIRD
+      2) broken-x all-birds plot colored by TREATMENT GROUP (Sham vs NMA)
+      3) grouped pre/post bird-level paired boxplots (unchanged)
     """
     decoded_root = Path(decoded_root)
 
@@ -341,7 +512,6 @@ def tte_wrapper_pre_vs_post(
             print(f"WARNING: failed to load metadata from {metadata_excel}: {e}")
 
     if bird_treatment_dates:
-        # Explicit mapping overrides anything from metadata (for dates only)
         bird_to_tdate.update(bird_treatment_dates)
 
     if not bird_to_tdate:
@@ -352,15 +522,12 @@ def tte_wrapper_pre_vs_post(
 
     # ---------- Figure directory ----------
     if fig_dir is None:
-        # Place figures OUTSIDE decoded_root by default
         fig_dir = decoded_root.parent / "tte_wrapper_figures"
     fig_dir = Path(fig_dir)
     fig_dir.mkdir(parents=True, exist_ok=True)
 
     # ---------- Discover per-bird decoded JSONs ----------
     decoded_files = sorted(decoded_root.rglob("*_decoded_database.json"))
-
-    # Safety: exclude any decoded files that might live inside fig_dir
     decoded_files = [p for p in decoded_files if fig_dir not in p.parents]
 
     if not decoded_files:
@@ -371,6 +538,7 @@ def tte_wrapper_pre_vs_post(
             combined_daily_df=empty,
             prepost_summary_df=empty,
             multi_bird_timecourse_path=None,
+            multi_bird_timecourse_by_group_path=None,
             prepost_boxplot_path=None,
             prepost_p_value=None,
             group_p_values={},
@@ -382,25 +550,18 @@ def tte_wrapper_pre_vs_post(
         animal_id = _infer_animal_id_from_path(decoded_path)
         t_raw = bird_to_tdate.get(animal_id)
         if t_raw is None:
-            print(
-                f"Skipping {decoded_path} (animal_id={animal_id}): "
-                f"no treatment date found in metadata / bird_treatment_dates."
-            )
+            print(f"Skipping {decoded_path} (animal_id={animal_id}): no treatment date found.")
             continue
 
         t_parsed = _parse_treatment_date(t_raw)
         if t_parsed is None:
-            print(
-                f"Skipping {decoded_path} (animal_id={animal_id}): "
-                f"could not parse treatment date {t_raw!r}."
-            )
+            print(f"Skipping {decoded_path} (animal_id={animal_id}): could not parse treatment date {t_raw!r}.")
             continue
 
         t_type = bird_to_ttype.get(animal_id)
-
         det_path = _find_detection_for_decoded(decoded_path)
 
-        # Per-bird figure directory
+        # Per-bird figure directory (per-bird outputs from TTE_by_day)
         bird_fig_dir = fig_dir / animal_id
         bird_fig_dir.mkdir(parents=True, exist_ok=True)
 
@@ -415,11 +576,9 @@ def tte_wrapper_pre_vs_post(
                 merge_repeated_syllables=merge_repeats,
                 repeat_gap_ms=repeat_gap_ms,
                 repeat_gap_inclusive=repeat_gap_inclusive,
-                merged_song_gap_ms=(
-                    None if dur_merge_gap_ms == 0 else dur_merge_gap_ms
-                ),
+                merged_song_gap_ms=(None if dur_merge_gap_ms == 0 else dur_merge_gap_ms),
                 fig_dir=bird_fig_dir,
-                show=False,  # per-bird plots: don't pop up unless you want to change this
+                show=False,  # don’t pop per-bird figures
                 min_songs_per_day=min_songs_per_day,
                 treatment_date=t_parsed,
                 treatment_in=treatment_in,
@@ -429,23 +588,16 @@ def tte_wrapper_pre_vs_post(
             tte_res = _call_tte(det_path)
         except (UnicodeDecodeError, json.JSONDecodeError) as e:
             print(
-                f"  -> ERROR reading song_detection_json for {animal_id} "
-                f"({det_path}): {e}. "
-                "Retrying TTE_by_day WITHOUT song_detection_json "
-                "(no split-song merging)."
+                f"  -> ERROR reading song_detection_json for {animal_id} ({det_path}): {e}. "
+                "Retrying WITHOUT song_detection_json."
             )
             try:
                 tte_res = _call_tte(None)
             except Exception as e2:
-                print(
-                    f"  -> Failed again without song_detection_json for {animal_id}: {e2}. "
-                    "Skipping this bird."
-                )
+                print(f"  -> Failed again without song_detection_json for {animal_id}: {e2}. Skipping.")
                 continue
         except Exception as e:
-            print(
-                f"  -> Unexpected error in TTE_by_day for {animal_id}: {e}. Skipping."
-            )
+            print(f"  -> Unexpected error in TTE_by_day for {animal_id}: {e}. Skipping.")
             continue
 
         if tte_res.results_df.empty:
@@ -457,6 +609,7 @@ def tte_wrapper_pre_vs_post(
         daily_df["animal_id"] = animal_id
         daily_df["days_from_lesion"] = (daily_df["day"] - tx).dt.days
         daily_df["treatment_type"] = t_type
+        daily_df["treatment_group"] = _treatment_group_from_type(t_type)
 
         per_bird_results.append(
             BirdDailyTTEResult(
@@ -478,6 +631,7 @@ def tte_wrapper_pre_vs_post(
             combined_daily_df=empty,
             prepost_summary_df=empty,
             multi_bird_timecourse_path=None,
+            multi_bird_timecourse_by_group_path=None,
             prepost_boxplot_path=None,
             prepost_p_value=None,
             group_p_values={},
@@ -489,48 +643,36 @@ def tte_wrapper_pre_vs_post(
     combined_daily = pd.concat([b.daily_df for b in per_bird_results], ignore_index=True)
 
     # -----------------------------------------------------------------
-    # Plot 1: Multi-bird TTE time-course (days-from-lesion)
+    # Plot A: Multi-bird broken-x, colored by bird (DOT markers, no labels)
     # -----------------------------------------------------------------
-    fig1, ax1 = plt.subplots(figsize=(10, 5))
-    birds = sorted({b.animal_id for b in per_bird_results})
-    color_cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]
-    color_map = {bid: color_cycle[i % len(color_cycle)] for i, bid in enumerate(birds)}
+    multi_bird_path = _plot_all_birds_broken_x(
+        combined_daily,
+        fig_dir=fig_dir,
+        out_name="TTE_all_birds_brokenx_colored_by_bird.png",
+        title="Transition Entropy by day (all birds)",
+        color_mode="bird",
+        gap_threshold=x_gap_threshold,
+        marker="o",
+        markersize=4.5,
+        linewidth=1.8,
+        show=show,
+    )
 
-    for bid in birds:
-        dfb = combined_daily[combined_daily["animal_id"] == bid].copy()
-        dfb = dfb.sort_values("days_from_lesion")
-
-        ax1.plot(
-            dfb["days_from_lesion"],
-            dfb["agg_TTE"],
-            marker="o",
-            linestyle="-",
-            linewidth=2,
-            color=color_map[bid],
-            label=bid,
-        )
-        # Optional: label each point with n_songs (default is OFF)
-        if label_n_songs and "n_songs" in dfb.columns:
-            for x, y, n in zip(dfb["days_from_lesion"], dfb["agg_TTE"], dfb["n_songs"]):
-                ax1.text(x, y, str(int(n)), fontsize=8, ha="center", va="bottom")
-
-    ax1.axvline(0, linestyle="--", color="k", linewidth=1.5)
-    ax1.set_xlabel("Days relative to lesion (0 = lesion day)")
-    ax1.set_ylabel("Total Transition Entropy")
-    ax1.set_title("Total Transition Entropy by day (all birds)")
-    ax1.legend(title="Bird", bbox_to_anchor=(1.02, 1), loc="upper left")
-
-    for side in ("top", "right"):
-        ax1.spines[side].set_visible(False)
-    ax1.tick_params(top=False, right=False)
-
-    fig1.tight_layout()
-    multi_bird_path = fig_dir / "TTE_multi_bird_timecourse.png"
-    fig1.savefig(multi_bird_path, dpi=300)
-    if show:
-        plt.show()
-    else:
-        plt.close(fig1)
+    # -----------------------------------------------------------------
+    # Plot B: Multi-bird broken-x, colored by treatment group (Sham vs NMA)
+    # -----------------------------------------------------------------
+    multi_bird_group_path = _plot_all_birds_broken_x(
+        combined_daily,
+        fig_dir=fig_dir,
+        out_name="TTE_all_birds_brokenx_colored_by_group.png",
+        title="Transition Entropy by day (all birds) — colored by Sham vs NMA",
+        color_mode="treatment_group",
+        gap_threshold=x_gap_threshold,
+        marker="o",
+        markersize=4.5,
+        linewidth=1.8,
+        show=show,
+    )
 
     # -----------------------------------------------------------------
     # Build pre vs post summary per bird
@@ -539,10 +681,7 @@ def tte_wrapper_pre_vs_post(
     for b in per_bird_results:
         pre_mean, post_mean = _compute_pre_post_means(b.daily_df, b.treatment_date)
         if pre_mean is None or post_mean is None:
-            print(
-                f"Skipping {b.animal_id} in pre/post summary: "
-                f"missing pre or post days."
-            )
+            print(f"Skipping {b.animal_id} in pre/post summary: missing pre or post days.")
             continue
         rows.append(
             {
@@ -552,23 +691,18 @@ def tte_wrapper_pre_vs_post(
                 "treatment_type": b.treatment_type,
             }
         )
-
-    if rows:
-        prepost_df = pd.DataFrame(rows)
-    else:
-        prepost_df = pd.DataFrame(
-            columns=["animal_id", "pre_mean_TTE", "post_mean_TTE", "treatment_type"]
-        )
+    prepost_df = pd.DataFrame(rows) if rows else pd.DataFrame(
+        columns=["animal_id", "pre_mean_TTE", "post_mean_TTE", "treatment_type"]
+    )
 
     # -----------------------------------------------------------------
     # Plot 2: Grouped Pre vs Post paired boxplots (bird-level means)
     # -----------------------------------------------------------------
     prepost_path: Optional[Path] = None
-    p_value: Optional[float] = None  # overall (all birds) paired test
+    p_value: Optional[float] = None
     group_p_values: Dict[str, Optional[float]] = {}
 
     if not prepost_df.empty:
-        # Overall paired stat across ALL birds (regardless of group)
         all_pre_vals = prepost_df["pre_mean_TTE"].astype(float).to_list()
         all_post_vals = prepost_df["post_mean_TTE"].astype(float).to_list()
         if _HAVE_SCIPY and len(all_pre_vals) >= 2:
@@ -577,16 +711,11 @@ def tte_wrapper_pre_vs_post(
             except Exception:
                 p_value = None
 
-        # Grouping by treatment_type (fall back to a single "All" group if missing)
-        if "treatment_type" not in prepost_df.columns:
-            prepost_df["treatment_type"] = "All"
         group_series = prepost_df["treatment_type"].fillna("Unknown")
         groups = sorted(group_series.unique())
         n_groups = len(groups)
 
-        fig2, axes = plt.subplots(
-            1, n_groups, figsize=(5.5 * n_groups, 5), sharey=True
-        )
+        fig2, axes = plt.subplots(1, n_groups, figsize=(5.5 * n_groups, 5), sharey=True)
         if n_groups == 1:
             axes = [axes]
 
@@ -596,8 +725,7 @@ def tte_wrapper_pre_vs_post(
             return "***" if p < 1e-3 else ("**" if p < 1e-2 else ("*" if p < 0.05 else "ns"))
 
         for ax, grp in zip(axes, groups):
-            gmask = group_series == grp
-            gdf = prepost_df[gmask]
+            gdf = prepost_df[group_series == grp]
             if gdf.empty:
                 ax.set_visible(False)
                 group_p_values[grp] = None
@@ -608,45 +736,15 @@ def tte_wrapper_pre_vs_post(
             bird_ids = gdf["animal_id"].astype(str).to_list()
 
             x_pre, x_post = 1.0, 2.0
-
             handles = []
+
             for i, (bid, pre, post) in enumerate(zip(bird_ids, pre_vals, post_vals)):
                 marker = marker_cycle[i % len(marker_cycle)]
-                ax.plot(
-                    [x_pre, x_post],
-                    [pre, post],
-                    color="0.7",
-                    linewidth=1.5,
-                    zorder=1,
-                )
-                ax.scatter(
-                    [x_pre],
-                    [pre],
-                    marker=marker,
-                    color="tab:blue",
-                    edgecolors="none",
-                    zorder=2,
-                )
-                ax.scatter(
-                    [x_post],
-                    [post],
-                    marker=marker,
-                    color="tab:red",
-                    edgecolors="none",
-                    zorder=2,
-                )
-                handles.append(
-                    plt.Line2D(
-                        [0],
-                        [0],
-                        marker=marker,
-                        linestyle="none",
-                        color="tab:blue",
-                        label=bid,
-                    )
-                )
+                ax.plot([x_pre, x_post], [pre, post], color="0.7", linewidth=1.5, zorder=1)
+                ax.scatter([x_pre], [pre], marker=marker, color="tab:blue", edgecolors="none", zorder=2)
+                ax.scatter([x_post], [post], marker=marker, color="tab:red", edgecolors="none", zorder=2)
+                handles.append(plt.Line2D([0], [0], marker=marker, linestyle="none", color="tab:blue", label=bid))
 
-            # Boxplots for pre/post distributions in this group
             bp = ax.boxplot(
                 [pre_vals, post_vals],
                 positions=[x_pre, x_post],
@@ -654,32 +752,19 @@ def tte_wrapper_pre_vs_post(
                 showfliers=False,
                 patch_artist=True,
             )
-            bp["boxes"][0].set_facecolor("tab:blue")
-            bp["boxes"][0].set_alpha(0.2)
-            bp["boxes"][1].set_facecolor("tab:red")
-            bp["boxes"][1].set_alpha(0.2)
+            bp["boxes"][0].set_facecolor("tab:blue"); bp["boxes"][0].set_alpha(0.2)
+            bp["boxes"][1].set_facecolor("tab:red");  bp["boxes"][1].set_alpha(0.2)
 
             ax.set_xticks([x_pre, x_post])
             ax.set_xticklabels(["Pre lesion", "Post lesion"])
-            if ax is axes[0]:
-                ax.set_ylabel("Total Transition Entropy")
-            else:
-                ax.set_ylabel("")
+            ax.set_ylabel("Total Transition Entropy" if ax is axes[0] else "")
             ax.set_title(f"{grp} (n = {len(bird_ids)} birds)")
             for side in ("top", "right"):
                 ax.spines[side].set_visible(False)
             ax.tick_params(top=False, right=False)
 
-            # Legend for birds in this group
-            ax.legend(
-                handles=handles,
-                title="Bird",
-                bbox_to_anchor=(1.02, 1),
-                loc="upper left",
-                fontsize=8,
-            )
+            ax.legend(handles=handles, title="Bird", bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=8)
 
-            # Group-specific paired Wilcoxon, if possible
             if _HAVE_SCIPY and len(pre_vals) >= 2:
                 try:
                     _, g_p = _scipy_stats.wilcoxon(pre_vals, post_vals)
@@ -687,7 +772,6 @@ def tte_wrapper_pre_vs_post(
                     g_p = None
             else:
                 g_p = None
-
             group_p_values[grp] = g_p
 
             if g_p is not None:
@@ -695,24 +779,10 @@ def tte_wrapper_pre_vs_post(
                 y_min = min(min(pre_vals), min(post_vals))
                 height = y_max + 0.08 * (y_max - y_min)
                 h = 0.03 * (y_max - y_min)
-                ax.plot(
-                    [x_pre, x_pre, x_post, x_post],
-                    [height, height + h, height + h, height],
-                    color="k",
-                    linewidth=1.5,
-                )
-                label = _p_to_stars(g_p)
-                ax.text(
-                    (x_pre + x_post) / 2.0,
-                    height + h * 1.2,
-                    label,
-                    ha="center",
-                    va="bottom",
-                )
+                ax.plot([x_pre, x_pre, x_post, x_post], [height, height + h, height + h, height], color="k", linewidth=1.5)
+                ax.text((x_pre + x_post) / 2.0, height + h * 1.2, _p_to_stars(g_p), ha="center", va="bottom")
 
-        fig2.suptitle(
-            f"Total Transition Entropy (n = {len(prepost_df)} birds)", y=1.02
-        )
+        fig2.suptitle(f"Total Transition Entropy (n = {len(prepost_df)} birds)", y=1.02)
         fig2.tight_layout(rect=[0, 0, 1, 0.95])
         prepost_path = fig_dir / "TTE_pre_vs_post_birds_boxplot.png"
         fig2.savefig(prepost_path, dpi=300, bbox_inches="tight")
@@ -725,7 +795,8 @@ def tte_wrapper_pre_vs_post(
         per_bird=per_bird_results,
         combined_daily_df=combined_daily,
         prepost_summary_df=prepost_df,
-        multi_bird_timecourse_path=multi_bird_path,
+        multi_bird_timecourse_path=(Path(multi_bird_path) if multi_bird_path else None),
+        multi_bird_timecourse_by_group_path=(Path(multi_bird_group_path) if multi_bird_group_path else None),
         prepost_boxplot_path=prepost_path,
         prepost_p_value=p_value,
         group_p_values=group_p_values,
@@ -744,8 +815,6 @@ importlib.reload(tw)
 
 decoded_root = Path("/Volumes/my_own_SSD/updated_AreaX_outputs")
 metadata_excel = decoded_root / "Area_X_lesion_metadata.xlsx"
-
-# Put summary figs OUTSIDE decoded_root:
 fig_root = decoded_root.parent / "tte_summary_figs"
 
 res = tw.tte_wrapper_pre_vs_post(
@@ -754,12 +823,10 @@ res = tw.tte_wrapper_pre_vs_post(
     fig_dir=fig_root,
     min_songs_per_day=5,
     show=True,
+    x_gap_threshold=3,
 )
 
-print(res.combined_daily_df.head())
-print(res.prepost_summary_df)
-print("Timecourse fig:", res.multi_bird_timecourse_path)
-print("Pre/Post fig:", res.prepost_boxplot_path)
-print("Overall pre/post Wilcoxon p-value (all birds):", res.prepost_p_value)
-print("Per-group p-values:", res.group_p_values)
+print("Bird-colored:", res.multi_bird_timecourse_path)
+print("Group-colored:", res.multi_bird_timecourse_by_group_path)
+print("Pre/Post:", res.prepost_boxplot_path)
 """

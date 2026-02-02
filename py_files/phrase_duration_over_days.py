@@ -48,7 +48,7 @@ except ImportError:
         )
 
 # ————————————————————————————————————————————————————————————————
-# Seaborn back-compat
+# Seaborn back-compat (older seaborn used `scale`, newer uses `density_norm`)
 # ————————————————————————————————————————————————————————————————
 def _violin_with_backcompat(*, data, x, y, order=None, color="lightgray", inner="quartile"):
     try:
@@ -207,16 +207,22 @@ def _choose_dt_series(df: pd.DataFrame) -> pd.Series:
             dt = pd.to_datetime(df[c], errors="coerce")
             if dt.notna().any():
                 return dt
+
     # Try separate 'Date' and 'Time'
     if "Date" in df.columns and "Time" in df.columns:
-        dt = pd.to_datetime(df["Date"].astype(str).str.replace(".", "-", regex=False) + " " + df["Time"].astype(str), errors="coerce")
+        dt = pd.to_datetime(
+            df["Date"].astype(str).str.replace(".", "-", regex=False) + " " + df["Time"].astype(str),
+            errors="coerce",
+        )
         if dt.notna().any():
             return dt
+
     # Try just 'Date'
     if "Date" in df.columns:
         dt = pd.to_datetime(df["Date"], errors="coerce")
         if dt.notna().any():
             return dt
+
     return pd.Series([pd.NaT] * len(df), index=df.index)
 
 def _infer_animal_id(df: pd.DataFrame, fallback_path: Optional[Path]) -> str:
@@ -238,6 +244,7 @@ def _coerce_treatment_date(user_treatment_date: Optional[str | pd.Timestamp], fa
         dt = pd.to_datetime(user_treatment_date, errors="coerce")
         if pd.notna(dt):
             return dt.normalize()
+
     if fallback_str:
         dt = pd.to_datetime(fallback_str, format="%Y.%m.%d", errors="coerce")
         if pd.isna(dt):
@@ -246,8 +253,22 @@ def _coerce_treatment_date(user_treatment_date: Optional[str | pd.Timestamp], fa
             return dt.normalize()
     return None
 
+def _drop_tz_if_present(dt: pd.Series) -> pd.Series:
+    """
+    Robustly remove timezone info if dt is tz-aware (prevents categorical mismatches
+    that can lead to "blank" plots).
+    """
+    try:
+        if hasattr(dt.dt, "tz") and dt.dt.tz is not None:
+            return dt.dt.tz_localize(None)
+    except Exception:
+        pass
+    return dt
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Core plotter for one syllable (aligned day axis with gaps preserved)
+# FIX: Use string date categories to prevent dtype/category mismatches that can
+#      silently produce empty violins/strip plots.
 # ──────────────────────────────────────────────────────────────────────────────
 def _plot_one_syllable(
     exploded: pd.DataFrame,
@@ -265,39 +286,66 @@ def _plot_one_syllable(
     xtick_every: int = 1,
     treatment_date_dt: Optional[pd.Timestamp] = None,
     show_plots: bool = False,
+    dpi: int = 300,
+    transparent: bool = False,
 ):
     exploded = exploded.copy()
-    exploded["DateDay"] = pd.to_datetime(exploded["Date"]).dt.normalize()
+
+    # Robust date handling (avoid tz + categorical dtype mismatches)
+    dt = pd.to_datetime(exploded["Date"], errors="coerce")
+    dt = _drop_tz_if_present(dt)
+    exploded["DateDay"] = dt.dt.normalize()
+
     exploded[col] = pd.to_numeric(exploded[col], errors="coerce")
-    exploded = exploded.dropna(subset=[col])
+    exploded = exploded.dropna(subset=[col, "DateDay"])
     if exploded.empty:
         return
 
-    exploded["DateCat"] = pd.Categorical(exploded["DateDay"], categories=full_date_range, ordered=True)
+    # Convert both the order and the data to matching strings (key fix)
+    date_order = [pd.Timestamp(d).strftime("%Y-%m-%d") for d in full_date_range]
+    exploded["DateStr"] = exploded["DateDay"].dt.strftime("%Y-%m-%d")
+    exploded["DateCat"] = pd.Categorical(exploded["DateStr"], categories=date_order, ordered=True)
 
     sns.set(style="white")
     plt.figure(figsize=figsize)
 
-    _violin_with_backcompat(data=exploded, x="DateCat", y=col, order=full_date_range, color="lightgray", inner="quartile")
-    sns.stripplot(data=exploded, x="DateCat", y=col, order=full_date_range, jitter=jitter, size=point_size, color="#2E4845", alpha=point_alpha)
+    _violin_with_backcompat(
+        data=exploded,
+        x="DateCat",
+        y=col,
+        order=date_order,
+        color="lightgray",
+        inner="quartile",
+    )
+    sns.stripplot(
+        data=exploded,
+        x="DateCat",
+        y=col,
+        order=date_order,
+        jitter=jitter,
+        size=point_size,
+        color="#2E4845",
+        alpha=point_alpha,
+    )
 
     ax = plt.gca()
     plt.ylim(0, y_max_ms)
     plt.xlabel("Recording Date", fontsize=font_size_labels)
     plt.ylabel("Phrase Duration (ms)", fontsize=font_size_labels)
 
-    tick_idx = list(range(0, len(full_date_range), max(1, int(xtick_every))))
+    tick_idx = list(range(0, len(date_order), max(1, int(xtick_every))))
     ax.set_xticks(tick_idx)
-    ax.set_xticklabels([full_date_range[i].strftime("%Y-%m-%d") for i in tick_idx], rotation=90, fontsize=xtick_fontsize)
+    ax.set_xticklabels([date_order[i] for i in tick_idx], rotation=90, fontsize=xtick_fontsize)
 
     if treatment_date_dt is not None and not pd.isna(treatment_date_dt):
-        t_idx = full_date_range.get_indexer([treatment_date_dt.normalize()])[0]
-        if t_idx >= 0:
+        t_str = pd.Timestamp(treatment_date_dt).strftime("%Y-%m-%d")
+        if t_str in date_order:
+            t_idx = date_order.index(t_str)
             plt.axvline(x=t_idx, color="red", linestyle="--", label="Treatment Date")
             plt.legend()
 
     plt.tight_layout()
-    plt.savefig(out_path, format="png", dpi=300, transparent=False)
+    plt.savefig(out_path, format="png", dpi=int(dpi), transparent=bool(transparent))
     if show_plots:
         plt.show()
     else:
@@ -328,8 +376,8 @@ def graph_phrase_duration_over_days(
     point_alpha: float = 0.7,
     point_size: int = 5,
     jitter: float | bool = True,
-    dpi: int = 300,                        # kept for signature compatibility
-    transparent: bool = True,              # kept for signature compatibility
+    dpi: int = 300,
+    transparent: bool = False,
     figsize: tuple[int, int] = (20, 11),
     font_size_labels: int = 30,
     xtick_fontsize: int = 8,
@@ -396,8 +444,12 @@ def graph_phrase_duration_over_days(
 
         # Prepare datetime + Date column
         dt = _choose_dt_series(df_merged)
+        dt = _drop_tz_if_present(pd.to_datetime(dt, errors="coerce"))
         df_merged = df_merged.assign(_dt=dt)
         df_merged = df_merged.dropna(subset=["_dt"]).sort_values("_dt").reset_index(drop=True)
+        if df_merged.empty:
+            print("[WARN] Merged annotations dataframe has no valid datetime rows; nothing to plot.")
+            return None
         df_merged["Date"] = df_merged["_dt"].dt.date
 
         # Choose labels from the best spans dict column and build durations columns
@@ -408,7 +460,8 @@ def graph_phrase_duration_over_days(
 
         labels = _collect_unique_labels_sorted(df_merged, spans_col)
         if syllables_subset is not None:
-            labels = [str(l) for l in labels if str(l) in set(map(str, syllables_subset))]
+            keep = set(map(str, syllables_subset))
+            labels = [str(l) for l in labels if str(l) in keep]
         if not labels:
             print("[WARN] No syllables to plot after filtering.")
             return None
@@ -440,6 +493,7 @@ def graph_phrase_duration_over_days(
             exploded = df_merged[["Date", col]].explode(col)
             if exploded[col].dropna().empty:
                 continue
+
             out_path = save_dir / f"{animal_id}_syllable_{lbl}_phrase_duration_plot.png"
             _plot_one_syllable(
                 exploded=exploded,
@@ -456,7 +510,10 @@ def graph_phrase_duration_over_days(
                 xtick_every=xtick_every,
                 treatment_date_dt=t_dt,
                 show_plots=show_plots,
+                dpi=dpi,
+                transparent=transparent,
             )
+
         return None  # merged mode → no OrganizedDataset
 
     # ──────────────────────────────────────────────────────────
@@ -471,7 +528,10 @@ def graph_phrase_duration_over_days(
     )
 
     df = out.organized_df.copy()
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+
+    # Organizer Date can be string/float; normalize into datetime
+    df["Date"] = pd.to_datetime(df.get("Date", pd.Series([pd.NaT] * len(df))), errors="coerce")
+    df["Date"] = _drop_tz_if_present(df["Date"])
 
     if not df["Date"].notna().any():
         return out
@@ -480,11 +540,12 @@ def graph_phrase_duration_over_days(
     latest_date = df["Date"].max().normalize()
     full_date_range = pd.date_range(start=earliest_date, end=latest_date, freq="D")
 
-    t_dt = _coerce_treatment_date(treatment_date, out.treatment_date)
+    t_dt = _coerce_treatment_date(treatment_date, getattr(out, "treatment_date", None))
 
     labels = out.unique_syllable_labels
     if syllables_subset is not None:
-        labels = [lab for lab in labels if lab in set(syllables_subset)]
+        keep = set(map(str, syllables_subset))
+        labels = [lab for lab in labels if str(lab) in keep]
     if not labels:
         return out
 
@@ -493,11 +554,14 @@ def graph_phrase_duration_over_days(
     except Exception:
         animal_id = "unknown_animal"
 
+    # Use python date objects for the plotting helper (it will convert safely)
+    df["_DateOnly"] = df["Date"].dt.date
+
     for syllable_label in labels:
         col = f"syllable_{syllable_label}_durations"
         if col not in df.columns:
             continue
-        exploded = df[["Date", col]].explode(col)
+        exploded = df[["_DateOnly", col]].rename(columns={"_DateOnly": "Date"}).explode(col)
         if exploded[col].dropna().empty:
             continue
         out_path = Path(save_dir) / f"{animal_id}_syllable_{syllable_label}_phrase_duration_plot.png"
@@ -516,7 +580,10 @@ def graph_phrase_duration_over_days(
             xtick_every=xtick_every,
             treatment_date_dt=t_dt,
             show_plots=show_plots,
+            dpi=dpi,
+            transparent=transparent,
         )
+
     return out
 
 
@@ -526,8 +593,10 @@ def graph_phrase_duration_over_days(
 if __name__ == "__main__":
     import argparse
 
-    ap = argparse.ArgumentParser(description="Plot per-syllable phrase duration distributions across calendar days "
-                                             "(works with organizer OR merged annotations).")
+    ap = argparse.ArgumentParser(
+        description="Plot per-syllable phrase duration distributions across calendar days "
+                    "(works with organizer OR merged annotations)."
+    )
     ap.add_argument("--decoded", type=str, default=None, help="Path to *_decoded_database.json")
     ap.add_argument("--creation-meta", type=str, default=None, help="Path to *_creation_data.json (unused with serial organizer)")
     ap.add_argument("--save-dir", type=str, required=True, help="Directory to save PNGs")
@@ -543,6 +612,8 @@ if __name__ == "__main__":
     ap.add_argument("--only-song-present", action="store_true")
     ap.add_argument("--y-max-ms", type=int, default=25000)
     ap.add_argument("--xtick-every", type=int, default=1)
+    ap.add_argument("--dpi", type=int, default=300)
+    ap.add_argument("--transparent", action="store_true")
     ap.add_argument("--show", action="store_true")
     ap.add_argument("--syllables", type=str, nargs="*", default=None, help="Subset of syllable labels to plot")
     ap.add_argument("--treatment-date", type=str, default=None, help="e.g., '2025-03-04' or '2025.03.04'")
@@ -562,6 +633,8 @@ if __name__ == "__main__":
         only_song_present=args.only_song_present,
         y_max_ms=args.y_max_ms,
         xtick_every=args.xtick_every,
+        dpi=args.dpi,
+        transparent=args.transparent,
         show_plots=args.show,
         syllables_subset=args.syllables,
         treatment_date=args.treatment_date,
@@ -569,17 +642,21 @@ if __name__ == "__main__":
 
 """
 from pathlib import Path
-import importlib
-import phrase_duration_over_days as gp
+import sys, importlib
 
-import Area_X_meta_wrapper as axmw
-importlib.reload(axmw); importlib.reload(gp)
+# Point to your code folder if needed
+code_dir = Path("/Users/mirandahulsey-vincent/Documents/allPythonCode/syntax_analysis/py_files")
+sys.path.insert(0, str(code_dir))
 
-detect  = Path("/Volumes/my_own_ssd/2025_areax_lesion/R08_RC6_Comp2_song_detection.json")
-decoded = Path("/Volumes/my_own_ssd/2025_areax_lesion/TweetyBERT_Pretrain_LLB_AreaX_FallSong_R08_RC6_Comp2_decoded_database.json")
+import merge_annotations_from_split_songs as mas
+importlib.reload(mas)
 
-# Build merged annotations once (same as wrapper does)
-ann = axmw.build_decoded_with_split_labels(
+# Paths to one bird's JSONs
+detect  = Path("/Volumes/my_own_SSD/updated_AreaX_outputs/R08/R08_song_detection.json")
+decoded = Path("/Volumes/my_own_SSD/updated_AreaX_outputs/R08/R08_decoded_database.json")
+
+# Build merged annotations
+res = mas.build_decoded_with_split_labels(
     decoded_database_json=decoded,
     song_detection_json=detect,
     only_song_present=True,
@@ -594,18 +671,14 @@ ann = axmw.build_decoded_with_split_labels(
     repeat_gap_inclusive=False,
 )
 
-merged_df = ann.annotations_appended_df
-outdir = decoded.parent / "figures" / "phrase_duration_daily"
+merged_df = res.annotations_appended_df
 
-gp.graph_phrase_duration_over_days(
-    premerged_annotations_df=merged_df,
-    premerged_annotations_path=decoded,  # just to infer animal id
-    save_output_to_this_file_path=outdir,
-    y_max_ms=25000,
-    xtick_every=1,
-    show_plots=True,
-    treatment_date="2025-05-22",
-    syllables_subset=[str(i) for i in range(26)],  # optional
-)
+# Print 2–3 lines + key columns (adjust column list if yours differs)
+cols = [c for c in ["file_name", "Segment", "was_merged", "merged_n_parts",
+                   "Recording DateTime", "Date", "Hour", "Minute", "Second"]
+        if c in merged_df.columns]
+
+print("Merged DF shape:", merged_df.shape)
+print(merged_df[cols].head(3).to_string(index=False))
 
 """
