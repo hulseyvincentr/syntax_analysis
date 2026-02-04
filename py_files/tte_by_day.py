@@ -735,7 +735,10 @@ def TTE_by_day(
             stats_text = "\n".join(lines)
             axTxt.text(0.0, 1.0, stats_text, transform=axTxt.transAxes, va="top", ha="left", fontsize=10, wrap=True)
 
-            figS.tight_layout()
+            # NOTE (Feb 2026): Removed figS.tight_layout() because Matplotlib can warn that
+            # this figure's axes (especially the "text panel" axis) are not fully compatible
+            # with tight_layout(). We already save with bbox_inches="tight", which handles
+            # cropping correctly without the warning.
             fig_path_stats = fig_dir / f"{animal_id}_TTE_pre_vs_post_balanced_3group_box_stats_merged.png"
             figS.savefig(fig_path_stats, dpi=200, bbox_inches="tight")
             if show:
