@@ -10,20 +10,20 @@ Wrapper around tte_by_day.TTE_by_day to:
 3) Build:
     - Multi-bird TTE vs days-from-lesion BROKEN x-axis plot (colored by bird)
     - Multi-bird TTE vs days-from-lesion BROKEN x-axis plot (colored by treatment group: Sham vs NMA)
-    - Grouped pre vs post paired boxplots (one subplot per treatment type).
+    - Multi-bird TTE vs days-from-lesion BROKEN x-axis plot (colored by lesion hit-type buckets)
+    - NEW: Mean±SD timecourse by hit-type bucket (3 lines with shaded SD band):
+         * sham saline injection
+         * Area X visible (single hit)
+         * COMBINED (visible ML + not visible)
 
-Key updates (this edit):
-- Remove numeric labels over points (n_songs labels OFF).
-- Use dot markers instead of 'x'.
-- Move legends to the RIGHT of the figure (outside the data area).
-- Add a second plot colored by Sham vs NMA lesion.
+4) Pre vs Post paired boxplots (bird-level means):
+    - overall (all birds)
+    - three separate figures for the 3 hit-type buckets above
 
-Outputs
--------
-TTEWrapperResult with:
-- multi_bird_timecourse_path:                per-bird colors plot
-- multi_bird_timecourse_by_group_path:       treatment-group colors plot
-- prepost_boxplot_path:                      grouped pre/post boxplots
+Notes
+-----
+- Metadata Excel may store treatment date/type and lesion hit type in DIFFERENT sheets.
+  This wrapper reads ALL sheets and merges values by Animal ID.
 """
 
 from __future__ import annotations
@@ -31,13 +31,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Union, Tuple
-import json
 
+import json
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# Optional SciPy for cross-bird paired stats
+# Optional SciPy for paired stats
 try:
     from scipy import stats as _scipy_stats  # type: ignore
     _HAVE_SCIPY = True
@@ -52,11 +52,78 @@ from tte_by_day import (
     _parse_treatment_date,
 )
 
-# Optional metadata helper (not required; we can also read Excel directly)
+# Optional metadata helper (not required; we also read Excel directly)
 try:
     from organize_metadata_excel import build_areax_metadata  # type: ignore
 except Exception:  # pragma: no cover
     build_areax_metadata = None  # type: ignore
+
+
+# ---------------------------------------------------------------------
+# Hit-type bucket definitions (match your outlier_graphs naming)
+# ---------------------------------------------------------------------
+HIT_SHAM = "sham saline injection"
+HIT_VISIBLE_SINGLE = "Area X visible (single hit)"
+HIT_VISIBLE_ML = "Area X visible (medial+lateral hit)"
+HIT_NOT_VISIBLE = "large lesion Area X not visible"
+COMBINED_LABEL = "COMBINED (visible ML + not visible)"
+OTHER_LABEL = "Other/Unknown"
+
+
+def _canonical_hit_type(raw: Optional[str]) -> Optional[str]:
+    """
+    Map messy/variant hit-type strings to canonical labels above.
+    Returns None if unknown.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, float) and pd.isna(raw):
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    sl = s.lower()
+
+    # sham
+    if ("sham" in sl) or ("saline" in sl) or ("control" in sl):
+        return HIT_SHAM
+
+    # not visible / large lesion
+    if ("not visible" in sl) or ("large lesion" in sl):
+        return HIT_NOT_VISIBLE
+
+    # visible single
+    if ("visible" in sl) and ("single" in sl):
+        return HIT_VISIBLE_SINGLE
+
+    # visible medial+lateral
+    if ("visible" in sl) and (("medial" in sl and "lateral" in sl) or ("medial+lateral" in sl) or ("ml" in sl)):
+        return HIT_VISIBLE_ML
+
+    # miss / unknown
+    if ("miss" in sl) or ("unknown" in sl):
+        return None
+
+    return None
+
+
+def _hit_type_subset_label(canon: Optional[str]) -> Optional[str]:
+    """
+    Return one of the three requested buckets:
+      - HIT_SHAM
+      - HIT_VISIBLE_SINGLE
+      - COMBINED_LABEL (HIT_VISIBLE_ML + HIT_NOT_VISIBLE)
+    or None if canon should be excluded.
+    """
+    if canon is None:
+        return None
+    if canon == HIT_SHAM:
+        return HIT_SHAM
+    if canon == HIT_VISIBLE_SINGLE:
+        return HIT_VISIBLE_SINGLE
+    if canon in (HIT_VISIBLE_ML, HIT_NOT_VISIBLE):
+        return COMBINED_LABEL
+    return None
 
 
 # ---------------------------------------------------------------------
@@ -69,8 +136,9 @@ class BirdDailyTTEResult:
     song_detection_path: Optional[Path]
     treatment_date: pd.Timestamp
     treatment_type: Optional[str]
+    lesion_hit_type: Optional[str]
     tte_result: TTEByDayResult
-    daily_df: pd.DataFrame  # results_df + animal_id + days_from_lesion + treatment_type + treatment_group
+    daily_df: pd.DataFrame  # results_df + animal_id + days_from_lesion + treatment_type + treatment_group + lesion_hit_type
 
 
 @dataclass
@@ -78,99 +146,162 @@ class TTEWrapperResult:
     per_bird: List[BirdDailyTTEResult]
     combined_daily_df: pd.DataFrame
     prepost_summary_df: pd.DataFrame
+
     multi_bird_timecourse_path: Optional[Path]                 # colored by bird
     multi_bird_timecourse_by_group_path: Optional[Path]        # colored by Sham vs NMA
-    prepost_boxplot_path: Optional[Path]
-    prepost_p_value: Optional[float]
-    group_p_values: Dict[str, Optional[float]]
+    multi_bird_timecourse_by_hit_type_path: Optional[Path]     # colored by hit-type bucket
+    hit_bucket_mean_sd_timecourse_path: Optional[Path]         # NEW: mean±SD lines for 3 buckets
+
+    prepost_boxplot_path_all: Optional[Path]                   # all birds combined
+    prepost_boxplot_paths_by_hit_bucket: Dict[str, Optional[Path]]  # 3 requested buckets
+
+    prepost_p_value_all: Optional[float]
+    prepost_p_values_by_hit_bucket: Dict[str, Optional[float]]
 
 
 # ---------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------
-def _load_treatment_info_from_metadata(
-    metadata_excel: Union[str, Path]
-) -> Tuple[Dict[str, Union[str, pd.Timestamp]], Dict[str, Optional[str]]]:
+def _treatment_group_from_type(treatment_type: Optional[str]) -> str:
     """
-    Build two dicts from the metadata Excel:
-        bird_to_date: {animal_id -> treatment_date}
-        bird_to_type: {animal_id -> treatment_type}
+    Collapse free-form 'Treatment type' into:
+      - 'Sham' (saline/sham/control)
+      - 'NMA'  (NMA lesion)
+      - 'Unknown' otherwise
+    """
+    if treatment_type is None or (isinstance(treatment_type, float) and pd.isna(treatment_type)):
+        return "Unknown"
+    s = str(treatment_type).lower()
+    if ("sham" in s) or ("saline" in s) or ("control" in s):
+        return "Sham"
+    if "nma" in s:
+        return "NMA"
+    return "Unknown"
 
-    Tries build_areax_metadata if available; else reads Excel with pandas.
+
+def _load_metadata_from_excel_all_sheets(
+    metadata_excel: Union[str, Path]
+) -> Tuple[Dict[str, Union[str, pd.Timestamp]], Dict[str, Optional[str]], Dict[str, Optional[str]]]:
+    """
+    Read ALL sheets in metadata_excel and build:
+        bird_to_date:     {animal_id -> treatment_date}
+        bird_to_type:     {animal_id -> treatment_type}
+        bird_to_hit_type: {animal_id -> lesion_hit_type}
+
+    Works even if these columns live on different sheets.
     """
     metadata_excel = Path(metadata_excel)
 
-    def _from_df(dfm: pd.DataFrame) -> Tuple[Dict[str, Union[str, pd.Timestamp]], Dict[str, Optional[str]]]:
-        id_col = "Animal ID" if "Animal ID" in dfm.columns else dfm.columns[0]
+    bird_to_date: Dict[str, Union[str, pd.Timestamp]] = {}
+    bird_to_type: Dict[str, Optional[str]] = {}
+    bird_to_hit: Dict[str, Optional[str]] = {}
 
-        # date col
+    def _extract_from_df(df: pd.DataFrame) -> None:
+        if df is None or df.empty:
+            return
+
+        # ID column
+        id_col = None
+        for cand in ["Animal ID", "AnimalID", "Animal Id", "Animal_ID", "animal_id"]:
+            if cand in df.columns:
+                id_col = cand
+                break
+        if id_col is None:
+            id_col = df.columns[0]
+
+        # treatment date col
         tcol = None
-        for cand in ["Treatment date", "Treatment_date", "treatment_date"]:
-            if cand in dfm.columns:
+        for cand in ["Treatment date", "Treatment_date", "treatment_date", "Tx date", "Surgery date", "Treatment Date"]:
+            if cand in df.columns:
                 tcol = cand
                 break
-        if tcol is None:
-            raise KeyError("Could not find a 'Treatment date' column in metadata Excel.")
 
-        # type col (optional)
+        # treatment type col
         type_col = None
-        for cand in ["Treatment type", "Treatment_type", "treatment_type"]:
-            if cand in dfm.columns:
+        for cand in ["Treatment type", "Treatment_type", "treatment_type", "Tx type", "Treatment Type"]:
+            if cand in df.columns:
                 type_col = cand
                 break
 
-        bird_to_date: Dict[str, Union[str, pd.Timestamp]] = {}
-        bird_to_type: Dict[str, Optional[str]] = {}
+        # hit type col
+        hit_col = None
+        for cand in [
+            "Lesion hit type",
+            "Hit type",
+            "animal_hit_type",
+            "Animal hit type",
+            "Lesion_hit_type",
+            "hit_type",
+            "Hit Type",
+        ]:
+            if cand in df.columns:
+                hit_col = cand
+                break
 
-        for aid, sub in dfm.groupby(id_col):
-            aid_str = str(aid)
+        # group and take first non-null per bird
+        for aid, sub in df.groupby(id_col):
+            aid_str = str(aid).strip()
+            if not aid_str:
+                continue
 
-            tvals = sub[tcol].dropna()
-            if len(tvals) > 0:
-                bird_to_date[aid_str] = tvals.iloc[0]
+            if tcol is not None and aid_str not in bird_to_date:
+                tvals = sub[tcol].dropna()
+                if len(tvals) > 0:
+                    bird_to_date[aid_str] = tvals.iloc[0]
 
-            if type_col is not None:
-                type_vals = sub[type_col].dropna()
-                bird_to_type[aid_str] = type_vals.iloc[0] if len(type_vals) > 0 else None
-            else:
-                bird_to_type[aid_str] = None
+            if type_col is not None and (aid_str not in bird_to_type or bird_to_type.get(aid_str) is None):
+                tvals = sub[type_col].dropna()
+                if len(tvals) > 0:
+                    bird_to_type[aid_str] = tvals.iloc[0]
 
-        return bird_to_date, bird_to_type
+            if hit_col is not None and (aid_str not in bird_to_hit or bird_to_hit.get(aid_str) is None):
+                hvals = sub[hit_col].dropna()
+                if len(hvals) > 0:
+                    bird_to_hit[aid_str] = hvals.iloc[0]
 
+    # First pass: build_areax_metadata if available
     if build_areax_metadata is not None:
         try:
             meta = build_areax_metadata(metadata_excel)  # type: ignore
             if isinstance(meta, dict):
-                bird_to_date: Dict[str, Union[str, pd.Timestamp]] = {}
-                bird_to_type: Dict[str, Optional[str]] = {}
                 for aid, info in meta.items():
                     if not isinstance(info, dict):
                         continue
-                    aid_str = str(aid)
+                    aid_str = str(aid).strip()
+                    if not aid_str:
+                        continue
 
-                    date_val = None
                     for key in ["Treatment date", "Treatment_date", "treatment_date"]:
-                        if key in info and pd.notna(info[key]):
-                            date_val = info[key]
+                        if key in info and pd.notna(info[key]) and aid_str not in bird_to_date:
+                            bird_to_date[aid_str] = info[key]
                             break
-                    if date_val is not None:
-                        bird_to_date[aid_str] = date_val
 
-                    type_val = None
                     for key in ["Treatment type", "Treatment_type", "treatment_type"]:
                         if key in info and pd.notna(info[key]):
-                            type_val = info[key]
+                            bird_to_type[aid_str] = info[key]
                             break
-                    bird_to_type[aid_str] = type_val
-                return bird_to_date, bird_to_type
-            else:
-                dfm = pd.DataFrame(meta)
-                return _from_df(dfm)
+
+                    for key in ["Lesion hit type", "Hit type", "animal_hit_type", "hit_type"]:
+                        if key in info and pd.notna(info[key]):
+                            bird_to_hit[aid_str] = info[key]
+                            break
         except Exception:
             pass
 
-    dfm = pd.read_excel(metadata_excel)
-    return _from_df(dfm)
+    # Second pass: parse ALL sheets
+    xls = pd.ExcelFile(metadata_excel)
+    for sheet in xls.sheet_names:
+        try:
+            df = pd.read_excel(metadata_excel, sheet_name=sheet)
+            _extract_from_df(df)
+        except Exception:
+            continue
+
+    for aid in list(bird_to_date.keys()):
+        bird_to_type.setdefault(aid, None)
+        bird_to_hit.setdefault(aid, None)
+
+    return bird_to_date, bird_to_type, bird_to_hit
 
 
 def _find_detection_for_decoded(decoded_path: Path) -> Optional[Path]:
@@ -211,21 +342,16 @@ def _compute_pre_post_means(
     return pre_mean, post_mean
 
 
-def _treatment_group_from_type(treatment_type: Optional[str]) -> str:
-    """
-    Collapse free-form 'Treatment type' into:
-      - 'Sham' (saline/sham/control)
-      - 'NMA'  (NMA lesion)
-      - 'Unknown' otherwise
-    """
-    if treatment_type is None or (isinstance(treatment_type, float) and pd.isna(treatment_type)):
-        return "Unknown"
-    s = str(treatment_type).lower()
-    if ("sham" in s) or ("saline" in s) or ("control" in s):
-        return "Sham"
-    if "nma" in s:
-        return "NMA"
-    return "Unknown"
+def _wilcoxon_p(pre_vals: List[float], post_vals: List[float]) -> Optional[float]:
+    if not _HAVE_SCIPY:
+        return None
+    if len(pre_vals) < 2:
+        return None
+    try:
+        _, p = _scipy_stats.wilcoxon(pre_vals, post_vals)
+        return float(p)
+    except Exception:
+        return None
 
 
 # -----------------------------
@@ -298,11 +424,11 @@ def _plot_all_birds_broken_x(
     fig_dir: Path,
     out_name: str,
     title: str,
-    color_mode: str = "bird",  # "bird" or "treatment_group"
+    color_mode: str = "bird",  # "bird" | "treatment_group" | "hit_type"
     ycol: str = "agg_TTE",
     xcol: str = "days_from_lesion",
     gap_threshold: int = 3,
-    marker: str = "o",         # dot marker
+    marker: str = "o",
     markersize: float = 4.5,
     linewidth: float = 1.8,
     show: bool = True,
@@ -311,6 +437,7 @@ def _plot_all_birds_broken_x(
     Broken-x multi-bird plot:
       - color_mode="bird": each bird gets its own color, legend lists birds
       - color_mode="treatment_group": birds colored by Sham vs NMA (legend lists groups)
+      - color_mode="hit_type": birds colored by hit-type BUCKET (legend lists 3 buckets + Other/Unknown)
     """
     if combined_daily.empty:
         return None
@@ -319,7 +446,6 @@ def _plot_all_birds_broken_x(
     if not segments:
         return None
 
-    # widths proportional to span
     widths = []
     for a, b in segments:
         span = max(1, abs(b - a) + 1)
@@ -344,7 +470,6 @@ def _plot_all_birds_broken_x(
     y_lo = max(0.0, y_min - pad)
     y_hi = y_max + pad
 
-    # axis formatting
     for si, ((xmin, xmax), ax) in enumerate(zip(segments, axes)):
         if xmin == xmax:
             ax.set_xlim(xmin - 0.5, xmax + 0.5)
@@ -368,27 +493,37 @@ def _plot_all_birds_broken_x(
             ax.spines["left"].set_visible(False)
             ax.tick_params(labelleft=False, left=False)
 
-    # breaks
     for i in range(len(axes) - 1):
         axes[i].spines["right"].set_visible(False)
         axes[i + 1].spines["left"].set_visible(False)
         _add_x_break_marks(axes[i], axes[i + 1], size=0.015, lw=1.5)
 
-    # color maps
     birds = sorted(combined_daily["animal_id"].astype(str).unique().tolist())
 
     if color_mode == "bird":
         color_cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]
         bird_color = {bid: color_cycle[i % len(color_cycle)] for i, bid in enumerate(birds)}
-        legend_handles = []
-        legend_labels = []
-    else:
-        # group coloring
+        legend_handles: Union[List[object], Dict[str, object]] = []
+        legend_labels: List[str] = []
+
+    elif color_mode == "treatment_group":
         group_color = {"NMA": "tab:blue", "Sham": "tab:orange", "Unknown": "0.5"}
-        legend_handles = {}
+        legend_handles = {}  # one handle per group
         legend_labels = []
 
-    # plot per bird per segment (don’t connect across breaks)
+    elif color_mode == "hit_type":
+        hit_color = {
+            HIT_SHAM: "tab:red",
+            HIT_VISIBLE_SINGLE: "tab:purple",
+            COMBINED_LABEL: "tab:blue",
+            OTHER_LABEL: "0.5",
+        }
+        legend_handles = {}  # one handle per bucket
+        legend_labels = []
+
+    else:
+        raise ValueError(f"Unknown color_mode: {color_mode!r}")
+
     for bid in birds:
         dfb = combined_daily[combined_daily["animal_id"].astype(str) == bid].copy()
         dfb = dfb.sort_values(xcol)
@@ -396,10 +531,20 @@ def _plot_all_birds_broken_x(
         if color_mode == "bird":
             col = bird_color[bid]
             label_for_legend = bid
-        else:
-            grp = _treatment_group_from_type(dfb["treatment_type"].iloc[0] if "treatment_type" in dfb.columns else None)
+
+        elif color_mode == "treatment_group":
+            grp = _treatment_group_from_type(
+                dfb["treatment_type"].iloc[0] if "treatment_type" in dfb.columns else None
+            )
             col = group_color.get(grp, "0.5")
             label_for_legend = grp
+
+        else:  # hit_type
+            raw_hit = dfb["lesion_hit_type"].iloc[0] if "lesion_hit_type" in dfb.columns else None
+            canon = _canonical_hit_type(None if pd.isna(raw_hit) else str(raw_hit))
+            bucket = _hit_type_subset_label(canon)
+            label_for_legend = bucket if bucket is not None else OTHER_LABEL
+            col = hit_color.get(label_for_legend, "0.5")
 
         first_segment_for_this_line = True
 
@@ -422,18 +567,15 @@ def _plot_all_birds_broken_x(
                 label=None,
             )[0]
 
-            # collect legend handles once
             if first_segment_for_this_line:
                 if color_mode == "bird":
-                    legend_handles.append(ln)
+                    legend_handles.append(ln)  # type: ignore
                     legend_labels.append(label_for_legend)
                 else:
-                    # one handle per group
-                    if label_for_legend not in legend_handles:
-                        legend_handles[label_for_legend] = ln
+                    if label_for_legend not in legend_handles:  # type: ignore
+                        legend_handles[label_for_legend] = ln  # type: ignore
                 first_segment_for_this_line = False
 
-    # lesion line at 0 + labels
     for (xmin, xmax), ax in zip(segments, axes):
         if xmin <= 0 <= xmax or xmax == 0:
             ax.axvline(0, linestyle="--", linewidth=1.5, color="0.6")
@@ -441,22 +583,22 @@ def _plot_all_birds_broken_x(
             ax.text(0, y_hi, "\npost lesion", rotation=90, va="top", ha="left", fontsize=10, color="k")
             break
 
-    # Titles/labels
     axes[0].set_ylabel("Transition Entropy")
     fig.supxlabel("Days post lesion")
     fig.suptitle(title, y=1.02)
 
-    # Legend OUTSIDE to the right
     if color_mode == "bird":
-        handles = legend_handles
+        handles = legend_handles  # type: ignore
         labels = legend_labels
-    else:
-        # preserve order
+    elif color_mode == "treatment_group":
         order = ["NMA", "Sham", "Unknown"]
-        handles = [legend_handles[g] for g in order if g in legend_handles]
-        labels = [g for g in order if g in legend_handles]
+        handles = [legend_handles[g] for g in order if g in legend_handles]  # type: ignore
+        labels = [g for g in order if g in legend_handles]  # type: ignore
+    else:  # hit_type
+        order = [HIT_SHAM, HIT_VISIBLE_SINGLE, COMBINED_LABEL, OTHER_LABEL]
+        handles = [legend_handles[g] for g in order if g in legend_handles]  # type: ignore
+        labels = [g for g in order if g in legend_handles]  # type: ignore
 
-    # leave space on the right for legend
     fig.tight_layout(rect=[0, 0, 0.84, 1.0])
     fig.legend(handles, labels, loc="center left", bbox_to_anchor=(0.86, 0.5), frameon=True, title=None)
 
@@ -467,6 +609,200 @@ def _plot_all_birds_broken_x(
     else:
         plt.close(fig)
     return out_path
+
+
+# ---------------------------------------------------------------------
+# NEW: Mean ± SD timecourse by hit-type bucket (3 lines, shaded SD)
+# ---------------------------------------------------------------------
+def _split_on_gaps(xs: np.ndarray, ys: np.ndarray, sds: np.ndarray, *, gap_threshold: int) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """Split arrays into segments when x gaps exceed gap_threshold."""
+    if xs.size == 0:
+        return []
+    segs: List[Tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+    start = 0
+    for i in range(1, xs.size):
+        if int(xs[i] - xs[i - 1]) > int(gap_threshold):
+            segs.append((xs[start:i], ys[start:i], sds[start:i]))
+            start = i
+    segs.append((xs[start:], ys[start:], sds[start:]))
+    return segs
+
+
+def _plot_hit_bucket_mean_sd_timecourse(
+    combined_daily: pd.DataFrame,
+    *,
+    fig_dir: Path,
+    out_name: str,
+    title: str,
+    xcol: str = "days_from_lesion",
+    ycol: str = "agg_TTE",
+    gap_threshold: int = 3,
+    show: bool = True,
+) -> Optional[Path]:
+    """
+    Plot 3 lines (mean across birds per day) with shaded ±1 SD across birds:
+      - sham saline injection
+      - Area X visible (single hit)
+      - COMBINED (visible ML + not visible)
+    """
+    if combined_daily.empty:
+        return None
+
+    df = combined_daily.copy()
+    df[xcol] = pd.to_numeric(df[xcol], errors="coerce")
+    df[ycol] = pd.to_numeric(df[ycol], errors="coerce")
+    df = df.dropna(subset=[xcol, ycol])
+
+    # assign bucket
+    df["hit_bucket"] = df["lesion_hit_type"].apply(lambda x: _hit_type_subset_label(_canonical_hit_type(None if pd.isna(x) else str(x))))
+    df = df[df["hit_bucket"].isin([HIT_SHAM, HIT_VISIBLE_SINGLE, COMBINED_LABEL])].copy()
+    if df.empty:
+        return None
+
+    # aggregate across birds per (bucket, day)
+    g = (
+        df.groupby(["hit_bucket", xcol])[ycol]
+        .agg(["mean", "std", "count"])
+        .reset_index()
+        .sort_values([xcol])
+    )
+    if g.empty:
+        return None
+
+    # colors from default cycle (so you get distinct colors without hard-coding)
+    cycle = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0", "C1", "C2"])
+    bucket_order = [HIT_SHAM, HIT_VISIBLE_SINGLE, COMBINED_LABEL]
+    bucket_color = {b: cycle[i % len(cycle)] for i, b in enumerate(bucket_order)}
+
+    fig, ax = plt.subplots(figsize=(9.5, 5.2))
+
+    for b in bucket_order:
+        gb = g[g["hit_bucket"] == b].copy()
+        if gb.empty:
+            continue
+
+        xs = gb[xcol].astype(int).to_numpy()
+        ys = gb["mean"].astype(float).to_numpy()
+        sds = gb["std"].astype(float).to_numpy()
+        sds = np.where(np.isfinite(sds), sds, 0.0)  # if n=1 -> std NaN -> show no band
+
+        # Split into segments to avoid connecting across big gaps
+        segs = _split_on_gaps(xs, ys, sds, gap_threshold=gap_threshold)
+
+        for j, (xseg, yseg, sdseg) in enumerate(segs):
+            if xseg.size == 0:
+                continue
+            # label only once per bucket
+            label = b if j == 0 else None
+            line = ax.plot(xseg, yseg, marker="o", linewidth=2.0, label=label, color=bucket_color[b])[0]
+            ax.fill_between(
+                xseg,
+                yseg - sdseg,
+                yseg + sdseg,
+                alpha=0.2,
+                color=line.get_color(),
+                linewidth=0,
+            )
+
+    # styling
+    ax.axvline(0, linestyle="--", linewidth=1.5, color="0.6")
+    ax.set_xlabel("Days from lesion")
+    ax.set_ylabel("Mean daily TTE (agg_TTE)")
+    ax.set_title(title)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    ax.tick_params(top=False, right=False)
+
+    # legend outside right
+    fig.tight_layout(rect=[0, 0, 0.82, 1.0])
+    fig.legend(loc="center left", bbox_to_anchor=(0.84, 0.5), frameon=True, title=None)
+
+    out_path = fig_dir / out_name
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+    return out_path
+
+
+# ---------------------------------------------------------------------
+# Pre/Post boxplot helper (paired, bird-level means)
+# ---------------------------------------------------------------------
+def _plot_prepost_paired_box(
+    df: pd.DataFrame,
+    *,
+    fig_dir: Path,
+    out_name: str,
+    title: str,
+    show: bool,
+) -> Tuple[Optional[Path], Optional[float]]:
+    """
+    df must have columns: animal_id, pre_mean_TTE, post_mean_TTE
+    Returns (path, wilcoxon_p).
+    """
+    if df.empty:
+        return None, None
+
+    pre_vals = df["pre_mean_TTE"].astype(float).to_list()
+    post_vals = df["post_mean_TTE"].astype(float).to_list()
+    bird_ids = df["animal_id"].astype(str).to_list()
+
+    p_val = _wilcoxon_p(pre_vals, post_vals)
+
+    fig, ax = plt.subplots(figsize=(6.6, 5.2))
+
+    marker_cycle = ["o", "P", "s", "D", "^", "v", "<", ">", "X", "*", "h", "H"]
+    for i, (bid, pre, post) in enumerate(zip(bird_ids, pre_vals, post_vals)):
+        mk = marker_cycle[i % len(marker_cycle)]
+        ax.plot([1, 2], [pre, post], color="0.7", linewidth=1.5, zorder=1)
+        ax.scatter([1], [pre], marker=mk, edgecolors="none", zorder=2)
+        ax.scatter([2], [post], marker=mk, edgecolors="none", zorder=2)
+
+    bp = ax.boxplot(
+        [pre_vals, post_vals],
+        positions=[1, 2],
+        widths=0.35,
+        showfliers=False,
+        patch_artist=True,
+    )
+    for patch in bp["boxes"]:
+        patch.set_alpha(0.2)
+
+    ax.set_xticks([1, 2])
+    ax.set_xticklabels(["Pre lesion", "Post lesion"])
+    ax.set_ylabel("Total Transition Entropy")
+    ax.set_title(title)
+
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    ax.tick_params(top=False, right=False)
+
+    handles = [
+        plt.Line2D([0], [0], marker=marker_cycle[i % len(marker_cycle)], linestyle="none", label=bid)
+        for i, bid in enumerate(bird_ids)
+    ]
+    fig.tight_layout(rect=[0, 0, 0.80, 1.0])
+    fig.legend(handles=handles, loc="center left", bbox_to_anchor=(0.82, 0.5), frameon=True, title="Bird")
+
+    if p_val is not None:
+        ax.text(
+            0.02, 0.02,
+            f"Wilcoxon p={p_val:.3g}",
+            transform=ax.transAxes,
+            ha="left", va="bottom",
+            fontsize=10,
+            color="k",
+        )
+
+    out_path = fig_dir / out_name
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    return out_path, p_val
 
 
 # ---------------------------------------------------------------------
@@ -488,26 +824,32 @@ def tte_wrapper_pre_vs_post(
     repeat_gap_inclusive: bool = False,
     dur_merge_gap_ms: int = 500,
     treatment_in: str = "post",
-    # broken x-axis behavior
+    # broken x-axis / gap behavior
     x_gap_threshold: int = 3,
 ) -> TTEWrapperResult:
     """
     Run TTE_by_day for all birds under decoded_root, then build:
       1) broken-x all-birds plot colored by BIRD
       2) broken-x all-birds plot colored by TREATMENT GROUP (Sham vs NMA)
-      3) grouped pre/post bird-level paired boxplots (unchanged)
+      3) broken-x all-birds plot colored by HIT-TYPE bucket
+      4) mean±SD timecourse plot (3 hit-type buckets)
+      5) paired pre/post plots:
+           - overall (all birds)
+           - 3 requested hit-type bucket figures
     """
     decoded_root = Path(decoded_root)
 
-    # ---------- Collect treatment dates + types ----------
+    # ---------- Collect treatment dates + types + hit types ----------
     bird_to_tdate: Dict[str, Union[str, pd.Timestamp]] = {}
     bird_to_ttype: Dict[str, Optional[str]] = {}
+    bird_to_hit: Dict[str, Optional[str]] = {}
 
     if metadata_excel is not None:
         try:
-            md_dates, md_types = _load_treatment_info_from_metadata(metadata_excel)
+            md_dates, md_types, md_hits = _load_metadata_from_excel_all_sheets(metadata_excel)
             bird_to_tdate.update(md_dates)
             bird_to_ttype.update(md_types)
+            bird_to_hit.update(md_hits)
         except Exception as e:  # pragma: no cover
             print(f"WARNING: failed to load metadata from {metadata_excel}: {e}")
 
@@ -539,9 +881,12 @@ def tte_wrapper_pre_vs_post(
             prepost_summary_df=empty,
             multi_bird_timecourse_path=None,
             multi_bird_timecourse_by_group_path=None,
-            prepost_boxplot_path=None,
-            prepost_p_value=None,
-            group_p_values={},
+            multi_bird_timecourse_by_hit_type_path=None,
+            hit_bucket_mean_sd_timecourse_path=None,
+            prepost_boxplot_path_all=None,
+            prepost_boxplot_paths_by_hit_bucket={},
+            prepost_p_value_all=None,
+            prepost_p_values_by_hit_bucket={},
         )
 
     per_bird_results: List[BirdDailyTTEResult] = []
@@ -559,9 +904,9 @@ def tte_wrapper_pre_vs_post(
             continue
 
         t_type = bird_to_ttype.get(animal_id)
+        hit_raw = bird_to_hit.get(animal_id)
         det_path = _find_detection_for_decoded(decoded_path)
 
-        # Per-bird figure directory (per-bird outputs from TTE_by_day)
         bird_fig_dir = fig_dir / animal_id
         bird_fig_dir.mkdir(parents=True, exist_ok=True)
 
@@ -610,6 +955,7 @@ def tte_wrapper_pre_vs_post(
         daily_df["days_from_lesion"] = (daily_df["day"] - tx).dt.days
         daily_df["treatment_type"] = t_type
         daily_df["treatment_group"] = _treatment_group_from_type(t_type)
+        daily_df["lesion_hit_type"] = hit_raw  # keep raw; canonicalize only when needed
 
         per_bird_results.append(
             BirdDailyTTEResult(
@@ -618,6 +964,7 @@ def tte_wrapper_pre_vs_post(
                 song_detection_path=det_path,
                 treatment_date=tx,
                 treatment_type=t_type,
+                lesion_hit_type=hit_raw,
                 tte_result=tte_res,
                 daily_df=daily_df,
             )
@@ -632,19 +979,17 @@ def tte_wrapper_pre_vs_post(
             prepost_summary_df=empty,
             multi_bird_timecourse_path=None,
             multi_bird_timecourse_by_group_path=None,
-            prepost_boxplot_path=None,
-            prepost_p_value=None,
-            group_p_values={},
+            multi_bird_timecourse_by_hit_type_path=None,
+            hit_bucket_mean_sd_timecourse_path=None,
+            prepost_boxplot_path_all=None,
+            prepost_boxplot_paths_by_hit_bucket={},
+            prepost_p_value_all=None,
+            prepost_p_values_by_hit_bucket={},
         )
 
-    # -----------------------------------------------------------------
-    # Combine daily data across birds
-    # -----------------------------------------------------------------
     combined_daily = pd.concat([b.daily_df for b in per_bird_results], ignore_index=True)
 
-    # -----------------------------------------------------------------
-    # Plot A: Multi-bird broken-x, colored by bird (DOT markers, no labels)
-    # -----------------------------------------------------------------
+    # Plot A: colored by bird
     multi_bird_path = _plot_all_birds_broken_x(
         combined_daily,
         fig_dir=fig_dir,
@@ -658,9 +1003,7 @@ def tte_wrapper_pre_vs_post(
         show=show,
     )
 
-    # -----------------------------------------------------------------
-    # Plot B: Multi-bird broken-x, colored by treatment group (Sham vs NMA)
-    # -----------------------------------------------------------------
+    # Plot B: colored by Sham vs NMA
     multi_bird_group_path = _plot_all_birds_broken_x(
         combined_daily,
         fig_dir=fig_dir,
@@ -674,9 +1017,31 @@ def tte_wrapper_pre_vs_post(
         show=show,
     )
 
-    # -----------------------------------------------------------------
-    # Build pre vs post summary per bird
-    # -----------------------------------------------------------------
+    # Plot C: colored by hit-type bucket (3 buckets + Other)
+    multi_bird_hit_path = _plot_all_birds_broken_x(
+        combined_daily,
+        fig_dir=fig_dir,
+        out_name="TTE_all_birds_brokenx_colored_by_hit_type.png",
+        title="Transition Entropy by day (all birds) — colored by lesion hit type",
+        color_mode="hit_type",
+        gap_threshold=x_gap_threshold,
+        marker="o",
+        markersize=4.5,
+        linewidth=1.8,
+        show=show,
+    )
+
+    # NEW Plot D: mean ± SD timecourse for the 3 buckets
+    mean_sd_path = _plot_hit_bucket_mean_sd_timecourse(
+        combined_daily,
+        fig_dir=fig_dir,
+        out_name="TTE_hitBuckets_mean_with_SD_band.png",
+        title="Mean daily TTE by lesion hit type (±1 SD across birds)",
+        gap_threshold=x_gap_threshold,
+        show=show,
+    )
+
+    # Build pre vs post summary per bird (bird-level means)
     rows = []
     for b in per_bird_results:
         pre_mean, post_mean = _compute_pre_post_means(b.daily_df, b.treatment_date)
@@ -689,107 +1054,56 @@ def tte_wrapper_pre_vs_post(
                 "pre_mean_TTE": pre_mean,
                 "post_mean_TTE": post_mean,
                 "treatment_type": b.treatment_type,
+                "treatment_group": _treatment_group_from_type(b.treatment_type),
+                "lesion_hit_type": b.lesion_hit_type,
             }
         )
     prepost_df = pd.DataFrame(rows) if rows else pd.DataFrame(
-        columns=["animal_id", "pre_mean_TTE", "post_mean_TTE", "treatment_type"]
+        columns=["animal_id", "pre_mean_TTE", "post_mean_TTE", "treatment_type", "treatment_group", "lesion_hit_type"]
     )
 
-    # -----------------------------------------------------------------
-    # Plot 2: Grouped Pre vs Post paired boxplots (bird-level means)
-    # -----------------------------------------------------------------
-    prepost_path: Optional[Path] = None
-    p_value: Optional[float] = None
-    group_p_values: Dict[str, Optional[float]] = {}
+    # Pre/Post plot: overall (all birds)
+    prepost_all_path: Optional[Path] = None
+    prepost_all_p: Optional[float] = None
+    if not prepost_df.empty:
+        prepost_all_path, prepost_all_p = _plot_prepost_paired_box(
+            prepost_df,
+            fig_dir=fig_dir,
+            out_name="TTE_pre_vs_post_ALL_birds_boxplot.png",
+            title=f"Total Transition Entropy — Pre vs Post (all birds; n={len(prepost_df)} birds)",
+            show=show,
+        )
+
+    # Pre/Post plots: 3 requested hit-type buckets
+    bucket_paths: Dict[str, Optional[Path]] = {}
+    bucket_ps: Dict[str, Optional[float]] = {}
 
     if not prepost_df.empty:
-        all_pre_vals = prepost_df["pre_mean_TTE"].astype(float).to_list()
-        all_post_vals = prepost_df["post_mean_TTE"].astype(float).to_list()
-        if _HAVE_SCIPY and len(all_pre_vals) >= 2:
-            try:
-                _, p_value = _scipy_stats.wilcoxon(all_pre_vals, all_post_vals)
-            except Exception:
-                p_value = None
+        canon = prepost_df["lesion_hit_type"].apply(lambda x: _canonical_hit_type(None if pd.isna(x) else str(x)))
+        bucket = canon.apply(_hit_type_subset_label)
+        tmp = prepost_df.copy()
+        tmp["hit_bucket"] = bucket
 
-        group_series = prepost_df["treatment_type"].fillna("Unknown")
-        groups = sorted(group_series.unique())
-        n_groups = len(groups)
-
-        fig2, axes = plt.subplots(1, n_groups, figsize=(5.5 * n_groups, 5), sharey=True)
-        if n_groups == 1:
-            axes = [axes]
-
-        marker_cycle = ["o", "P", "s", "D", "^", "v", "<", ">", "X", "*", "h", "H"]
-
-        def _p_to_stars(p: float) -> str:
-            return "***" if p < 1e-3 else ("**" if p < 1e-2 else ("*" if p < 0.05 else "ns"))
-
-        for ax, grp in zip(axes, groups):
-            gdf = prepost_df[group_series == grp]
-            if gdf.empty:
-                ax.set_visible(False)
-                group_p_values[grp] = None
+        for label, out_name in [
+            (HIT_SHAM, "TTE_pre_vs_post_hitBucket_SHAM.png"),
+            (HIT_VISIBLE_SINGLE, "TTE_pre_vs_post_hitBucket_VISIBLE_SINGLE.png"),
+            (COMBINED_LABEL, "TTE_pre_vs_post_hitBucket_COMBINED.png"),
+        ]:
+            sub = tmp[tmp["hit_bucket"] == label].copy()
+            if sub.empty:
+                bucket_paths[label] = None
+                bucket_ps[label] = None
                 continue
 
-            pre_vals = gdf["pre_mean_TTE"].astype(float).to_list()
-            post_vals = gdf["post_mean_TTE"].astype(float).to_list()
-            bird_ids = gdf["animal_id"].astype(str).to_list()
-
-            x_pre, x_post = 1.0, 2.0
-            handles = []
-
-            for i, (bid, pre, post) in enumerate(zip(bird_ids, pre_vals, post_vals)):
-                marker = marker_cycle[i % len(marker_cycle)]
-                ax.plot([x_pre, x_post], [pre, post], color="0.7", linewidth=1.5, zorder=1)
-                ax.scatter([x_pre], [pre], marker=marker, color="tab:blue", edgecolors="none", zorder=2)
-                ax.scatter([x_post], [post], marker=marker, color="tab:red", edgecolors="none", zorder=2)
-                handles.append(plt.Line2D([0], [0], marker=marker, linestyle="none", color="tab:blue", label=bid))
-
-            bp = ax.boxplot(
-                [pre_vals, post_vals],
-                positions=[x_pre, x_post],
-                widths=0.35,
-                showfliers=False,
-                patch_artist=True,
+            pth, pv = _plot_prepost_paired_box(
+                sub,
+                fig_dir=fig_dir,
+                out_name=out_name,
+                title=f"Total Transition Entropy — Pre vs Post ({label}; n={len(sub)} birds)",
+                show=show,
             )
-            bp["boxes"][0].set_facecolor("tab:blue"); bp["boxes"][0].set_alpha(0.2)
-            bp["boxes"][1].set_facecolor("tab:red");  bp["boxes"][1].set_alpha(0.2)
-
-            ax.set_xticks([x_pre, x_post])
-            ax.set_xticklabels(["Pre lesion", "Post lesion"])
-            ax.set_ylabel("Total Transition Entropy" if ax is axes[0] else "")
-            ax.set_title(f"{grp} (n = {len(bird_ids)} birds)")
-            for side in ("top", "right"):
-                ax.spines[side].set_visible(False)
-            ax.tick_params(top=False, right=False)
-
-            ax.legend(handles=handles, title="Bird", bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=8)
-
-            if _HAVE_SCIPY and len(pre_vals) >= 2:
-                try:
-                    _, g_p = _scipy_stats.wilcoxon(pre_vals, post_vals)
-                except Exception:
-                    g_p = None
-            else:
-                g_p = None
-            group_p_values[grp] = g_p
-
-            if g_p is not None:
-                y_max = max(max(pre_vals), max(post_vals))
-                y_min = min(min(pre_vals), min(post_vals))
-                height = y_max + 0.08 * (y_max - y_min)
-                h = 0.03 * (y_max - y_min)
-                ax.plot([x_pre, x_pre, x_post, x_post], [height, height + h, height + h, height], color="k", linewidth=1.5)
-                ax.text((x_pre + x_post) / 2.0, height + h * 1.2, _p_to_stars(g_p), ha="center", va="bottom")
-
-        fig2.suptitle(f"Total Transition Entropy (n = {len(prepost_df)} birds)", y=1.02)
-        fig2.tight_layout(rect=[0, 0, 1, 0.95])
-        prepost_path = fig_dir / "TTE_pre_vs_post_birds_boxplot.png"
-        fig2.savefig(prepost_path, dpi=300, bbox_inches="tight")
-        if show:
-            plt.show()
-        else:
-            plt.close(fig2)
+            bucket_paths[label] = (Path(pth) if pth else None)
+            bucket_ps[label] = pv
 
     return TTEWrapperResult(
         per_bird=per_bird_results,
@@ -797,9 +1111,12 @@ def tte_wrapper_pre_vs_post(
         prepost_summary_df=prepost_df,
         multi_bird_timecourse_path=(Path(multi_bird_path) if multi_bird_path else None),
         multi_bird_timecourse_by_group_path=(Path(multi_bird_group_path) if multi_bird_group_path else None),
-        prepost_boxplot_path=prepost_path,
-        prepost_p_value=p_value,
-        group_p_values=group_p_values,
+        multi_bird_timecourse_by_hit_type_path=(Path(multi_bird_hit_path) if multi_bird_hit_path else None),
+        hit_bucket_mean_sd_timecourse_path=(Path(mean_sd_path) if mean_sd_path else None),
+        prepost_boxplot_path_all=prepost_all_path,
+        prepost_boxplot_paths_by_hit_bucket=bucket_paths,
+        prepost_p_value_all=prepost_all_p,
+        prepost_p_values_by_hit_bucket=bucket_ps,
     )
 
 
@@ -814,8 +1131,8 @@ import tte_wrapper_pre_vs_post as tw
 importlib.reload(tw)
 
 decoded_root = Path("/Volumes/my_own_SSD/updated_AreaX_outputs")
-metadata_excel = decoded_root / "Area_X_lesion_metadata.xlsx"
-fig_root = decoded_root.parent / "tte_summary_figs"
+metadata_excel = decoded_root / "Area_X_lesion_metadata_with_hit_types.xlsx"
+fig_root = decoded_root.parent / "tte_summary_figs_hit_types"
 
 res = tw.tte_wrapper_pre_vs_post(
     decoded_root=decoded_root,
@@ -828,5 +1145,8 @@ res = tw.tte_wrapper_pre_vs_post(
 
 print("Bird-colored:", res.multi_bird_timecourse_path)
 print("Group-colored:", res.multi_bird_timecourse_by_group_path)
-print("Pre/Post:", res.prepost_boxplot_path)
+print("Hit-type-colored:", res.multi_bird_timecourse_by_hit_type_path)
+print("Hit-bucket mean±SD:", res.hit_bucket_mean_sd_timecourse_path)
+print("All birds pre/post:", res.prepost_boxplot_path_all)
+print("Hit-bucket pre/post:", res.prepost_boxplot_paths_by_hit_bucket)
 """
