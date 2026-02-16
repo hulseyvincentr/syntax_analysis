@@ -118,6 +118,9 @@ def _save_dir(fig_dir: Union[str, Path, None], decoded_database_json: Path) -> P
 
 
 def _parse_treatment_date(treatment_date: Optional[Union[str, pd.Timestamp]]) -> Optional[pd.Timestamp]:
+    """
+    Parse a treatment date into a date-only Timestamp (midnight).
+    """
     if treatment_date is None:
         return None
     if isinstance(treatment_date, pd.Timestamp):
@@ -327,6 +330,75 @@ def _build_per_song_from_merged_annotations(merged_ann_df: pd.DataFrame) -> pd.D
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# NEW: Song-balanced window selection helper (last N pre, first N post)
+# ──────────────────────────────────────────────────────────────────────────────
+def select_song_balanced_pre_post(
+    per_song_df: pd.DataFrame,
+    *,
+    treatment_date: Union[str, pd.Timestamp],
+    n_songs: int,
+    treatment_in: str = "post",
+) -> Tuple[pd.DataFrame, pd.DataFrame, int]:
+    """
+    Select song-balanced windows from a per-song table:
+      - pre_sel:  last n_eff songs from PRE
+      - post_sel: first n_eff songs from POST
+    where n_eff = min(n_songs, n_pre, n_post).
+
+    Uses the same 'treatment_in' convention as TTE_by_day:
+      - "post"    : pre < tx_date,  post >= tx_date
+      - "pre"     : pre <= tx_date, post >  tx_date
+      - "exclude" : pre < tx_date,  post >  tx_date  (drops tx_date)
+
+    Requires per_song_df columns: date_time (datetime-like), file_TTE (float).
+    Returns (pre_sel, post_sel, n_eff).
+    """
+    if per_song_df is None or per_song_df.empty:
+        return per_song_df.copy(), per_song_df.copy(), 0
+
+    if n_songs <= 0:
+        return per_song_df.iloc[0:0].copy(), per_song_df.iloc[0:0].copy(), 0
+
+    if "date_time" not in per_song_df.columns:
+        raise ValueError("per_song_df must contain a 'date_time' column.")
+    if "file_TTE" not in per_song_df.columns:
+        raise ValueError("per_song_df must contain a 'file_TTE' column (per-song TTE).")
+
+    tx = _parse_treatment_date(treatment_date)
+    if tx is None:
+        raise ValueError(f"Could not parse treatment_date={treatment_date!r}")
+
+    df = per_song_df.copy()
+    df["date_time"] = pd.to_datetime(df["date_time"], errors="coerce")
+    df = df.dropna(subset=["date_time"])
+    df = df.sort_values(["date_time", *(c for c in ["Segment", "segment", "file_name", "File Stem"] if c in df.columns)])
+
+    dts = df["date_time"]
+    t0 = pd.Timestamp(tx)
+
+    if treatment_in.lower() == "pre":
+        pre_mask = dts.dt.date <= t0.date()
+        post_mask = dts.dt.date > t0.date()
+    elif treatment_in.lower() == "exclude":
+        pre_mask = dts.dt.date < t0.date()
+        post_mask = dts.dt.date > t0.date()
+    else:  # "post"
+        pre_mask = dts.dt.date < t0.date()
+        post_mask = dts.dt.date >= t0.date()
+
+    pre_df = df.loc[pre_mask].copy()
+    post_df = df.loc[post_mask].copy()
+
+    n_eff = int(min(int(n_songs), len(pre_df), len(post_df)))
+    if n_eff <= 0:
+        return pre_df.iloc[0:0].copy(), post_df.iloc[0:0].copy(), 0
+
+    pre_sel = pre_df.tail(n_eff).reset_index(drop=True)
+    post_sel = post_df.head(n_eff).reset_index(drop=True)
+    return pre_sel, post_sel, n_eff
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Public API
 # ──────────────────────────────────────────────────────────────────────────────
 @dataclass
@@ -342,8 +414,19 @@ class TTEByDayResult:
     merged_durations_df: Optional[pd.DataFrame]
     three_group_stats: Optional[Dict[str, object]]
 
+    # NEW (Feb 2026): song-level outputs for downstream "equal N songs pre vs post"
+    per_song_df: Optional[pd.DataFrame] = None
+    syllable_types: Optional[List[str]] = None
 
-__all__ = ["TTEByDayResult", "TTE_by_day", "main"]
+
+__all__ = [
+    "TTEByDayResult",
+    "TTE_by_day",
+    "main",
+    "_extract_id_from_text",
+    "_parse_treatment_date",
+    "select_song_balanced_pre_post",
+]
 
 
 def TTE_by_day(
@@ -390,6 +473,11 @@ def TTE_by_day(
       3) legacy organizers (per-segment)
 
     Returns time-course figure + two balanced 3-group figures (plain & stats).
+
+    NEW (Feb 2026):
+      - Also returns per_song_df with per-song file_TTE values (song-level TTE),
+        enabling downstream selection of equal-N song windows (e.g., last 100 pre,
+        first 100 post) in the wrapper.
     """
     decoded_path = Path(decoded_database_json)
     det_path = Path(song_detection_json) if song_detection_json else None
@@ -496,8 +584,22 @@ def TTE_by_day(
     if pf.empty:
         print("No valid per-song transitions after merging.")
         return TTEByDayResult(
-            pd.DataFrame(), None, None, None, None, None, None, merged_durations_df=merged_dur_df, three_group_stats=None
+            results_df=pd.DataFrame(),
+            figure_path_timecourse=None,
+            figure_path_prepost_box_plain=None,
+            figure_path_prepost_box_stats=None,
+            figure_path_prepost_box=None,
+            prepost_p_value=None,
+            prepost_test=None,
+            merged_durations_df=merged_dur_df,
+            three_group_stats=None,
+            per_song_df=pf,
+            syllable_types=None,
         )
+
+    # Attach animal_id for downstream convenience (wrapper uses this frequently)
+    pf = pf.copy()
+    pf["animal_id"] = animal_id
 
     # Global syllable set
     all_tr: Dict[Tuple[str, str], int] = {}
@@ -506,15 +608,18 @@ def TTE_by_day(
             all_tr[tr] = all_tr.get(tr, 0) + cnt
     syllable_types = sorted({a for a, _ in all_tr} | {b for _, b in all_tr})
 
+    # NEW: compute per-song TTE ONCE, store in per_song_df
+    pf["file_TTE"] = pf["transition_frequencies"].apply(lambda d: _per_file_tte_from_freq(d, syllable_types))
+
     # Per-day aggregated TTE (+ per-song stats for ref)
     rows: List[Dict[str, object]] = []
     for day, grp in pf.groupby("day"):
-        grp = grp.sort_values(["date_time", *(c for c in ["Segment", "segment", "file_name"] if c in grp.columns)])
+        grp = grp.sort_values(["date_time", *(c for c in ["Segment", "segment", "file_name", "File Stem"] if c in grp.columns)])
         n = len(grp)
         if n < min_songs_per_day:
             continue
 
-        per_song_tte = [_per_file_tte_from_freq(freq, syllable_types) for freq in grp["transition_frequencies"]]
+        per_song_tte = grp["file_TTE"].astype(float).to_list()
         mean_pf, sem_pf, _ = _mean_sem(per_song_tte)
 
         pooled: Dict[Tuple[str, str], int] = {}
@@ -542,7 +647,17 @@ def TTE_by_day(
     if results_df.empty:
         print("No days satisfied the minimum song requirement.")
         return TTEByDayResult(
-            results_df, None, None, None, None, None, None, merged_durations_df=merged_dur_df, three_group_stats=None
+            results_df=results_df,
+            figure_path_timecourse=None,
+            figure_path_prepost_box_plain=None,
+            figure_path_prepost_box_stats=None,
+            figure_path_prepost_box=None,
+            prepost_p_value=None,
+            prepost_test=None,
+            merged_durations_df=merged_dur_df,
+            three_group_stats=None,
+            per_song_df=pf,
+            syllable_types=syllable_types,
         )
 
     fig_dir = _save_dir(fig_dir, decoded_path)
@@ -592,10 +707,7 @@ def TTE_by_day(
     three_stats: Optional[Dict[str, object]] = None
 
     if tx_date is not None:
-        pf_sorted = pf.sort_values(["date_time", *(c for c in ["Segment", "segment", "file_name"] if c in pf.columns)])
-        pf_sorted = pf_sorted.assign(
-            file_TTE=pf_sorted["transition_frequencies"].apply(lambda d: _per_file_tte_from_freq(d, syllable_types))
-        )
+        pf_sorted = pf.sort_values(["date_time", *(c for c in ["Segment", "segment", "file_name", "File Stem"] if c in pf.columns)])
 
         dts = pf_sorted["date_time"]
         t0 = pd.Timestamp(tx_date)
@@ -612,6 +724,7 @@ def TTE_by_day(
         pre_df = pf_sorted.loc[pre_mask].copy().sort_values("date_time")
         post_df = pf_sorted.loc[post_mask].copy().sort_values("date_time")
 
+        # Original 3-group balancing: Early Pre / Late Pre / Post
         n = min(len(pre_df) // 2, len(post_df))
         if n > 0:
             pre_last_2n = pre_df.tail(2 * n).reset_index(drop=True)
@@ -735,10 +848,7 @@ def TTE_by_day(
             stats_text = "\n".join(lines)
             axTxt.text(0.0, 1.0, stats_text, transform=axTxt.transAxes, va="top", ha="left", fontsize=10, wrap=True)
 
-            # NOTE (Feb 2026): Removed figS.tight_layout() because Matplotlib can warn that
-            # this figure's axes (especially the "text panel" axis) are not fully compatible
-            # with tight_layout(). We already save with bbox_inches="tight", which handles
-            # cropping correctly without the warning.
+            # NOTE (Feb 2026): Removed figS.tight_layout(); save with bbox_inches="tight".
             fig_path_stats = fig_dir / f"{animal_id}_TTE_pre_vs_post_balanced_3group_box_stats_merged.png"
             figS.savefig(fig_path_stats, dpi=200, bbox_inches="tight")
             if show:
@@ -759,6 +869,8 @@ def TTE_by_day(
         prepost_test=None,
         merged_durations_df=merged_dur_df,
         three_group_stats=three_stats,
+        per_song_df=pf,
+        syllable_types=syllable_types,
     )
 
 
@@ -797,6 +909,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 def main():
     args = _build_arg_parser().parse_args()
+
+    dur_gap = getattr(args, "dur_merge_gap_ms", None)  # should exist if your parser defines it
+    merged_song_gap_ms = None if (dur_gap is None or int(dur_gap) == 0) else int(dur_gap)
+
     res = TTE_by_day(
         decoded_database_json=args.decoded,
         song_detection_json=args.detect,
@@ -805,7 +921,7 @@ def main():
         merge_repeated_syllables=args.merge_repeats,
         repeat_gap_ms=args.repeat_gap_ms,
         repeat_gap_inclusive=args.repeat_gap_inclusive,
-        merged_song_gap_ms=(None if args.dur_merge_gap_ms == 0 else args.dur_merge_gap_ms),
+        merged_song_gap_ms=merged_song_gap_ms,  # <-- fixed
         fig_dir=args.fig_dir,
         show=not args.no_show,
         min_songs_per_day=args.min_songs_per_day,
@@ -816,6 +932,7 @@ def main():
         only_song_present=args.only_song_present,
         compute_durations=args.compute_durations,
     )
+
     print("\nResults (first 10 rows):")
     if not res.results_df.empty:
         print(res.results_df.head(10).to_string(index=False))
@@ -827,6 +944,9 @@ def main():
         print(f"3-group (plain) → {res.figure_path_prepost_box_plain}")
     if res.figure_path_prepost_box_stats:
         print(f"3-group (stats) → {res.figure_path_prepost_box_stats}")
+    if getattr(res, "per_song_df", None) is not None and not res.per_song_df.empty:
+        print(f"\nPer-song table rows: {len(res.per_song_df)} (includes file_TTE)")
+
     if res.three_group_stats:
         print("\n[Three-group stats]")
         print(res.three_group_stats)
@@ -835,20 +955,25 @@ def main():
 if __name__ == "__main__":
     main()
 
+
 # ---------------------------------------------------------------------------
-# Example (Python usage with pre-merged DataFrames from your wrapper):
+# Example: selecting equal-N song windows for a bird (Python)
 # ---------------------------------------------------------------------------
-# from tte_by_day import TTE_by_day
-# res = run_area_x_meta_bundle(... )  # your wrapper that returns merged tables
-# tte = TTE_by_day(
+# from tte_by_day import TTE_by_day, select_song_balanced_pre_post
+# res = TTE_by_day(
 #     decoded_database_json=decoded_json_path,
-#     premerged_annotations_df=res.merged_annotations_df,
-#     premerged_durations_df=res.merged_detected_df,   # optional
-#     animal_id_override="R08",                        # optional
+#     song_detection_json=detect_json_path,
 #     fig_dir=(Path(decoded_json_path).parent / "figures"),
-#     show=True,
+#     show=False,
 #     min_songs_per_day=5,
 #     treatment_date="2025-05-22",
 #     treatment_in="post",
 # )
-# print(tte.figure_path_timecourse, tte.figure_path_prepost_box_stats)
+# pre_sel, post_sel, n_eff = select_song_balanced_pre_post(
+#     res.per_song_df,
+#     treatment_date="2025-05-22",
+#     n_songs=100,
+#     treatment_in="post",
+# )
+# print("n_eff used:", n_eff)
+# print("pre mean:", pre_sel["file_TTE"].mean(), "post mean:", post_sel["file_TTE"].mean())

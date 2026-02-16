@@ -11,12 +11,17 @@ Wrapper around tte_by_day.TTE_by_day to:
     - Multi-bird TTE vs days-from-lesion BROKEN x-axis plot (colored by bird)
     - Multi-bird TTE vs days-from-lesion BROKEN x-axis plot (colored by treatment group: Sham vs NMA)
     - Multi-bird TTE vs days-from-lesion BROKEN x-axis plot (colored by lesion hit-type buckets)
-    - NEW: Mean±SD timecourse by hit-type bucket (3 lines with shaded SD band):
+    - Mean±SD timecourse by hit-type bucket (3 lines with shaded SD band):
          * sham saline injection
          * Area X visible (single hit)
          * COMBINED (visible ML + not visible)
 
-4) Pre vs Post paired boxplots (bird-level means):
+4) Pre vs Post paired boxplots (bird-level means) using DAILY agg_TTE (equal weight per date):
+    - overall (all birds)
+    - three separate figures for the 3 hit-type buckets above
+
+5) NEW: Pre vs Post paired boxplots (bird-level means) using SONG-BALANCED windows
+   (equal number of songs pre and post *within each bird*):
     - overall (all birds)
     - three separate figures for the 3 hit-type buckets above
 
@@ -24,6 +29,8 @@ Notes
 -----
 - Metadata Excel may store treatment date/type and lesion hit type in DIFFERENT sheets.
   This wrapper reads ALL sheets and merges values by Animal ID.
+- Requires updated tte_by_day.py that returns `per_song_df` with a `file_TTE` column,
+  and exports `select_song_balanced_pre_post`.
 """
 
 from __future__ import annotations
@@ -44,12 +51,13 @@ try:
 except Exception:  # pragma: no cover
     _HAVE_SCIPY = False
 
-# Core per-bird TTE function
+# Core per-bird TTE function + helpers
 from tte_by_day import (
     TTE_by_day,
     TTEByDayResult,
     _extract_id_from_text,
     _parse_treatment_date,
+    select_song_balanced_pre_post,  # NEW (Feb 2026)
 )
 
 # Optional metadata helper (not required; we also read Excel directly)
@@ -96,8 +104,13 @@ def _canonical_hit_type(raw: Optional[str]) -> Optional[str]:
     if ("visible" in sl) and ("single" in sl):
         return HIT_VISIBLE_SINGLE
 
-    # visible medial+lateral
-    if ("visible" in sl) and (("medial" in sl and "lateral" in sl) or ("medial+lateral" in sl) or ("ml" in sl)):
+    # visible medial+lateral (accept a few variants)
+    if ("visible" in sl) and (
+        ("medial" in sl and "lateral" in sl)
+        or ("medial+lateral" in sl)
+        or ("medial + lateral" in sl)
+        or ("ml" in sl and "visible" in sl)
+    ):
         return HIT_VISIBLE_ML
 
     # miss / unknown
@@ -137,26 +150,45 @@ class BirdDailyTTEResult:
     treatment_date: pd.Timestamp
     treatment_type: Optional[str]
     lesion_hit_type: Optional[str]
+
     tte_result: TTEByDayResult
-    daily_df: pd.DataFrame  # results_df + animal_id + days_from_lesion + treatment_type + treatment_group + lesion_hit_type
+
+    daily_df: pd.DataFrame  # results_df + extras: animal_id, days_from_lesion, treatment_type, treatment_group, lesion_hit_type
+
+    # NEW (song-balanced summary info; computed in wrapper)
+    song_balanced_n_eff: Optional[int] = None
+    song_balanced_pre_mean: Optional[float] = None
+    song_balanced_post_mean: Optional[float] = None
 
 
 @dataclass
 class TTEWrapperResult:
     per_bird: List[BirdDailyTTEResult]
     combined_daily_df: pd.DataFrame
+
+    # Daily-based pre/post summary (bird-level means over DAYS)
     prepost_summary_df: pd.DataFrame
 
+    # NEW: Song-balanced pre/post summary (bird-level means over selected songs)
+    prepost_song_balanced_summary_df: pd.DataFrame
+
+    # Timecourse plots
     multi_bird_timecourse_path: Optional[Path]                 # colored by bird
     multi_bird_timecourse_by_group_path: Optional[Path]        # colored by Sham vs NMA
     multi_bird_timecourse_by_hit_type_path: Optional[Path]     # colored by hit-type bucket
-    hit_bucket_mean_sd_timecourse_path: Optional[Path]         # NEW: mean±SD lines for 3 buckets
+    hit_bucket_mean_sd_timecourse_path: Optional[Path]         # mean±SD lines for 3 buckets
 
-    prepost_boxplot_path_all: Optional[Path]                   # all birds combined
-    prepost_boxplot_paths_by_hit_bucket: Dict[str, Optional[Path]]  # 3 requested buckets
-
+    # Daily-based pre/post plots
+    prepost_boxplot_path_all: Optional[Path]                   # all birds combined (daily-based)
+    prepost_boxplot_paths_by_hit_bucket: Dict[str, Optional[Path]]
     prepost_p_value_all: Optional[float]
     prepost_p_values_by_hit_bucket: Dict[str, Optional[float]]
+
+    # NEW: Song-balanced pre/post plots
+    prepost_song_balanced_boxplot_path_all: Optional[Path]
+    prepost_song_balanced_boxplot_paths_by_hit_bucket: Dict[str, Optional[Path]]
+    prepost_song_balanced_p_value_all: Optional[float]
+    prepost_song_balanced_p_values_by_hit_bucket: Dict[str, Optional[float]]
 
 
 # ---------------------------------------------------------------------
@@ -330,7 +362,7 @@ def _infer_animal_id_from_path(decoded_path: Path) -> str:
     return text.split("_")[0]
 
 
-def _compute_pre_post_means(
+def _compute_pre_post_means_daily(
     daily_df: pd.DataFrame, treatment_date: pd.Timestamp
 ) -> Tuple[Optional[float], Optional[float]]:
     """Bird-level mean of daily agg_TTE pre (< tx) and post (>= tx)."""
@@ -340,6 +372,43 @@ def _compute_pre_post_means(
     pre_mean = float(pre_vals.mean()) if len(pre_vals) > 0 else None
     post_mean = float(post_vals.mean()) if len(post_vals) > 0 else None
     return pre_mean, post_mean
+
+
+def _compute_pre_post_means_song_balanced(
+    tte_res: TTEByDayResult,
+    *,
+    treatment_date: pd.Timestamp,
+    n_songs: int,
+    treatment_in: str,
+) -> Tuple[Optional[float], Optional[float], int]:
+    """
+    Bird-level mean of per-song file_TTE for:
+      - last n_eff pre songs
+      - first n_eff post songs
+    n_eff is the effective number of songs possible for that bird.
+    """
+    per_song_df = getattr(tte_res, "per_song_df", None)
+    if per_song_df is None or not isinstance(per_song_df, pd.DataFrame) or per_song_df.empty:
+        return None, None, 0
+
+    try:
+        pre_sel, post_sel, n_eff = select_song_balanced_pre_post(
+            per_song_df,
+            treatment_date=treatment_date,
+            n_songs=int(n_songs),
+            treatment_in=str(treatment_in),
+        )
+    except Exception:
+        return None, None, 0
+
+    if n_eff <= 0 or pre_sel.empty or post_sel.empty:
+        return None, None, 0
+
+    pre_mean = float(pd.to_numeric(pre_sel["file_TTE"], errors="coerce").dropna().mean())
+    post_mean = float(pd.to_numeric(post_sel["file_TTE"], errors="coerce").dropna().mean())
+    if not np.isfinite(pre_mean) or not np.isfinite(post_mean):
+        return None, None, n_eff
+    return pre_mean, post_mean, n_eff
 
 
 def _wilcoxon_p(pre_vals: List[float], post_vals: List[float]) -> Optional[float]:
@@ -364,7 +433,7 @@ def _infer_x_segments_from_days(
     force_zero_split: bool = True,
 ) -> List[Tuple[int, int]]:
     """Split x into segments when gaps exceed gap_threshold; also split at 0 (pre/post)."""
-    xs = []
+    xs: List[int] = []
     for v in list(days_from_lesion):
         if pd.isna(v):
             continue
@@ -446,7 +515,7 @@ def _plot_all_birds_broken_x(
     if not segments:
         return None
 
-    widths = []
+    widths: List[float] = []
     for a, b in segments:
         span = max(1, abs(b - a) + 1)
         widths.append(max(1.2, min(10.0, float(span))))
@@ -576,6 +645,7 @@ def _plot_all_birds_broken_x(
                         legend_handles[label_for_legend] = ln  # type: ignore
                 first_segment_for_this_line = False
 
+    # mark lesion boundary
     for (xmin, xmax), ax in zip(segments, axes):
         if xmin <= 0 <= xmax or xmax == 0:
             ax.axvline(0, linestyle="--", linewidth=1.5, color="0.6")
@@ -584,7 +654,7 @@ def _plot_all_birds_broken_x(
             break
 
     axes[0].set_ylabel("Transition Entropy")
-    fig.supxlabel("Days post lesion")
+    fig.supxlabel("Days from lesion")
     fig.suptitle(title, y=1.02)
 
     if color_mode == "bird":
@@ -612,7 +682,7 @@ def _plot_all_birds_broken_x(
 
 
 # ---------------------------------------------------------------------
-# NEW: Mean ± SD timecourse by hit-type bucket (3 lines, shaded SD)
+# Mean ± SD timecourse by hit-type bucket (3 lines, shaded SD)
 # ---------------------------------------------------------------------
 def _split_on_gaps(xs: np.ndarray, ys: np.ndarray, sds: np.ndarray, *, gap_threshold: int) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
     """Split arrays into segments when x gaps exceed gap_threshold."""
@@ -654,7 +724,9 @@ def _plot_hit_bucket_mean_sd_timecourse(
     df = df.dropna(subset=[xcol, ycol])
 
     # assign bucket
-    df["hit_bucket"] = df["lesion_hit_type"].apply(lambda x: _hit_type_subset_label(_canonical_hit_type(None if pd.isna(x) else str(x))))
+    df["hit_bucket"] = df["lesion_hit_type"].apply(
+        lambda x: _hit_type_subset_label(_canonical_hit_type(None if pd.isna(x) else str(x)))
+    )
     df = df[df["hit_bucket"].isin([HIT_SHAM, HIT_VISIBLE_SINGLE, COMBINED_LABEL])].copy()
     if df.empty:
         return None
@@ -669,7 +741,7 @@ def _plot_hit_bucket_mean_sd_timecourse(
     if g.empty:
         return None
 
-    # colors from default cycle (so you get distinct colors without hard-coding)
+    # use default cycle (no hard-coded colors)
     cycle = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0", "C1", "C2"])
     bucket_order = [HIT_SHAM, HIT_VISIBLE_SINGLE, COMBINED_LABEL]
     bucket_color = {b: cycle[i % len(cycle)] for i, b in enumerate(bucket_order)}
@@ -686,13 +758,11 @@ def _plot_hit_bucket_mean_sd_timecourse(
         sds = gb["std"].astype(float).to_numpy()
         sds = np.where(np.isfinite(sds), sds, 0.0)  # if n=1 -> std NaN -> show no band
 
-        # Split into segments to avoid connecting across big gaps
         segs = _split_on_gaps(xs, ys, sds, gap_threshold=gap_threshold)
 
         for j, (xseg, yseg, sdseg) in enumerate(segs):
             if xseg.size == 0:
                 continue
-            # label only once per bucket
             label = b if j == 0 else None
             line = ax.plot(xseg, yseg, marker="o", linewidth=2.0, label=label, color=bucket_color[b])[0]
             ax.fill_between(
@@ -704,7 +774,6 @@ def _plot_hit_bucket_mean_sd_timecourse(
                 linewidth=0,
             )
 
-    # styling
     ax.axvline(0, linestyle="--", linewidth=1.5, color="0.6")
     ax.set_xlabel("Days from lesion")
     ax.set_ylabel("Mean daily TTE (agg_TTE)")
@@ -713,7 +782,6 @@ def _plot_hit_bucket_mean_sd_timecourse(
         ax.spines[side].set_visible(False)
     ax.tick_params(top=False, right=False)
 
-    # legend outside right
     fig.tight_layout(rect=[0, 0, 0.82, 1.0])
     fig.legend(loc="center left", bbox_to_anchor=(0.84, 0.5), frameon=True, title=None)
 
@@ -727,7 +795,7 @@ def _plot_hit_bucket_mean_sd_timecourse(
 
 
 # ---------------------------------------------------------------------
-# Pre/Post boxplot helper (paired, bird-level means)
+# Pre/Post paired boxplot helper (generic columns)
 # ---------------------------------------------------------------------
 def _plot_prepost_paired_box(
     df: pd.DataFrame,
@@ -735,32 +803,45 @@ def _plot_prepost_paired_box(
     fig_dir: Path,
     out_name: str,
     title: str,
+    pre_col: str,
+    post_col: str,
+    ylabel: str,
     show: bool,
+    p_text_prefix: str = "Wilcoxon",
 ) -> Tuple[Optional[Path], Optional[float]]:
     """
-    df must have columns: animal_id, pre_mean_TTE, post_mean_TTE
+    df must have columns: animal_id, <pre_col>, <post_col>
     Returns (path, wilcoxon_p).
     """
     if df.empty:
         return None, None
 
-    pre_vals = df["pre_mean_TTE"].astype(float).to_list()
-    post_vals = df["post_mean_TTE"].astype(float).to_list()
+    pre_vals = pd.to_numeric(df[pre_col], errors="coerce").to_list()
+    post_vals = pd.to_numeric(df[post_col], errors="coerce").to_list()
     bird_ids = df["animal_id"].astype(str).to_list()
 
-    p_val = _wilcoxon_p(pre_vals, post_vals)
+    # filter finite pairs
+    pairs = [(bid, pre, post) for bid, pre, post in zip(bird_ids, pre_vals, post_vals) if np.isfinite(pre) and np.isfinite(post)]
+    if len(pairs) == 0:
+        return None, None
+
+    bird_ids = [p[0] for p in pairs]
+    pre_vals_f = [float(p[1]) for p in pairs]
+    post_vals_f = [float(p[2]) for p in pairs]
+
+    p_val = _wilcoxon_p(pre_vals_f, post_vals_f)
 
     fig, ax = plt.subplots(figsize=(6.6, 5.2))
 
     marker_cycle = ["o", "P", "s", "D", "^", "v", "<", ">", "X", "*", "h", "H"]
-    for i, (bid, pre, post) in enumerate(zip(bird_ids, pre_vals, post_vals)):
+    for i, (bid, pre, post) in enumerate(zip(bird_ids, pre_vals_f, post_vals_f)):
         mk = marker_cycle[i % len(marker_cycle)]
         ax.plot([1, 2], [pre, post], color="0.7", linewidth=1.5, zorder=1)
         ax.scatter([1], [pre], marker=mk, edgecolors="none", zorder=2)
         ax.scatter([2], [post], marker=mk, edgecolors="none", zorder=2)
 
     bp = ax.boxplot(
-        [pre_vals, post_vals],
+        [pre_vals_f, post_vals_f],
         positions=[1, 2],
         widths=0.35,
         showfliers=False,
@@ -771,7 +852,7 @@ def _plot_prepost_paired_box(
 
     ax.set_xticks([1, 2])
     ax.set_xticklabels(["Pre lesion", "Post lesion"])
-    ax.set_ylabel("Total Transition Entropy")
+    ax.set_ylabel(ylabel)
     ax.set_title(title)
 
     for side in ("top", "right"):
@@ -788,7 +869,7 @@ def _plot_prepost_paired_box(
     if p_val is not None:
         ax.text(
             0.02, 0.02,
-            f"Wilcoxon p={p_val:.3g}",
+            f"{p_text_prefix} p={p_val:.3g}",
             transform=ax.transAxes,
             ha="left", va="bottom",
             fontsize=10,
@@ -826,16 +907,27 @@ def tte_wrapper_pre_vs_post(
     treatment_in: str = "post",
     # broken x-axis / gap behavior
     x_gap_threshold: int = 3,
+    # NEW: song-balanced selection
+    n_songs_balanced: int = 100,
 ) -> TTEWrapperResult:
     """
     Run TTE_by_day for all birds under decoded_root, then build:
-      1) broken-x all-birds plot colored by BIRD
-      2) broken-x all-birds plot colored by TREATMENT GROUP (Sham vs NMA)
-      3) broken-x all-birds plot colored by HIT-TYPE bucket
-      4) mean±SD timecourse plot (3 hit-type buckets)
-      5) paired pre/post plots:
-           - overall (all birds)
-           - 3 requested hit-type bucket figures
+
+      Timecourse figures:
+        1) broken-x all-birds plot colored by BIRD
+        2) broken-x all-birds plot colored by TREATMENT GROUP (Sham vs NMA)
+        3) broken-x all-birds plot colored by HIT-TYPE bucket
+        4) mean±SD timecourse plot (3 hit-type buckets)
+
+      Pre/Post (daily-based):
+        5) paired pre/post plots (bird-level mean of DAILY agg_TTE):
+             - overall (all birds)
+             - 3 requested hit-type bucket figures
+
+      Pre/Post (song-balanced):
+        6) paired pre/post plots (bird-level mean of per-song file_TTE for last N pre and first N post):
+             - overall (all birds)
+             - 3 requested hit-type bucket figures
     """
     decoded_root = Path(decoded_root)
 
@@ -879,6 +971,7 @@ def tte_wrapper_pre_vs_post(
             per_bird=[],
             combined_daily_df=empty,
             prepost_summary_df=empty,
+            prepost_song_balanced_summary_df=empty,
             multi_bird_timecourse_path=None,
             multi_bird_timecourse_by_group_path=None,
             multi_bird_timecourse_by_hit_type_path=None,
@@ -887,6 +980,10 @@ def tte_wrapper_pre_vs_post(
             prepost_boxplot_paths_by_hit_bucket={},
             prepost_p_value_all=None,
             prepost_p_values_by_hit_bucket={},
+            prepost_song_balanced_boxplot_path_all=None,
+            prepost_song_balanced_boxplot_paths_by_hit_bucket={},
+            prepost_song_balanced_p_value_all=None,
+            prepost_song_balanced_p_values_by_hit_bucket={},
         )
 
     per_bird_results: List[BirdDailyTTEResult] = []
@@ -957,6 +1054,14 @@ def tte_wrapper_pre_vs_post(
         daily_df["treatment_group"] = _treatment_group_from_type(t_type)
         daily_df["lesion_hit_type"] = hit_raw  # keep raw; canonicalize only when needed
 
+        # NEW: song-balanced per-bird summary (mean of file_TTE over last/first N songs)
+        sb_pre_mean, sb_post_mean, sb_n_eff = _compute_pre_post_means_song_balanced(
+            tte_res,
+            treatment_date=tx,
+            n_songs=int(n_songs_balanced),
+            treatment_in=str(treatment_in),
+        )
+
         per_bird_results.append(
             BirdDailyTTEResult(
                 animal_id=animal_id,
@@ -967,6 +1072,9 @@ def tte_wrapper_pre_vs_post(
                 lesion_hit_type=hit_raw,
                 tte_result=tte_res,
                 daily_df=daily_df,
+                song_balanced_n_eff=(sb_n_eff if sb_n_eff > 0 else None),
+                song_balanced_pre_mean=sb_pre_mean,
+                song_balanced_post_mean=sb_post_mean,
             )
         )
 
@@ -977,6 +1085,7 @@ def tte_wrapper_pre_vs_post(
             per_bird=[],
             combined_daily_df=empty,
             prepost_summary_df=empty,
+            prepost_song_balanced_summary_df=empty,
             multi_bird_timecourse_path=None,
             multi_bird_timecourse_by_group_path=None,
             multi_bird_timecourse_by_hit_type_path=None,
@@ -985,6 +1094,10 @@ def tte_wrapper_pre_vs_post(
             prepost_boxplot_paths_by_hit_bucket={},
             prepost_p_value_all=None,
             prepost_p_values_by_hit_bucket={},
+            prepost_song_balanced_boxplot_path_all=None,
+            prepost_song_balanced_boxplot_paths_by_hit_bucket={},
+            prepost_song_balanced_p_value_all=None,
+            prepost_song_balanced_p_values_by_hit_bucket={},
         )
 
     combined_daily = pd.concat([b.daily_df for b in per_bird_results], ignore_index=True)
@@ -1031,7 +1144,7 @@ def tte_wrapper_pre_vs_post(
         show=show,
     )
 
-    # NEW Plot D: mean ± SD timecourse for the 3 buckets
+    # Plot D: mean ± SD timecourse for the 3 buckets
     mean_sd_path = _plot_hit_bucket_mean_sd_timecourse(
         combined_daily,
         fig_dir=fig_dir,
@@ -1041,14 +1154,16 @@ def tte_wrapper_pre_vs_post(
         show=show,
     )
 
-    # Build pre vs post summary per bird (bird-level means)
-    rows = []
+    # -----------------------------------------------------------------
+    # Pre vs post summary per bird (DAILY-based: bird-level mean over days)
+    # -----------------------------------------------------------------
+    rows_daily = []
     for b in per_bird_results:
-        pre_mean, post_mean = _compute_pre_post_means(b.daily_df, b.treatment_date)
+        pre_mean, post_mean = _compute_pre_post_means_daily(b.daily_df, b.treatment_date)
         if pre_mean is None or post_mean is None:
-            print(f"Skipping {b.animal_id} in pre/post summary: missing pre or post days.")
+            print(f"Skipping {b.animal_id} in DAILY pre/post summary: missing pre or post days.")
             continue
-        rows.append(
+        rows_daily.append(
             {
                 "animal_id": b.animal_id,
                 "pre_mean_TTE": pre_mean,
@@ -1058,65 +1173,170 @@ def tte_wrapper_pre_vs_post(
                 "lesion_hit_type": b.lesion_hit_type,
             }
         )
-    prepost_df = pd.DataFrame(rows) if rows else pd.DataFrame(
+
+    prepost_df_daily = pd.DataFrame(rows_daily) if rows_daily else pd.DataFrame(
         columns=["animal_id", "pre_mean_TTE", "post_mean_TTE", "treatment_type", "treatment_group", "lesion_hit_type"]
     )
 
-    # Pre/Post plot: overall (all birds)
-    prepost_all_path: Optional[Path] = None
-    prepost_all_p: Optional[float] = None
-    if not prepost_df.empty:
-        prepost_all_path, prepost_all_p = _plot_prepost_paired_box(
-            prepost_df,
-            fig_dir=fig_dir,
-            out_name="TTE_pre_vs_post_ALL_birds_boxplot.png",
-            title=f"Total Transition Entropy — Pre vs Post (all birds; n={len(prepost_df)} birds)",
-            show=show,
+    # -----------------------------------------------------------------
+    # NEW: Pre vs post summary per bird (SONG-balanced: bird-level mean over selected songs)
+    # -----------------------------------------------------------------
+    rows_song = []
+    for b in per_bird_results:
+        if b.song_balanced_pre_mean is None or b.song_balanced_post_mean is None or not b.song_balanced_n_eff:
+            print(f"Skipping {b.animal_id} in SONG-balanced pre/post summary: insufficient songs or missing per_song_df.")
+            continue
+        rows_song.append(
+            {
+                "animal_id": b.animal_id,
+                "pre_mean_song_TTE": float(b.song_balanced_pre_mean),
+                "post_mean_song_TTE": float(b.song_balanced_post_mean),
+                "n_songs_used_per_side": int(b.song_balanced_n_eff),
+                "n_songs_requested": int(n_songs_balanced),
+                "treatment_type": b.treatment_type,
+                "treatment_group": _treatment_group_from_type(b.treatment_type),
+                "lesion_hit_type": b.lesion_hit_type,
+            }
         )
 
-    # Pre/Post plots: 3 requested hit-type buckets
-    bucket_paths: Dict[str, Optional[Path]] = {}
-    bucket_ps: Dict[str, Optional[float]] = {}
+    prepost_df_song = pd.DataFrame(rows_song) if rows_song else pd.DataFrame(
+        columns=[
+            "animal_id",
+            "pre_mean_song_TTE",
+            "post_mean_song_TTE",
+            "n_songs_used_per_side",
+            "n_songs_requested",
+            "treatment_type",
+            "treatment_group",
+            "lesion_hit_type",
+        ]
+    )
 
-    if not prepost_df.empty:
-        canon = prepost_df["lesion_hit_type"].apply(lambda x: _canonical_hit_type(None if pd.isna(x) else str(x)))
+    # -----------------------------------------------------------------
+    # Pre/Post plots: DAILY-based
+    # -----------------------------------------------------------------
+    prepost_all_path: Optional[Path] = None
+    prepost_all_p: Optional[float] = None
+    if not prepost_df_daily.empty:
+        prepost_all_path, prepost_all_p = _plot_prepost_paired_box(
+            prepost_df_daily,
+            fig_dir=fig_dir,
+            out_name="TTE_pre_vs_post_ALL_birds_boxplot_DAILY.png",
+            title=f"Total Transition Entropy — Pre vs Post (daily means; n={len(prepost_df_daily)} birds)",
+            pre_col="pre_mean_TTE",
+            post_col="post_mean_TTE",
+            ylabel="Total Transition Entropy (agg_TTE; mean across days)",
+            show=show,
+            p_text_prefix="Wilcoxon",
+        )
+
+    bucket_paths_daily: Dict[str, Optional[Path]] = {}
+    bucket_ps_daily: Dict[str, Optional[float]] = {}
+
+    if not prepost_df_daily.empty:
+        canon = prepost_df_daily["lesion_hit_type"].apply(lambda x: _canonical_hit_type(None if pd.isna(x) else str(x)))
         bucket = canon.apply(_hit_type_subset_label)
-        tmp = prepost_df.copy()
+        tmp = prepost_df_daily.copy()
         tmp["hit_bucket"] = bucket
 
         for label, out_name in [
-            (HIT_SHAM, "TTE_pre_vs_post_hitBucket_SHAM.png"),
-            (HIT_VISIBLE_SINGLE, "TTE_pre_vs_post_hitBucket_VISIBLE_SINGLE.png"),
-            (COMBINED_LABEL, "TTE_pre_vs_post_hitBucket_COMBINED.png"),
+            (HIT_SHAM, "TTE_pre_vs_post_hitBucket_SHAM_DAILY.png"),
+            (HIT_VISIBLE_SINGLE, "TTE_pre_vs_post_hitBucket_VISIBLE_SINGLE_DAILY.png"),
+            (COMBINED_LABEL, "TTE_pre_vs_post_hitBucket_COMBINED_DAILY.png"),
         ]:
             sub = tmp[tmp["hit_bucket"] == label].copy()
             if sub.empty:
-                bucket_paths[label] = None
-                bucket_ps[label] = None
+                bucket_paths_daily[label] = None
+                bucket_ps_daily[label] = None
                 continue
 
             pth, pv = _plot_prepost_paired_box(
                 sub,
                 fig_dir=fig_dir,
                 out_name=out_name,
-                title=f"Total Transition Entropy — Pre vs Post ({label}; n={len(sub)} birds)",
+                title=f"Total Transition Entropy — Pre vs Post (daily means; {label}; n={len(sub)} birds)",
+                pre_col="pre_mean_TTE",
+                post_col="post_mean_TTE",
+                ylabel="Total Transition Entropy (agg_TTE; mean across days)",
                 show=show,
+                p_text_prefix="Wilcoxon",
             )
-            bucket_paths[label] = (Path(pth) if pth else None)
-            bucket_ps[label] = pv
+            bucket_paths_daily[label] = (Path(pth) if pth else None)
+            bucket_ps_daily[label] = pv
+
+    # -----------------------------------------------------------------
+    # NEW: Pre/Post plots: SONG-balanced
+    # -----------------------------------------------------------------
+    prepost_song_all_path: Optional[Path] = None
+    prepost_song_all_p: Optional[float] = None
+    if not prepost_df_song.empty:
+        used = prepost_df_song["n_songs_used_per_side"].astype(int)
+        used_summary = f"requested {n_songs_balanced}; used median={int(used.median())}, min={int(used.min())}, max={int(used.max())}"
+        prepost_song_all_path, prepost_song_all_p = _plot_prepost_paired_box(
+            prepost_df_song,
+            fig_dir=fig_dir,
+            out_name="TTE_pre_vs_post_ALL_birds_boxplot_SONG_BALANCED.png",
+            title=f"Total Transition Entropy — Pre vs Post (song-balanced; {used_summary}; n={len(prepost_df_song)} birds)",
+            pre_col="pre_mean_song_TTE",
+            post_col="post_mean_song_TTE",
+            ylabel="Per-song Total Transition Entropy (file_TTE; mean of selected songs)",
+            show=show,
+            p_text_prefix="Wilcoxon",
+        )
+
+    bucket_paths_song: Dict[str, Optional[Path]] = {}
+    bucket_ps_song: Dict[str, Optional[float]] = {}
+
+    if not prepost_df_song.empty:
+        canon = prepost_df_song["lesion_hit_type"].apply(lambda x: _canonical_hit_type(None if pd.isna(x) else str(x)))
+        bucket = canon.apply(_hit_type_subset_label)
+        tmp = prepost_df_song.copy()
+        tmp["hit_bucket"] = bucket
+
+        for label, out_name in [
+            (HIT_SHAM, "TTE_pre_vs_post_hitBucket_SHAM_SONG_BALANCED.png"),
+            (HIT_VISIBLE_SINGLE, "TTE_pre_vs_post_hitBucket_VISIBLE_SINGLE_SONG_BALANCED.png"),
+            (COMBINED_LABEL, "TTE_pre_vs_post_hitBucket_COMBINED_SONG_BALANCED.png"),
+        ]:
+            sub = tmp[tmp["hit_bucket"] == label].copy()
+            if sub.empty:
+                bucket_paths_song[label] = None
+                bucket_ps_song[label] = None
+                continue
+
+            used = sub["n_songs_used_per_side"].astype(int)
+            used_summary = f"requested {n_songs_balanced}; used median={int(used.median())}, min={int(used.min())}, max={int(used.max())}"
+            pth, pv = _plot_prepost_paired_box(
+                sub,
+                fig_dir=fig_dir,
+                out_name=out_name,
+                title=f"Total Transition Entropy — Pre vs Post (song-balanced; {used_summary}; {label}; n={len(sub)} birds)",
+                pre_col="pre_mean_song_TTE",
+                post_col="post_mean_song_TTE",
+                ylabel="Per-song Total Transition Entropy (file_TTE; mean of selected songs)",
+                show=show,
+                p_text_prefix="Wilcoxon",
+            )
+            bucket_paths_song[label] = (Path(pth) if pth else None)
+            bucket_ps_song[label] = pv
 
     return TTEWrapperResult(
         per_bird=per_bird_results,
         combined_daily_df=combined_daily,
-        prepost_summary_df=prepost_df,
+        prepost_summary_df=prepost_df_daily,
+        prepost_song_balanced_summary_df=prepost_df_song,
         multi_bird_timecourse_path=(Path(multi_bird_path) if multi_bird_path else None),
         multi_bird_timecourse_by_group_path=(Path(multi_bird_group_path) if multi_bird_group_path else None),
         multi_bird_timecourse_by_hit_type_path=(Path(multi_bird_hit_path) if multi_bird_hit_path else None),
         hit_bucket_mean_sd_timecourse_path=(Path(mean_sd_path) if mean_sd_path else None),
         prepost_boxplot_path_all=prepost_all_path,
-        prepost_boxplot_paths_by_hit_bucket=bucket_paths,
+        prepost_boxplot_paths_by_hit_bucket=bucket_paths_daily,
         prepost_p_value_all=prepost_all_p,
-        prepost_p_values_by_hit_bucket=bucket_ps,
+        prepost_p_values_by_hit_bucket=bucket_ps_daily,
+        prepost_song_balanced_boxplot_path_all=(Path(prepost_song_all_path) if prepost_song_all_path else None),
+        prepost_song_balanced_boxplot_paths_by_hit_bucket=bucket_paths_song,
+        prepost_song_balanced_p_value_all=prepost_song_all_p,
+        prepost_song_balanced_p_values_by_hit_bucket=bucket_ps_song,
     )
 
 
@@ -1139,6 +1359,7 @@ res = tw.tte_wrapper_pre_vs_post(
     metadata_excel=metadata_excel,
     fig_dir=fig_root,
     min_songs_per_day=5,
+    n_songs_balanced=1000,   # NEW: last 100 pre, first 100 post (per bird, if available)
     show=True,
     x_gap_threshold=3,
 )
@@ -1147,6 +1368,14 @@ print("Bird-colored:", res.multi_bird_timecourse_path)
 print("Group-colored:", res.multi_bird_timecourse_by_group_path)
 print("Hit-type-colored:", res.multi_bird_timecourse_by_hit_type_path)
 print("Hit-bucket mean±SD:", res.hit_bucket_mean_sd_timecourse_path)
-print("All birds pre/post:", res.prepost_boxplot_path_all)
-print("Hit-bucket pre/post:", res.prepost_boxplot_paths_by_hit_bucket)
+
+print("DAILY pre/post (all):", res.prepost_boxplot_path_all)
+print("DAILY pre/post (by bucket):", res.prepost_boxplot_paths_by_hit_bucket)
+
+print("SONG-balanced pre/post (all):", res.prepost_song_balanced_boxplot_path_all)
+print("SONG-balanced pre/post (by bucket):", res.prepost_song_balanced_boxplot_paths_by_hit_bucket)
+
+# Inspect summary tables:
+print(res.prepost_summary_df.head())
+print(res.prepost_song_balanced_summary_df.head())
 """

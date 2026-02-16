@@ -652,8 +652,8 @@ import merge_annotations_from_split_songs as mas
 importlib.reload(mas)
 
 # Paths to one bird's JSONs
-detect  = Path("/Volumes/my_own_SSD/updated_AreaX_outputs/R08/R08_song_detection.json")
-decoded = Path("/Volumes/my_own_SSD/updated_AreaX_outputs/R08/R08_decoded_database.json")
+detect  = Path("/Volumes/my_own_SSD/updated_AreaX_outputs/USA5443/USA5443_song_detection.json")
+decoded = Path("/Volumes/my_own_SSD/updated_AreaX_outputs/USA5443/USA5443_decoded_database.json")
 
 # Build merged annotations
 res = mas.build_decoded_with_split_labels(

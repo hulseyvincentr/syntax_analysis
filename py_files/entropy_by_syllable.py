@@ -4,27 +4,25 @@
 entropy_by_syllable.py
 
 Compute transition entropy H_a for a single target syllable a, pre vs post lesion,
-for ONE bird, using your JSON inputs and your merge pipeline:
+for ONE bird.
 
-  merge_annotations_from_split_songs.build_decoded_with_split_labels
+Pipeline:
+  1) merge_annotations_from_split_songs.build_decoded_with_split_labels (JSONs -> merged DF)
+  2) build "organized-from-merged" DF using functions from organize_decoded_with_segments.py
+  3) compute H_a pre vs post using organized_df['syllable_order']
 
-Then, build an "organized" dataframe FROM THE MERGED DATA by calling logic from:
-  organize_decoded_with_segments.py
-(specifically: extract_syllable_order, calculate_syllable_durations_ms, OrganizedDataset)
-
-We compute transitions from the organized dataframe's 'syllable_order' column.
+Treatment date:
+  - Either pass --treatment-date YYYY-MM-DD
+  - OR pass --metadata-xlsx and (optionally) --animal-id
+    * If --animal-id not provided, infer from merged_df.
 
 Example:
   python entropy_by_syllable.py \
     --song-detection /path/to/bird_song_detection.json \
     --decoded /path/to/bird_decoded_database.json \
-    --treatment-date 2024-04-03 \
+    --metadata-xlsx /path/to/Area_X_lesion_metadata_with_hit_types.xlsx \
     --syllable 9 \
-    --max-gap-ms 500 \
-    --segment-index-offset 0 \
-    --merge-repeats --repeat-gap-ms 10 \
-    --out-dir /path/to/out_entropy \
-    --save-merged-csv --save-organized-csv
+    --out-dir /path/to/out_entropy
 """
 
 from __future__ import annotations
@@ -35,6 +33,7 @@ from typing import Dict, List, Optional, Sequence, Tuple, Union
 import argparse
 import ast
 import json
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -47,7 +46,7 @@ from organize_decoded_with_segments import (
     OrganizedDataset,
     extract_syllable_order,
     calculate_syllable_durations_ms,
-    parse_json_safe,  # handy if anything is stringified
+    parse_json_safe,
 )
 
 
@@ -162,6 +161,132 @@ def compute_H_a_from_counts(
 
 
 # -----------------------------
+# Treatment date lookup (NEW)
+# -----------------------------
+def infer_animal_id_from_merged_df(df: pd.DataFrame) -> Optional[str]:
+    """
+    Try to infer Animal ID from merged_df. Prefer 'Animal ID' column; fallback to file_name prefix.
+    """
+    if "Animal ID" in df.columns:
+        vals = df["Animal ID"].dropna().astype(str)
+        if not vals.empty:
+            uniq = vals.unique()
+            if len(uniq) == 1:
+                return uniq[0]
+            # if multiple, pick the most common
+            return vals.mode().iloc[0]
+
+    if "file_name" in df.columns:
+        fn = df["file_name"].dropna().astype(str)
+        if not fn.empty:
+            prefixes = fn.apply(lambda s: s.split("_")[0])
+            uniq = prefixes.unique()
+            if len(uniq) == 1:
+                return uniq[0]
+            return prefixes.mode().iloc[0]
+
+    return None
+
+
+def _find_col_case_insensitive(df: pd.DataFrame, wanted: Sequence[str]) -> Optional[str]:
+    lower_map = {c.lower(): c for c in df.columns}
+    for w in wanted:
+        if w.lower() in lower_map:
+            return lower_map[w.lower()]
+    return None
+
+
+def lookup_treatment_date_from_xlsx(
+    metadata_xlsx: Union[str, Path],
+    animal_id: str,
+    sheet_name: Optional[str] = None,
+) -> pd.Timestamp:
+    """
+    Read an Excel metadata sheet and return the Treatment date for the given animal_id.
+    Uses columns (case-insensitive):
+      - 'Animal ID'
+      - 'Treatment date' (or variants)
+    If multiple treatment dates exist (e.g., repeated rows per injection),
+    returns the earliest date and prints a note.
+    """
+    metadata_xlsx = Path(metadata_xlsx)
+    if not metadata_xlsx.exists():
+        raise FileNotFoundError(metadata_xlsx)
+
+    xls = pd.ExcelFile(metadata_xlsx)
+
+    # Prefer user-specified; else try common sheets first
+    preferred = []
+    if sheet_name:
+        preferred.append(sheet_name)
+    for s in ["metadata_with_hit_type", "metadata", "animal_hit_type_summary"]:
+        if s in xls.sheet_names and s not in preferred:
+            preferred.append(s)
+    # fallback: all sheets
+    for s in xls.sheet_names:
+        if s not in preferred:
+            preferred.append(s)
+
+    for sname in preferred:
+        df = pd.read_excel(metadata_xlsx, sheet_name=sname)
+
+        animal_col = _find_col_case_insensitive(df, ["Animal ID", "animal_id", "AnimalID"])
+        date_col = _find_col_case_insensitive(df, ["Treatment date", "Treatment Date", "treatment_date", "Treatment_date"])
+
+        if not animal_col or not date_col:
+            continue
+
+        sub = df[df[animal_col].astype(str) == str(animal_id)].copy()
+        if sub.empty:
+            continue
+
+        dates = pd.to_datetime(sub[date_col], errors="coerce").dropna().dt.normalize().unique()
+        if len(dates) == 0:
+            continue
+
+        dates_sorted = sorted(pd.to_datetime(dates))
+        if len(dates_sorted) > 1:
+            print(f"[metadata lookup] Multiple treatment dates found for {animal_id} in sheet '{sname}': "
+                  f"{[d.date() for d in dates_sorted]}. Using earliest.")
+        return pd.to_datetime(dates_sorted[0]).normalize()
+
+    raise ValueError(
+        f"Could not find a treatment date for animal_id='{animal_id}' in {metadata_xlsx} "
+        f"(searched sheets: {preferred})."
+    )
+
+
+def resolve_treatment_date(
+    *,
+    treatment_date_arg: Optional[str],
+    metadata_xlsx: Optional[Union[str, Path]],
+    animal_id_arg: Optional[str],
+    merged_df: pd.DataFrame,
+    sheet_name: Optional[str] = None,
+) -> Tuple[pd.Timestamp, str]:
+    """
+    Returns (treatment_date_timestamp, animal_id_used)
+    """
+    if treatment_date_arg:
+        t = pd.to_datetime(treatment_date_arg, errors="raise").normalize()
+        # still try to infer animal_id for printing
+        animal_id_used = animal_id_arg or infer_animal_id_from_merged_df(merged_df) or "UNKNOWN"
+        return t, animal_id_used
+
+    if not metadata_xlsx:
+        raise ValueError("Provide either --treatment-date OR --metadata-xlsx (to look up treatment date).")
+
+    animal_id_used = animal_id_arg or infer_animal_id_from_merged_df(merged_df)
+    if not animal_id_used:
+        raise ValueError(
+            "Could not infer animal_id from merged data. Please pass --animal-id explicitly."
+        )
+
+    t = lookup_treatment_date_from_xlsx(metadata_xlsx, animal_id_used, sheet_name=sheet_name)
+    return t, animal_id_used
+
+
+# -----------------------------
 # Merge + organize (from merged data)
 # -----------------------------
 def build_merged_annotations_df(
@@ -206,28 +331,20 @@ def build_organized_from_merged_df(
     *,
     compute_durations: bool = True,
     add_recording_datetime: bool = True,
-    treatment_date: Optional[str] = None,  # 'YYYY-MM-DD' or None
+    treatment_date: Optional[Union[str, pd.Timestamp]] = None,
 ) -> OrganizedDataset:
     """
-    Build an OrganizedDataset using the *merged* dataframe as input.
-    This uses functions from organize_decoded_with_segments.py to compute:
-      - syllables_present
-      - syllable_order (by onset time)
-      - syllable_<label>_durations columns
-
-    Note: This stays "one row per merged song row" (since merged_df is),
-    but adds the same organization fields you use elsewhere.
+    Build an OrganizedDataset from the *merged* dataframe.
+    Adds: syllables_present, syllable_order, syllable_<label>_durations.
     """
     df = merged_df.copy()
 
-    # Ensure dict column exists (your merger uses syllable_onsets_offsets_ms_dict)
     if "syllable_onsets_offsets_ms_dict" not in df.columns:
         if "syllable_onsets_offsets_ms" in df.columns:
             df["syllable_onsets_offsets_ms_dict"] = df["syllable_onsets_offsets_ms"].apply(parse_json_safe)
         else:
             df["syllable_onsets_offsets_ms_dict"] = [{} for _ in range(len(df))]
 
-    # Ensure Date exists
     if "Date" not in df.columns:
         if "Recording DateTime" in df.columns:
             df["Date"] = pd.to_datetime(df["Recording DateTime"], errors="coerce").dt.normalize()
@@ -236,37 +353,29 @@ def build_organized_from_merged_df(
     else:
         df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.normalize()
 
-    # Optional: Recording DateTime
     if add_recording_datetime and "Recording DateTime" in df.columns:
         df["Recording DateTime"] = pd.to_datetime(df["Recording DateTime"], errors="coerce")
 
-    # Compute unique labels across merged data
+    # unique labels across merged data
     label_set: set[str] = set()
     for d in df["syllable_onsets_offsets_ms_dict"]:
         if isinstance(d, dict) and d:
             label_set.update([str(k) for k in d.keys()])
     unique_labels = sorted(label_set)
 
-    # syllables_present
-    def _sylls_present(d: dict) -> List[str]:
-        return sorted([str(k) for k in d.keys()]) if isinstance(d, dict) else []
-
-    df["syllables_present"] = df["syllable_onsets_offsets_ms_dict"].apply(_sylls_present)
-
-    # syllable_order (sorted by onset)
+    df["syllables_present"] = df["syllable_onsets_offsets_ms_dict"].apply(
+        lambda d: sorted([str(k) for k in d.keys()]) if isinstance(d, dict) else []
+    )
     df["syllable_order"] = df["syllable_onsets_offsets_ms_dict"].apply(
         lambda d: extract_syllable_order(d, onset_index=0)
     )
 
-    # Optional: per-label duration columns (ms)
     if compute_durations and unique_labels:
         for lab in unique_labels:
-            col = f"syllable_{lab}_durations"
-            df[col] = df["syllable_onsets_offsets_ms_dict"].apply(
+            df[f"syllable_{lab}_durations"] = df["syllable_onsets_offsets_ms_dict"].apply(
                 lambda d, L=lab: calculate_syllable_durations_ms(d, L)
             )
 
-    # Unique dates as strings 'YYYY.MM.DD'
     unique_dates = (
         pd.to_datetime(df["Date"], errors="coerce")
         .dt.strftime("%Y.%m.%d")
@@ -276,9 +385,8 @@ def build_organized_from_merged_df(
     )
     unique_dates.sort()
 
-    # Format treatment_date as 'YYYY.MM.DD' if provided
     treatment_fmt = None
-    if treatment_date:
+    if treatment_date is not None:
         try:
             treatment_fmt = pd.to_datetime(treatment_date).strftime("%Y.%m.%d")
         except Exception:
@@ -421,10 +529,16 @@ def plot_followers_pre_post(
 # CLI
 # -----------------------------
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Compute H_a for one syllable pre vs post using merged JSON pipeline + organized-from-merged DF.")
+    p = argparse.ArgumentParser(description="Compute H_a for one syllable pre vs post (treatment date via arg OR metadata Excel).")
     p.add_argument("--song-detection", "-d", type=str, required=True, help="Path to song_detection JSON")
     p.add_argument("--decoded", "-a", type=str, required=True, help="Path to decoded_database JSON")
-    p.add_argument("--treatment-date", type=str, required=True, help="Treatment date, e.g. 2024-04-03")
+
+    # Treatment date options (NEW)
+    p.add_argument("--treatment-date", type=str, default=None, help="Treatment date, e.g. 2024-04-03 (optional if using metadata-xlsx)")
+    p.add_argument("--metadata-xlsx", type=str, default=None, help="Path to metadata Excel to look up treatment date (optional if passing treatment-date)")
+    p.add_argument("--metadata-sheet", type=str, default=None, help="Optional sheet name (default tries metadata_with_hit_type then metadata)")
+    p.add_argument("--animal-id", type=str, default=None, help="Animal ID to use for metadata lookup (optional; otherwise inferred)")
+
     p.add_argument("--syllable", type=str, required=True, help="Target syllable label a (string)")
 
     # merge params
@@ -470,19 +584,27 @@ def main() -> None:
         repeat_gap_inclusive=args.repeat_gap_inclusive,
     )
 
-    # ✅ NEW: build organized dataset from the merged dataframe using your organizer module
+    # ✅ Resolve treatment date from arg OR metadata Excel
+    treatment_dt, animal_id_used = resolve_treatment_date(
+        treatment_date_arg=args.treatment_date,
+        metadata_xlsx=args.metadata_xlsx,
+        animal_id_arg=args.animal_id,
+        merged_df=merged_df,
+        sheet_name=args.metadata_sheet,
+    )
+
     organized_ds = build_organized_from_merged_df(
         merged_df,
         compute_durations=True,
         add_recording_datetime=True,
-        treatment_date=args.treatment_date,
+        treatment_date=treatment_dt,
     )
     organized_df = organized_ds.organized_df
 
     pre, post = compute_pre_post_Ha(
         organized_df,
         target=str(args.syllable),
-        treatment_date=args.treatment_date,
+        treatment_date=treatment_dt,
         include_treatment_day=args.include_treatment_day,
         collapse_repeats=collapse,
         ignore_labels=ignore,
@@ -491,9 +613,10 @@ def main() -> None:
     )
 
     print("\n--- Entropy by syllable (H_a) ---")
+    print(f"Animal ID = {animal_id_used}")
     print(f"Target a = {pre.target}")
     print(f"Entropy base = {base_name}")
-    print(f"Treatment date = {pd.to_datetime(args.treatment_date).date()} (include_treatment_day={bool(args.include_treatment_day)})")
+    print(f"Treatment date = {treatment_dt.date()} (include_treatment_day={bool(args.include_treatment_day)})")
 
     def _print_res(r: EntropyResult) -> None:
         print(f"\n{r.group.upper()}:")
@@ -531,8 +654,12 @@ def main() -> None:
         print(f"Saved follower plot: {plot_path}")
 
         results = {
+            "animal_id": animal_id_used,
             "target": pre.target,
-            "treatment_date": str(pd.to_datetime(args.treatment_date).date()),
+            "treatment_date": str(treatment_dt.date()),
+            "treatment_date_source": ("arg" if args.treatment_date else "metadata_xlsx"),
+            "metadata_xlsx": args.metadata_xlsx,
+            "metadata_sheet": args.metadata_sheet,
             "log_base": ("e" if log_base == np.e else log_base),
             "include_treatment_day": bool(args.include_treatment_day),
             "collapse_consecutive_repeats": bool(collapse),
@@ -559,3 +686,40 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+"""
+from pathlib import Path
+import importlib
+import entropy_by_syllable as ebs
+importlib.reload(ebs)
+
+song_detection = Path("/path/to/song_detection.json")
+decoded = Path("/path/to/decoded_database.json")
+
+merged_df = ebs.build_merged_annotations_df(
+    decoded_database_json=decoded,
+    song_detection_json=song_detection,
+    merge_repeated_syllables=True,
+    repeat_gap_ms=10,
+)
+
+treatment_dt, animal_id_used = ebs.resolve_treatment_date(
+    treatment_date_arg="2024-04-03",
+    metadata_xlsx=None,
+    animal_id_arg=None,
+    merged_df=merged_df,
+)
+
+organized_df = ebs.build_organized_from_merged_df(merged_df, treatment_date=treatment_dt).organized_df
+
+pre, post = ebs.compute_pre_post_Ha(
+    organized_df,
+    target="9",
+    treatment_date=treatment_dt,
+)
+
+print(animal_id_used, pre.entropy, post.entropy)
+
+
+"""
