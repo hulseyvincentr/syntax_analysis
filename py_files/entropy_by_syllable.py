@@ -3,29 +3,27 @@
 """
 entropy_by_syllable.py
 
-Compute transition entropy H_a for one bird, using merged annotations (split-song aware),
-and compare PRE vs POST lesion.
+Compute:
+  • Per-syllable transition entropy H_a (conditioned on preceding syllable a)
+  • Total transition entropy TE (weighted average of H_a by syllable frequency P(a))
 
-Includes:
-  • build_merged_annotations_df(...)              # merges split songs + appends annotations
-  • resolve_treatment_date(...)                  # pass treatment date OR look it up in metadata Excel
-  • build_organized_from_merged_df(...)          # builds organizer-style DF from merged output
-  • compute_pre_post_Ha(...)                     # H_a for one target syllable
-  • compute_pre_post_Ha_all_syllables(...)       # H_a for every syllable (as the preceding syllable)
-  • plot_Ha_all_syllables_pre_post(...)          # paired plot or scatter (H_pre vs H_post)
-  • plot_Ha_boxplot_pre_post_connected(...)      # boxplot w/ BLUE(pre) + ORANGE(post) points + connecting lines
-  • plot_Ha_boxplot_pre_post_by_label(...)       # second boxplot: each syllable label gets its own color (+ lines)
-  • plot_followers_pre_post(...)                 # follower distribution for ONE target syllable
+Definition (matching your screenshot):
+  H_a = - Σ_i P(i|a) log P(i|a)
+  TE  = Σ_a P(a) * H_a
+(where P(a) is the frequency of syllable a as the *preceding* syllable in transitions)
 
-Stats:
-  • paired_entropy_tests(...) does paired tests across syllables (finite pre+post):
-      - Wilcoxon signed-rank + paired t-test if SciPy is available
-      - otherwise a sign-flip permutation test on mean difference
+This file is split-song aware:
+  - merges split songs / appends annotations using detection timing
+  - builds an organized dataframe from the merged table
+  - computes pre vs post H_a and TE relative to treatment_date
 
-Important:
+Also includes plotting utilities:
+  • plot_Ha_boxplot_pre_post_connected(...)     # BLUE/ORANGE points + connecting lines + stats
+  • plot_Ha_boxplot_pre_post_by_label(...)      # TWO-PANEL: entropy + usage, colored by syllable, readable legend
+
+NOTE:
   - This module intentionally does NOT import organize_decoded_with_segments.py
-    to avoid circular-import issues. It contains local copies of the small helper
-    functions it needs.
+    to avoid circular-import issues. It includes local versions of helper funcs.
 """
 
 from __future__ import annotations
@@ -188,15 +186,41 @@ def _try_int(s: str) -> Optional[int]:
 
 
 def _sorted_labels_natural(labels: Sequence[str]) -> List[str]:
-    """
-    Sort labels like ['0','1','10','2'] into numeric order when possible,
-    otherwise fall back to lexicographic.
-    """
     labs = list({str(x) for x in labels})
     numeric = [(lab, _try_int(lab)) for lab in labs]
     if numeric and all(v is not None for _, v in numeric):
         return [lab for lab, _ in sorted(numeric, key=lambda t: int(t[1]))]
     return sorted(labs)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Distinct categorical colors (30+ unique)
+# ──────────────────────────────────────────────────────────────────────────────
+def _get_distinct_qual_colors(n: int) -> List[tuple]:
+    pools: List[tuple] = []
+    for cmap_name in ["tab20", "tab20b", "tab20c", "Set3", "Paired", "Accent"]:
+        try:
+            cmap = plt.get_cmap(cmap_name)
+            if hasattr(cmap, "colors"):
+                pools.extend(list(cmap.colors))  # type: ignore[attr-defined]
+            else:
+                pools.extend([cmap(i) for i in np.linspace(0, 1, 12)])
+        except Exception:
+            continue
+
+    uniq: List[tuple] = []
+    seen = set()
+    for c in pools:
+        key = tuple(np.round(np.array(c), 6))
+        if key not in seen:
+            seen.add(key)
+            uniq.append(tuple(c))
+
+    if len(uniq) >= n:
+        return uniq[:n]
+
+    cmap = plt.get_cmap("turbo")
+    return [cmap(i) for i in np.linspace(0, 1, n)]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -252,10 +276,121 @@ def compute_H_a_from_counts(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Total transition entropy TE (weighted average of H_a)
+# ──────────────────────────────────────────────────────────────────────────────
+@dataclass
+class TotalEntropyResult:
+    group: str
+    total_entropy: float
+    log_base: float
+    n_total_transitions: int
+    n_unique_preceding_syllables: int
+    P_of_a: Dict[str, float]              # P(a) over preceding syllables
+    H_of_a: Dict[str, float]              # H_a for each a (nan if none)
+    TE_terms: Dict[str, float]            # P(a) * H_a (nan skipped)
+    notes: Optional[str] = None
+
+
+def compute_total_transition_entropy_from_prev_counts(
+    prev_to_next_counts: Dict[str, Dict[str, int]],
+    *,
+    log_base: float = 2.0,
+) -> TotalEntropyResult:
+    """
+    Given nested counts counts[a][b] = number of transitions a->b,
+    compute:
+      P(a) = sum_b counts[a][b] / sum_all transitions
+      H_a  = entropy of P(b|a)
+      TE   = sum_a P(a) * H_a
+
+    Returns a TotalEntropyResult with details.
+    """
+    # total transitions
+    totals_by_a: Dict[str, int] = {a: int(sum(d.values())) for a, d in prev_to_next_counts.items()}
+    n_total = int(sum(totals_by_a.values()))
+
+    if n_total == 0:
+        return TotalEntropyResult(
+            group="unknown",
+            total_entropy=float("nan"),
+            log_base=log_base,
+            n_total_transitions=0,
+            n_unique_preceding_syllables=len(prev_to_next_counts),
+            P_of_a={},
+            H_of_a={},
+            TE_terms={},
+            notes="No transitions available (n_total_transitions=0).",
+        )
+
+    P_of_a: Dict[str, float] = {a: totals_by_a[a] / n_total for a in totals_by_a}
+    H_of_a: Dict[str, float] = {}
+    TE_terms: Dict[str, float] = {}
+
+    TE = 0.0
+    for a, next_counts in prev_to_next_counts.items():
+        Ha, _probs, _maxH, n_a = compute_H_a_from_counts(next_counts, log_base=log_base)
+        H_of_a[a] = float(Ha)
+        if np.isfinite(Ha) and a in P_of_a:
+            term = float(P_of_a[a] * Ha)
+            TE_terms[a] = term
+            TE += term
+        else:
+            TE_terms[a] = float("nan")
+
+    return TotalEntropyResult(
+        group="unknown",
+        total_entropy=float(TE),
+        log_base=log_base,
+        n_total_transitions=n_total,
+        n_unique_preceding_syllables=len(prev_to_next_counts),
+        P_of_a=P_of_a,
+        H_of_a=H_of_a,
+        TE_terms=TE_terms,
+        notes=None,
+    )
+
+
+def compute_pre_post_total_transition_entropy(
+    organized_df: pd.DataFrame,
+    *,
+    treatment_date: Union[str, pd.Timestamp],
+    include_treatment_day: bool = False,
+    collapse_repeats: bool = True,
+    ignore_labels: Optional[Sequence[str]] = None,
+    log_base: float = 2.0,
+    order_col: str = "syllable_order",
+) -> Tuple[TotalEntropyResult, TotalEntropyResult]:
+    """
+    Compute TE_pre and TE_post using the same definitions as the paper screenshot.
+
+    TE is computed over *preceding syllables* a:
+      TE = Σ_a P(a) * H_a
+    where P(a) is the frequency of syllable a as the preceding syllable in transitions.
+
+    Returns (pre_result, post_result).
+    """
+    pre_df, post_df = split_pre_post(
+        organized_df, treatment_date=treatment_date, include_treatment_day=include_treatment_day
+    )
+
+    pre_seqs = get_syllable_order_sequences(pre_df, col=order_col) if not pre_df.empty else []
+    post_seqs = get_syllable_order_sequences(post_df, col=order_col) if not post_df.empty else []
+
+    pre_counts_all = _bigram_counts_by_prev(pre_seqs, collapse_repeats=collapse_repeats, ignore_labels=ignore_labels)
+    post_counts_all = _bigram_counts_by_prev(post_seqs, collapse_repeats=collapse_repeats, ignore_labels=ignore_labels)
+
+    pre_TE = compute_total_transition_entropy_from_prev_counts(pre_counts_all, log_base=log_base)
+    post_TE = compute_total_transition_entropy_from_prev_counts(post_counts_all, log_base=log_base)
+
+    pre_TE.group = "pre"
+    post_TE.group = "post"
+    return pre_TE, post_TE
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Treatment date: arg OR Excel lookup
 # ──────────────────────────────────────────────────────────────────────────────
 def infer_animal_id_from_merged_df(df: pd.DataFrame) -> Optional[str]:
-    """Infer Animal ID from merged DF using 'Animal ID' column or file_name prefix."""
     if "Animal ID" in df.columns:
         vals = df["Animal ID"].dropna().astype(str)
         if not vals.empty:
@@ -289,14 +424,6 @@ def lookup_treatment_date_from_xlsx(
     animal_id: str,
     sheet_name: Optional[str] = None,
 ) -> pd.Timestamp:
-    """
-    Find treatment date for animal_id in an Excel file.
-    Looks for columns (case-insensitive):
-      - Animal ID
-      - Treatment date (variants)
-
-    If multiple dates exist, returns earliest.
-    """
     metadata_xlsx = Path(metadata_xlsx)
     if not metadata_xlsx.exists():
         raise FileNotFoundError(metadata_xlsx)
@@ -361,7 +488,6 @@ def resolve_treatment_date(
     merged_df: pd.DataFrame,
     sheet_name: Optional[str] = None,
 ) -> Tuple[pd.Timestamp, str, str]:
-    """Returns (treatment_date_timestamp, animal_id_used, source='arg'|'metadata_xlsx')."""
     if treatment_date_arg:
         t = pd.to_datetime(treatment_date_arg, errors="raise").normalize()
         animal_id_used = animal_id_arg or infer_animal_id_from_merged_df(merged_df) or "UNKNOWN"
@@ -391,10 +517,6 @@ def build_merged_annotations_df(
     repeat_gap_ms: float = 10.0,
     repeat_gap_inclusive: bool = False,
 ) -> pd.DataFrame:
-    """
-    Merge split songs + append annotations using detection timing.
-    Returns the merged annotations dataframe (singles + merged).
-    """
     res = build_decoded_with_split_labels(
         decoded_database_json=decoded_database_json,
         song_detection_json=song_detection_json,
@@ -429,14 +551,6 @@ def build_organized_from_merged_df(
     add_recording_datetime: bool = True,
     treatment_date: Optional[Union[str, pd.Timestamp]] = None,
 ) -> OrganizedDataset:
-    """
-    Build an OrganizedDataset from the merged dataframe.
-    Adds:
-      - syllable_onsets_offsets_ms_dict
-      - syllables_present
-      - syllable_order
-      - syllable_<label>_durations (optional)
-    """
     df = merged_df.copy()
 
     if "syllable_onsets_offsets_ms_dict" not in df.columns:
@@ -445,7 +559,6 @@ def build_organized_from_merged_df(
         else:
             df["syllable_onsets_offsets_ms_dict"] = [{} for _ in range(len(df))]
 
-    # Normalize Date
     if "Date" in df.columns:
         df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.normalize()
     elif "Recording DateTime" in df.columns:
@@ -456,7 +569,6 @@ def build_organized_from_merged_df(
     if add_recording_datetime and "Recording DateTime" in df.columns:
         df["Recording DateTime"] = pd.to_datetime(df["Recording DateTime"], errors="coerce")
 
-    # Unique labels across merged data
     label_set: set[str] = set()
     for d in df["syllable_onsets_offsets_ms_dict"]:
         if isinstance(d, dict) and d:
@@ -501,7 +613,7 @@ def build_organized_from_merged_df(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Pre/Post split + compute H_a (single syllable)
+# Pre/Post split + sequences
 # ──────────────────────────────────────────────────────────────────────────────
 def split_pre_post(
     df: pd.DataFrame,
@@ -529,6 +641,9 @@ def get_syllable_order_sequences(df: pd.DataFrame, col: str = "syllable_order") 
     return seqs
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# H_a for ONE syllable (already used in your workflow)
+# ──────────────────────────────────────────────────────────────────────────────
 @dataclass
 class EntropyResult:
     group: str
@@ -612,7 +727,7 @@ def compute_pre_post_Ha(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ALL syllables: compute H_a pre vs post
+# ALL syllables bigram counts (needed for Ha_all and TE)
 # ──────────────────────────────────────────────────────────────────────────────
 def _bigram_counts_by_prev(
     sequences: Sequence[Sequence[str]],
@@ -620,10 +735,6 @@ def _bigram_counts_by_prev(
     collapse_repeats: bool = True,
     ignore_labels: Optional[Sequence[str]] = None,
 ) -> Dict[str, Dict[str, int]]:
-    """
-    Returns nested dict:
-      counts[prev][next] = number of transitions prev -> next
-    """
     ignore = set(ignore_labels or [])
     out: Dict[str, Dict[str, int]] = {}
 
@@ -654,16 +765,6 @@ def compute_pre_post_Ha_all_syllables(
     order_col: str = "syllable_order",
     min_transitions: int = 1,
 ) -> pd.DataFrame:
-    """
-    Returns a DataFrame with one row per syllable 'a', including:
-      - H_pre, H_post
-      - n_pre, n_post
-      - followers_pre, followers_post
-      - delta (post - pre)
-
-    min_transitions filters syllables that have <min_transitions transitions in BOTH
-    pre and post (keeps syllables that meet threshold in at least one side).
-    """
     pre_df, post_df = split_pre_post(
         organized_df, treatment_date=treatment_date, include_treatment_day=include_treatment_day
     )
@@ -676,7 +777,6 @@ def compute_pre_post_Ha_all_syllables(
 
     targets = set(pre_counts_all.keys()) | set(post_counts_all.keys())
 
-    # also include labels that appear in the dataset even if they have no outgoing transitions
     if "syllables_present" in organized_df.columns:
         for v in organized_df["syllables_present"].tolist():
             for lab in _coerce_listlike(v):
@@ -720,12 +820,9 @@ def compute_pre_post_Ha_all_syllables(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Paired statistical tests across syllables (finite pre+post)
+# Paired tests across syllables
 # ──────────────────────────────────────────────────────────────────────────────
 def _paired_diffs_from_ha_df(ha_df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Returns (pre, post, diffs=post-pre) restricted to syllables with finite pre and post.
-    """
     pre = pd.to_numeric(ha_df["H_pre"], errors="coerce").to_numpy(dtype=float)
     post = pd.to_numeric(ha_df["H_post"], errors="coerce").to_numpy(dtype=float)
     ok = np.isfinite(pre) & np.isfinite(post)
@@ -742,10 +839,6 @@ def _signflip_permutation_pvalue(
     seed: int = 0,
     two_sided: bool = True,
 ) -> float:
-    """
-    Paired sign-flip permutation test on mean(diffs).
-    H0: diffs are symmetric about 0.
-    """
     diffs = np.asarray(diffs, dtype=float)
     diffs = diffs[np.isfinite(diffs)]
     if diffs.size == 0:
@@ -754,14 +847,12 @@ def _signflip_permutation_pvalue(
     rng = np.random.default_rng(seed)
     obs = float(np.mean(diffs))
 
-    # Fast: random sign matrix
     signs = rng.choice([-1.0, 1.0], size=(n_perm, diffs.size), replace=True)
     perm_means = (signs * diffs[None, :]).mean(axis=1)
 
     if two_sided:
         p = float((np.sum(np.abs(perm_means) >= abs(obs)) + 1) / (n_perm + 1))
     else:
-        # one-sided: post > pre (mean diff > 0)
         p = float((np.sum(perm_means >= obs) + 1) / (n_perm + 1))
     return p
 
@@ -772,14 +863,6 @@ def paired_entropy_tests(
     n_perm: int = 20000,
     seed: int = 0,
 ) -> Dict[str, object]:
-    """
-    Run paired tests across syllables (requires finite pre+post per syllable).
-    Returns a dict with summary stats + available tests.
-
-    Tests included:
-      - SciPy: paired t-test + Wilcoxon signed-rank (if SciPy available)
-      - Fallback: sign-flip permutation test on mean difference
-    """
     pre, post, diffs = _paired_diffs_from_ha_df(ha_df)
 
     out: Dict[str, object] = {
@@ -796,14 +879,13 @@ def paired_entropy_tests(
 
     if _HAVE_SCIPY:
         try:
-            tt = _scipy_stats.ttest_rel(post, pre, nan_policy="omit")  # post vs pre
+            tt = _scipy_stats.ttest_rel(post, pre, nan_policy="omit")
             out["ttest_rel_p_two_sided"] = float(tt.pvalue)
             out["ttest_rel_t"] = float(tt.statistic)
         except Exception as e:
             out["ttest_rel_error"] = str(e)
 
         try:
-            # Wilcoxon fails if all diffs are 0; handle gently
             if np.allclose(diffs, 0):
                 out["wilcoxon_p_two_sided"] = 1.0
                 out["wilcoxon_stat"] = 0.0
@@ -815,7 +897,6 @@ def paired_entropy_tests(
         except Exception as e:
             out["wilcoxon_error"] = str(e)
 
-    # Always include a permutation-based p-value (robust, minimal assumptions)
     out["signflip_perm_p_two_sided"] = float(
         _signflip_permutation_pvalue(diffs, n_perm=n_perm, seed=seed, two_sided=True)
     )
@@ -836,9 +917,6 @@ def _format_p(p: object) -> str:
 
 
 def format_test_summary(stats: Dict[str, object]) -> str:
-    """
-    Compact string for putting on plots.
-    """
     n = stats.get("n_paired_syllables", "NA")
     p_perm = _format_p(stats.get("signflip_perm_p_two_sided", np.nan))
     parts = [f"n={n}", f"perm p={p_perm}"]
@@ -850,92 +928,7 @@ def format_test_summary(stats: Dict[str, object]) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Plotting: ALL syllables (paired plot or scatter)
-# ──────────────────────────────────────────────────────────────────────────────
-def plot_Ha_all_syllables_pre_post(
-    ha_df: pd.DataFrame,
-    *,
-    out_path: Union[str, Path],
-    style: str = "paired",  # "paired" or "scatter"
-    title: Optional[str] = None,
-    show: bool = False,
-) -> None:
-    """
-    style="paired": x is syllable (categorical), y is H; show pre+post points per syllable
-    style="scatter": x=H_pre, y=H_post with y=x reference line
-    """
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if ha_df is None or ha_df.empty:
-        raise ValueError("ha_df is empty; nothing to plot.")
-
-    df = ha_df.copy()
-
-    if style.lower() == "scatter":
-        fig, ax = plt.subplots(figsize=(5.6, 5.2))
-        x = df["H_pre"].to_numpy(dtype=float)
-        y = df["H_post"].to_numpy(dtype=float)
-
-        ax.scatter(x, y)
-
-        finite = np.isfinite(x) & np.isfinite(y)
-        if finite.any():
-            lo = float(min(x[finite].min(), y[finite].min()))
-            hi = float(max(x[finite].max(), y[finite].max()))
-            ax.plot([lo, hi], [lo, hi], linestyle="--")
-
-        ax.set_xlabel("H_pre (bits)")
-        ax.set_ylabel("H_post (bits)")
-        if title:
-            ax.set_title(title)
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-        fig.tight_layout()
-        fig.savefig(out_path, dpi=200)
-        if show:
-            plt.show()
-        else:
-            plt.close(fig)
-        return
-
-    # paired plot
-    fig, ax = plt.subplots(figsize=(max(8.5, 0.35 * len(df)), 4.8))
-
-    labels = df["syllable"].astype(str).tolist()
-    x = np.arange(len(labels))
-
-    pre = df["H_pre"].to_numpy(dtype=float)
-    post = df["H_post"].to_numpy(dtype=float)
-
-    for i in range(len(labels)):
-        if np.isfinite(pre[i]) and np.isfinite(post[i]):
-            ax.plot([x[i], x[i]], [pre[i], post[i]], linewidth=1)
-
-    ax.scatter(x, pre, label="Pre")
-    ax.scatter(x, post, label="Post")
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels, rotation=45, ha="right")
-    ax.set_ylabel("Transition entropy Hₐ (bits)")
-    ax.set_xlabel("Syllable a (preceding syllable)")
-    ax.legend(frameon=False, loc="best")
-
-    if title:
-        ax.set_title(title)
-
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=200)
-    if show:
-        plt.show()
-    else:
-        plt.close(fig)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Box plots with connecting lines + stats
+# Plots
 # ──────────────────────────────────────────────────────────────────────────────
 def plot_Ha_boxplot_pre_post_connected(
     ha_df: pd.DataFrame,
@@ -949,20 +942,12 @@ def plot_Ha_boxplot_pre_post_connected(
     stats_n_perm: int = 20000,
     stats_seed: int = 0,
 ) -> Dict[str, object]:
-    """
-    Box plot comparing the distribution of per-syllable H_a values (pre vs post),
-    with BLUE(pre) and ORANGE(post) points and (optionally) connecting lines
-    for each syllable.
-
-    Returns a stats dict from paired_entropy_tests(ha_df).
-    """
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     if ha_df is None or ha_df.empty:
         raise ValueError("ha_df is empty; nothing to plot.")
 
-    # full distributions (may include syllables with finite on only one side)
     pre_all = pd.to_numeric(ha_df["H_pre"], errors="coerce").to_numpy(dtype=float)
     post_all = pd.to_numeric(ha_df["H_post"], errors="coerce").to_numpy(dtype=float)
     pre_all = pre_all[np.isfinite(pre_all)]
@@ -971,26 +956,16 @@ def plot_Ha_boxplot_pre_post_connected(
     if pre_all.size == 0 and post_all.size == 0:
         raise ValueError("No finite H_pre or H_post values to plot.")
 
-    # paired subset for connecting lines + stats
-    pre_p, post_p, diffs = _paired_diffs_from_ha_df(ha_df)
-
+    pre_p, post_p, _diffs = _paired_diffs_from_ha_df(ha_df)
     stats = paired_entropy_tests(ha_df, n_perm=stats_n_perm, seed=stats_seed)
 
     fig, ax = plt.subplots(figsize=(5.6, 4.9))
 
-    # Boxplots
-    ax.boxplot(
-        [pre_all, post_all],
-        labels=["Pre", "Post"],
-        showfliers=True,
-        whis=1.5,
-    )
+    ax.boxplot([pre_all, post_all], labels=["Pre", "Post"], showfliers=True, whis=1.5)
 
-    # Overlay points and connecting lines for paired syllables
     if overlay_points:
         rng = np.random.default_rng(stats_seed)
         jitter = rng.normal(loc=0.0, scale=0.05, size=pre_p.size) if pre_p.size else np.array([])
-
         x1 = 1.0 + jitter
         x2 = 2.0 + jitter
 
@@ -999,7 +974,6 @@ def plot_Ha_boxplot_pre_post_connected(
                 if np.isfinite(pre_p[i]) and np.isfinite(post_p[i]):
                     ax.plot([x1[i], x2[i]], [pre_p[i], post_p[i]], linewidth=1, alpha=0.5)
 
-        # Keep BLUE / ORANGE points (Matplotlib default cycle C0/C1)
         if pre_p.size:
             ax.scatter(x1, pre_p, s=20, alpha=0.85, color="C0", label="Pre")
         if post_p.size:
@@ -1010,20 +984,11 @@ def plot_Ha_boxplot_pre_post_connected(
     ax.set_ylabel("Transition entropy Hₐ (bits)")
     if title:
         ax.set_title(title)
-
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
 
     if annotate_stats:
-        msg = format_test_summary(stats)
-        ax.text(
-            0.02, 0.98,
-            msg,
-            transform=ax.transAxes,
-            va="top",
-            ha="left",
-            fontsize=9,
-        )
+        ax.text(0.02, 0.98, format_test_summary(stats), transform=ax.transAxes, va="top", ha="left", fontsize=9)
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=200)
@@ -1042,104 +1007,177 @@ def plot_Ha_boxplot_pre_post_by_label(
     title: Optional[str] = None,
     show: bool = False,
     connect_pairs: bool = True,
+
     annotate_stats: bool = True,
     stats_n_perm: int = 20000,
     stats_seed: int = 0,
-    legend_max_labels: int = 20,
-) -> Dict[str, object]:
-    """
-    Second box plot: same Pre/Post boxes, but each syllable's paired points
-    are color-coded by syllable label (same color for pre and post), with
-    connecting lines (optionally).
 
-    Returns a stats dict from paired_entropy_tests(ha_df).
-    """
+    legend_max_labels: int = 60,
+    legend_fontsize: float = 7.0,
+    legend_title_fontsize: float = 9.0,
+    legend_ncol: int = 2,
+    legend_loc: str = "center left",
+    legend_bbox_to_anchor: Tuple[float, float] = (1.02, 0.5),
+
+    show_usage_panel: bool = True,
+    connect_usage_pairs: bool = True,
+    usage_log_scale: bool = True,
+) -> Dict[str, object]:
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     if ha_df is None or ha_df.empty:
         raise ValueError("ha_df is empty; nothing to plot.")
 
-    pre_all = pd.to_numeric(ha_df["H_pre"], errors="coerce").to_numpy(dtype=float)
-    post_all = pd.to_numeric(ha_df["H_post"], errors="coerce").to_numpy(dtype=float)
+    df = ha_df.copy()
+    df["syllable"] = df["syllable"].astype(str)
+    df["H_pre"] = pd.to_numeric(df["H_pre"], errors="coerce")
+    df["H_post"] = pd.to_numeric(df["H_post"], errors="coerce")
+    df["n_pre"] = pd.to_numeric(df.get("n_pre", np.nan), errors="coerce")
+    df["n_post"] = pd.to_numeric(df.get("n_post", np.nan), errors="coerce")
+
+    pre_all = df["H_pre"].to_numpy(dtype=float)
+    post_all = df["H_post"].to_numpy(dtype=float)
     pre_all = pre_all[np.isfinite(pre_all)]
     post_all = post_all[np.isfinite(post_all)]
-
     if pre_all.size == 0 and post_all.size == 0:
         raise ValueError("No finite H_pre or H_post values to plot.")
 
-    # paired subset for points/lines (finite pre & post)
-    df = ha_df.copy()
-    df["H_pre"] = pd.to_numeric(df["H_pre"], errors="coerce")
-    df["H_post"] = pd.to_numeric(df["H_post"], errors="coerce")
-    df = df[np.isfinite(df["H_pre"]) & np.isfinite(df["H_post"])].copy()
-    df["syllable"] = df["syllable"].astype(str)
+    df_paired_H = df[np.isfinite(df["H_pre"]) & np.isfinite(df["H_post"])].copy()
+    uniq = _sorted_labels_natural(df_paired_H["syllable"].tolist())
+    if len(uniq) == 0:
+        raise ValueError("No paired syllables with finite H_pre and H_post to plot.")
 
-    stats = paired_entropy_tests(ha_df, n_perm=stats_n_perm, seed=stats_seed)
+    colors = _get_distinct_qual_colors(max(len(uniq), 30))
+    color_map: Dict[str, tuple] = {lab: colors[i] for i, lab in enumerate(uniq)}
 
-    fig, ax = plt.subplots(figsize=(5.9, 5.0))
-    ax.boxplot(
-        [pre_all, post_all],
-        labels=["Pre", "Post"],
-        showfliers=True,
-        whis=1.5,
-    )
+    stats = paired_entropy_tests(df, n_perm=stats_n_perm, seed=stats_seed)
 
-    # Map syllables to colors using a matplotlib colormap
-    syllables = df["syllable"].tolist()
-    uniq = _sorted_labels_natural(syllables)
-    cmap = plt.get_cmap("tab20")  # good categorical default
-    color_map: Dict[str, tuple] = {}
-    for i, lab in enumerate(uniq):
-        color_map[lab] = cmap(i % cmap.N)
+    if show_usage_panel:
+        fig, (axH, axN) = plt.subplots(1, 2, figsize=(9.8, 5.2), gridspec_kw={"width_ratios": [1.0, 1.0]})
+    else:
+        fig, axH = plt.subplots(1, 1, figsize=(6.8, 5.2))
+        axN = None
 
     rng = np.random.default_rng(stats_seed)
-    jitter = rng.normal(loc=0.0, scale=0.05, size=len(df)) if len(df) else np.array([])
+
+    # Entropy panel
+    axH.boxplot([pre_all, post_all], labels=["Pre", "Post"], showfliers=True, whis=1.5)
+
+    jitter = rng.normal(loc=0.0, scale=0.05, size=len(df_paired_H)) if len(df_paired_H) else np.array([])
     x1 = 1.0 + jitter
     x2 = 2.0 + jitter
 
-    # Draw pairs
-    for i, (_, row) in enumerate(df.iterrows()):
+    for i, (_, row) in enumerate(df_paired_H.iterrows()):
         lab = row["syllable"]
         c = color_map.get(lab, (0, 0, 0, 1))
         y1 = float(row["H_pre"])
         y2 = float(row["H_post"])
 
         if connect_pairs:
-            ax.plot([x1[i], x2[i]], [y1, y2], linewidth=1, alpha=0.6, color=c)
+            axH.plot([x1[i], x2[i]], [y1, y2], linewidth=1, alpha=0.65, color=c)
 
-        ax.scatter([x1[i]], [y1], s=22, alpha=0.9, color=c)
-        ax.scatter([x2[i]], [y2], s=22, alpha=0.9, color=c)
+        axH.scatter([x1[i]], [y1], s=26, alpha=0.92, color=c)
+        axH.scatter([x2[i]], [y2], s=26, alpha=0.92, color=c)
 
-    ax.set_ylabel("Transition entropy Hₐ (bits)")
+    axH.set_ylabel("Transition entropy Hₐ (bits)")
     if title:
-        ax.set_title(title)
-
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
+        axH.set_title(title)
+    axH.spines["top"].set_visible(False)
+    axH.spines["right"].set_visible(False)
 
     if annotate_stats:
-        msg = format_test_summary(stats)
-        ax.text(
-            0.02, 0.98,
-            msg,
-            transform=ax.transAxes,
-            va="top",
-            ha="left",
-            fontsize=9,
-        )
+        axH.text(0.02, 0.98, format_test_summary(stats), transform=axH.transAxes, va="top", ha="left", fontsize=9)
 
-    # Optional legend (only if not too many labels)
-    if len(uniq) <= legend_max_labels:
-        handles = []
-        labels = []
-        for lab in uniq:
-            h = plt.Line2D([0], [0], marker="o", linestyle="None", color=color_map[lab], markersize=6)
-            handles.append(h)
-            labels.append(lab)
-        ax.legend(handles, labels, frameon=False, loc="center left", bbox_to_anchor=(1.02, 0.5))
+    # Usage panel
+    if show_usage_panel and axN is not None:
+        npre_all = df["n_pre"].to_numpy(dtype=float)
+        npost_all = df["n_post"].to_numpy(dtype=float)
+        npre_all = npre_all[np.isfinite(npre_all)]
+        npost_all = npost_all[np.isfinite(npost_all)]
 
-    fig.tight_layout()
+        if npre_all.size == 0 and npost_all.size == 0:
+            axN.text(0.5, 0.5, "No n_pre/n_post available", ha="center", va="center")
+        else:
+            axN.boxplot([npre_all, npost_all], labels=["Pre", "Post"], showfliers=True, whis=1.5)
+
+            df_counts = df[df["syllable"].isin(uniq)].copy().reset_index(drop=True)
+            jitterN = rng.normal(loc=0.0, scale=0.05, size=len(df_counts)) if len(df_counts) else np.array([])
+            xn1 = 1.0 + jitterN
+            xn2 = 2.0 + jitterN
+
+            for i, row in df_counts.iterrows():
+                lab = row["syllable"]
+                c = color_map.get(lab, (0, 0, 0, 1))
+                npre = row["n_pre"]
+                npost = row["n_post"]
+
+                if np.isfinite(npre):
+                    axN.scatter([xn1[i]], [float(npre)], s=26, alpha=0.92, color=c)
+                if np.isfinite(npost):
+                    axN.scatter([xn2[i]], [float(npost)], s=26, alpha=0.92, color=c)
+                if connect_usage_pairs and np.isfinite(npre) and np.isfinite(npost):
+                    axN.plot([xn1[i], xn2[i]], [float(npre), float(npost)], linewidth=1, alpha=0.65, color=c)
+
+            axN.set_ylabel("Usage (nₐ transitions)")
+            axN.set_title("Syllable usage (nₐ)")
+            axN.spines["top"].set_visible(False)
+            axN.spines["right"].set_visible(False)
+
+            if usage_log_scale:
+                all_counts = []
+                if npre_all.size:
+                    all_counts.append(npre_all)
+                if npost_all.size:
+                    all_counts.append(npost_all)
+                if all_counts:
+                    mn = float(np.min(np.concatenate(all_counts)))
+                    if mn > 0:
+                        axN.set_yscale("log")
+                    else:
+                        axN.text(0.02, 0.02, "log-scale skipped (counts include 0)",
+                                 transform=axN.transAxes, va="bottom", ha="left", fontsize=8)
+
+    # Figure legend
+    if len(uniq) > 0:
+        if len(uniq) > legend_max_labels:
+            axH.text(
+                0.02, 0.02,
+                f"Legend omitted: {len(uniq)} syllables > legend_max_labels={legend_max_labels}",
+                transform=axH.transAxes,
+                va="bottom",
+                ha="left",
+                fontsize=8,
+            )
+        else:
+            n_lookup = df.set_index("syllable")[["n_pre", "n_post"]]
+            handles = []
+            labels = []
+            for lab in uniq:
+                c = color_map[lab]
+                npre = n_lookup.loc[lab, "n_pre"] if lab in n_lookup.index else np.nan
+                npost = n_lookup.loc[lab, "n_post"] if lab in n_lookup.index else np.nan
+                npre_s = "NA" if not np.isfinite(float(npre)) else str(int(float(npre)))
+                npost_s = "NA" if not np.isfinite(float(npost)) else str(int(float(npost)))
+                handles.append(plt.Line2D([0], [0], marker="o", linestyle="None", color=c, markersize=6))
+                labels.append(f"{lab} (n_pre={npre_s}, n_post={npost_s})")
+
+            fig.legend(
+                handles,
+                labels,
+                frameon=False,
+                loc=legend_loc,
+                bbox_to_anchor=legend_bbox_to_anchor,
+                title="Syllable label",
+                ncol=int(max(1, legend_ncol)),
+                fontsize=float(legend_fontsize),
+                title_fontsize=float(legend_title_fontsize),
+                borderaxespad=0.0,
+                handletextpad=0.4,
+                columnspacing=0.8,
+            )
+
+    fig.tight_layout(rect=[0.0, 0.0, 0.78, 1.0])
     fig.savefig(out_path, dpi=200)
     if show:
         plt.show()
@@ -1149,9 +1187,6 @@ def plot_Ha_boxplot_pre_post_by_label(
     return stats
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Plotting: ONE target syllable follower distributions (pre vs post)
-# ──────────────────────────────────────────────────────────────────────────────
 def plot_followers_pre_post(
     pre: EntropyResult,
     post: EntropyResult,
@@ -1189,10 +1224,11 @@ def plot_followers_pre_post(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# COMMENTED-OUT EXAMPLE USAGE (Spyder console) — uses your exact paths
+# COMMENTED-OUT EXAMPLE USAGE (Spyder console) — includes TE computation
 # ──────────────────────────────────────────────────────────────────────────────
 """
 from pathlib import Path
+import pandas as pd
 import importlib
 import entropy_by_syllable as ebs
 importlib.reload(ebs)
@@ -1231,7 +1267,20 @@ organized_df = ebs.build_organized_from_merged_df(
 
 print("Animal:", animal_id_used, "| Treatment:", treatment_dt.date(), "| source:", src)
 
-# 4) ALL syllables: compute table
+# 4) Compute TOTAL transition entropy TE (pre vs post)
+TE_pre, TE_post = ebs.compute_pre_post_total_transition_entropy(
+    organized_df,
+    treatment_date=treatment_dt,
+    include_treatment_day=False,
+    collapse_repeats=True,
+    ignore_labels=["silence", "-"],
+    log_base=2.0,
+)
+
+print("TE_pre:", TE_pre.total_entropy, "| n_trans:", TE_pre.n_total_transitions, "| unique a:", TE_pre.n_unique_preceding_syllables)
+print("TE_post:", TE_post.total_entropy, "| n_trans:", TE_post.n_total_transitions, "| unique a:", TE_post.n_unique_preceding_syllables)
+
+# 5) ALL syllables H_a table
 ha_df = ebs.compute_pre_post_Ha_all_syllables(
     organized_df,
     treatment_date=treatment_dt,
@@ -1245,45 +1294,42 @@ ha_df = ebs.compute_pre_post_Ha_all_syllables(
 out_dir = Path("/Volumes/my_own_SSD/updated_AreaX_outputs/USA5288/entropy_all_syllables")
 out_dir.mkdir(parents=True, exist_ok=True)
 
-# A) Box plot with BLUE/ORANGE points + connecting lines + stats annotation
-stats1 = ebs.plot_Ha_boxplot_pre_post_connected(
-    ha_df,
-    out_path=out_dir / "Ha_all_syllables__boxplot_connected.png",
-    title=f"{animal_id_used}: per-syllable H_a (pre vs post)",
-    connect_pairs=True,
-    annotate_stats=True,
-)
-
-print("Stats (connected boxplot):", stats1)
-
-# B) Second box plot: each syllable label gets its own color (+ connecting lines)
+# A) TWO-PANEL plot: entropy + usage, colored by syllable (legend small font)
 stats2 = ebs.plot_Ha_boxplot_pre_post_by_label(
     ha_df,
-    out_path=out_dir / "Ha_all_syllables__boxplot_by_label.png",
-    title=f"{animal_id_used}: per-syllable H_a (colored by syllable)",
+    out_path=out_dir / "Ha_all_syllables__boxplot_by_label__with_usage.png",
+    title=f"{animal_id_used}: per-syllable H_a (colored by syllable; legend shows n_pre/n_post)",
     connect_pairs=True,
     annotate_stats=True,
-    legend_max_labels=20,   # set higher if you want a bigger legend
+    legend_fontsize=7,
+    legend_ncol=2,
+    show_usage_panel=True,
+    usage_log_scale=True,
 )
 
-print("Stats (colored-by-label boxplot):", stats2)
+print("Stats:", stats2)
 
-# Save table and optional debug CSVs
+# Save tables
 ha_df.to_csv(out_dir / "Ha_all_syllables_pre_post.csv", index=False)
-merged_df.to_csv(out_dir / "decoded_with_split_labels.csv", index=False)
-organized_df.to_csv(out_dir / "organized_from_merged.csv", index=False)
 
-# If you want the paired plot / scatter too:
-ebs.plot_Ha_all_syllables_pre_post(
-    ha_df,
-    out_path=out_dir / "Ha_all_syllables__paired.png",
-    style="paired",
-    title=f"{animal_id_used}: H_a pre vs post (paired points per syllable)",
-)
-ebs.plot_Ha_all_syllables_pre_post(
-    ha_df,
-    out_path=out_dir / "Ha_all_syllables__scatter.png",
-    style="scatter",
-    title=f"{animal_id_used}: H_pre vs H_post (all syllables)",
-)
+# Save TE details
+pd.DataFrame([{
+    "group": "pre",
+    "TE": TE_pre.total_entropy,
+    "n_total_transitions": TE_pre.n_total_transitions,
+    "n_unique_preceding_syllables": TE_pre.n_unique_preceding_syllables,
+}, {
+    "group": "post",
+    "TE": TE_post.total_entropy,
+    "n_total_transitions": TE_post.n_total_transitions,
+    "n_unique_preceding_syllables": TE_post.n_unique_preceding_syllables,
+}]).to_csv(out_dir / "TE_pre_post_summary.csv", index=False)
+
+pd.DataFrame([{"syllable": k, "P_of_a": v} for k, v in TE_pre.P_of_a.items()]).to_csv(out_dir / "TE_pre__P_of_a.csv", index=False)
+pd.DataFrame([{"syllable": k, "H_of_a": v} for k, v in TE_pre.H_of_a.items()]).to_csv(out_dir / "TE_pre__H_of_a.csv", index=False)
+pd.DataFrame([{"syllable": k, "term": v} for k, v in TE_pre.TE_terms.items()]).to_csv(out_dir / "TE_pre__P_times_H.csv", index=False)
+
+pd.DataFrame([{"syllable": k, "P_of_a": v} for k, v in TE_post.P_of_a.items()]).to_csv(out_dir / "TE_post__P_of_a.csv", index=False)
+pd.DataFrame([{"syllable": k, "H_of_a": v} for k, v in TE_post.H_of_a.items()]).to_csv(out_dir / "TE_post__H_of_a.csv", index=False)
+pd.DataFrame([{"syllable": k, "term": v} for k, v in TE_post.TE_terms.items()]).to_csv(out_dir / "TE_post__P_times_H.csv", index=False)
 """
