@@ -3,45 +3,52 @@
 """
 entropy_aggregate_across_birds.py
 
-Aggregate plots across birds using outputs from your batch entropy wrapper.
+Aggregate plots across birds using outputs from entropy_batch_wrapper.py.
 
-What this script does
----------------------
-1) Loads the batch summary CSV produced by entropy_batch_wrapper.py
-   (expects at minimum: animal_id, TE_pre, TE_post; optionally ha_csv_path)
+This script expects a batch summary CSV produced by entropy_batch_wrapper.py, and an
+Excel metadata sheet mapping Animal ID -> Lesion hit type.
 
-2) Loads lesion hit type metadata (Animal ID, Lesion hit type) and maps to 3 groups:
-   - Combined (visible ML + not visible)
-   - Area X visible (single hit)
-   - Sham saline injection
+What this script can plot
+-------------------------
+A) Bird-level Total Transition Entropy (TTE)
+   - Pre vs Post paired within bird, shown separately for 3 lesion groups:
+        • Combined (visible ML + not visible)
+        • Area X visible (single hit)
+        • Sham saline injection
+   - Optional: ΔTTE = TTE_post - TTE_pre across groups
 
-3) Makes aggregate bird-level TTE plots:
-   A) ONE combined figure:
-        For EACH group, plot TE_pre vs TE_post (paired within bird) with boxplots,
-        paired lines, and a paired test (Wilcoxon if SciPy available; else sign-flip perm).
-        p and n are placed on separate lines to avoid overlap.
+B) Syllable-level transition entropy H_a (optional; requires per-bird Ha table CSV path)
+   - Overall ΔH_a distribution by group (points are syllable×bird; stats use bird-level
+     means to reduce pseudo-replication).
+   - Optional: per-syllable ΔH_a across birds (one figure per syllable)
 
-   B) Optional: ΔTTE = TE_post - TE_pre boxplot across groups with between-group tests
-      (Combined vs Sham, Single vs Sham) and p-values on plot.
+NEW (requires per-bird output paths saved by updated entropy_batch_wrapper.py)
+-----------------------------------------------------------------------------
+C) Mean remaining syllables to end-of-song (per syllable; pre vs post)
+   - Overall Δ(mean remaining) distribution by group (syllable×bird points; bird-mean stats).
+   - Optional: per-syllable Δ(mean remaining) across birds
 
-4) Optional: ΔH_a (per-syllable entropy change) aggregate plots if ha_csv_path exists:
-   - Overall ΔH_a distribution by group (points are syllable×bird; stats use bird-level means
-     to avoid pseudo-replication).
-   - Per-syllable boxplots across birds (one figure per syllable), with tests vs Sham.
+D) Variance-tier analysis: do high phrase-duration-variance syllables change more in H_a?
+   - For each bird, selects top-variance syllables (default: top 30% by var_summary from
+     aggregate_variance_points_by_bird_and_syllable.csv) and the remaining syllables.
+   - Computes bird-level mean ΔH_a for each tier.
+   - Produces separate boxplots for:
+        • High-variance syllables (bird means)
+        • Low-variance syllables (bird means)
+   - Optional: paired within-bird plot (high vs low) for each lesion group.
 
 Outputs
 -------
 Default out_dir:
   <root_dir.parent>/entropy_figures/aggregate
 
-Key files (if enabled):
+Key files (when enabled):
   - TTE_pre_post_by_group__paired.png
-  - TTE_pre_post_by_group__paired_stats.txt
   - delta_TTE_by_group__boxplot.png
-  - delta_TTE_by_group__stats.txt
   - delta_Ha_overall_by_group__boxplot.png
-  - delta_Ha_by_syllable/*.png
-  - delta_Ha_by_syllable__stats.csv
+  - mean_remaining_delta_overall_by_group__boxplot.png
+  - variance_tier__delta_Ha_high_by_group__boxplot.png
+  - variance_tier__delta_Ha_low_by_group__boxplot.png
 """
 
 from __future__ import annotations
@@ -72,9 +79,7 @@ GROUP_ORDER = (GROUP_COMBINED, GROUP_SINGLE, GROUP_SHAM)
 
 
 def map_hit_type_to_group(hit_type: str) -> Optional[str]:
-    """
-    Map metadata 'Lesion hit type' → the 3-group scheme.
-    """
+    """Map metadata 'Lesion hit type' → the 3-group scheme."""
     if hit_type is None or (isinstance(hit_type, float) and np.isnan(hit_type)):
         return None
     s = str(hit_type).strip().lower()
@@ -113,10 +118,13 @@ def load_entropy_batch_summary(summary_csv: Union[str, Path]) -> pd.DataFrame:
       - TE_pre
       - TE_post
 
-    Optional columns:
-      - ha_csv_path   (enables ΔH_a aggregate plots)
+    Optional columns (newer wrappers may include these):
+      - Ha_table_csv (or ha_csv_path)
+      - mean_remaining_to_end_csv
+      - variance_summary_csv
     """
     df = pd.read_csv(summary_csv)
+
     required = {"animal_id", "TE_pre", "TE_post"}
     missing = required - set(df.columns)
     if missing:
@@ -126,8 +134,10 @@ def load_entropy_batch_summary(summary_csv: Union[str, Path]) -> pd.DataFrame:
     df["TE_pre"] = pd.to_numeric(df["TE_pre"], errors="coerce")
     df["TE_post"] = pd.to_numeric(df["TE_post"], errors="coerce")
 
-    if "ha_csv_path" in df.columns:
-        df["ha_csv_path"] = df["ha_csv_path"].astype(str)
+    # Normalize path-like columns to strings if present
+    for c in ["ha_csv_path", "Ha_table_csv", "mean_remaining_to_end_csv", "variance_summary_csv"]:
+        if c in df.columns:
+            df[c] = df[c].astype(str)
 
     return df
 
@@ -183,6 +193,13 @@ def merge_batch_with_groups(
     return merged, batch_summary_csv, Path(metadata_xlsx)
 
 
+def _first_existing_col(df: pd.DataFrame, candidates: Sequence[str]) -> Optional[str]:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Stats helpers
 # ──────────────────────────────────────────────────────────────────────────────
@@ -195,6 +212,7 @@ def _format_p(p: float) -> str:
 
 
 def _welch_ttest(a: np.ndarray, b: np.ndarray) -> Tuple[float, float]:
+    """Welch's t-test (two-sided). Returns (t, p)."""
     a = np.asarray(a, float)
     b = np.asarray(b, float)
     a = a[np.isfinite(a)]
@@ -400,7 +418,7 @@ def plot_TTE_pre_post_by_group(
         local_max = float(np.nanmax(np.r_[pre, post])) if n > 0 else y_max
         base = local_max + 0.07 * span
         h = 0.03 * span
-        label = f"p={_format_p(p)}\n(n={n})"
+        label = f"p={_format_p(p)}\\n(n={n})"
         _add_sig_bracket(
             ax,
             x_pre[gi],
@@ -416,7 +434,7 @@ def plot_TTE_pre_post_by_group(
     ax.set_ylabel("TTE (bits)")
 
     if title is None:
-        title = "Bird-level Total Transition Entropy (TTE)\n(Pre vs Post; paired within bird; weighted by syllable usage P(a))"
+        title = "Bird-level Total Transition Entropy (TTE)\\n(Pre vs Post; paired within bird; weighted by syllable usage P(a))"
     ax.set_title(title)
 
     ax.set_ylim(y_min - 0.05 * span, y_max + 0.45 * span)
@@ -463,7 +481,7 @@ def plot_delta_TTE_by_group(
         ns.append(int(len(v)))
 
     fig, ax = plt.subplots(figsize=(10.8, 5.6))
-    ax.boxplot(vals, labels=[f"{g}\n(n={n})" for g, n in zip(GROUP_ORDER, ns)], showfliers=True, whis=1.5)
+    ax.boxplot(vals, labels=[f"{g}\\n(n={n})" for g, n in zip(GROUP_ORDER, ns)], showfliers=True, whis=1.5)
 
     rng = np.random.default_rng(seed)
     for i, v in enumerate(vals, start=1):
@@ -506,29 +524,38 @@ def plot_delta_TTE_by_group(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ΔH_a (optional) – requires ha_csv_path in batch summary
+# ΔH_a (optional) – requires per-bird Ha table path in batch summary
 # ──────────────────────────────────────────────────────────────────────────────
+def _get_ha_csv_path_col(merged: pd.DataFrame) -> Optional[str]:
+    # Prefer updated wrapper column name, but allow legacy name too.
+    return _first_existing_col(merged, ["Ha_table_csv", "ha_csv_path", "ha_table_csv", "ha_table_path"])
+
+
 def build_delta_Ha_long_df(merged: pd.DataFrame) -> pd.DataFrame:
     """
-    Builds a long table with one row per (bird, syllable) containing:
+    Builds a long table with one row per (bird, syllable):
       animal_id, group, syllable, H_pre, H_post, delta_Ha, n_pre, n_post
-
-    Requires merged to include a valid 'ha_csv_path' per bird.
     """
-    if "ha_csv_path" not in merged.columns:
-        raise KeyError("Merged df has no 'ha_csv_path' column. Re-run batch wrapper with ha_csv_path saved.")
+    ha_col = _get_ha_csv_path_col(merged)
+    if ha_col is None:
+        raise KeyError(
+            "Merged df has no per-bird Ha table path column. Expected one of: "
+            "Ha_table_csv, ha_csv_path."
+        )
 
     rows: List[Dict[str, object]] = []
     for _, r in merged.iterrows():
         aid = str(r["animal_id"])
         grp = str(r["group"])
-        ha_path = Path(str(r["ha_csv_path"]))
+        ha_path = Path(str(r[ha_col]))
 
         if not ha_path.exists():
             continue
 
         hdf = pd.read_csv(ha_path)
-        if "syllable" not in hdf.columns or "H_pre" not in hdf.columns or "H_post" not in hdf.columns:
+
+        needed = {"syllable", "H_pre", "H_post"}
+        if not needed.issubset(set(hdf.columns)):
             continue
 
         hdf["syllable"] = hdf["syllable"].astype(str)
@@ -603,7 +630,7 @@ def plot_delta_Ha_overall_by_group(
         n_pairs.append(int(len(v)))
 
     fig, ax = plt.subplots(figsize=(10.8, 5.6))
-    ax.boxplot(vals, labels=[f"{g}\n(n_pairs={n})" for g, n in zip(GROUP_ORDER, n_pairs)], showfliers=True, whis=1.5)
+    ax.boxplot(vals, labels=[f"{g}\\n(n_pairs={n})" for g, n in zip(GROUP_ORDER, n_pairs)], showfliers=True, whis=1.5)
 
     rng = np.random.default_rng(seed)
     for i, v in enumerate(vals, start=1):
@@ -666,7 +693,7 @@ def plot_delta_Ha_by_syllable_across_birds(
     with tests vs Sham (Combined vs Sham; Single vs Sham).
 
     Writes a summary CSV with p-values to:
-      out_dir / "delta_Ha_by_syllable__stats.csv"
+      out_dir.parent / "delta_Ha_by_syllable__stats.csv"
 
     Returns path to the summary CSV.
     """
@@ -707,7 +734,7 @@ def plot_delta_Ha_by_syllable_across_birds(
         t2, p2 = _welch_ttest(vals[1], vals[2])  # single vs sham
 
         fig, ax = plt.subplots(figsize=(10.0, 5.4))
-        ax.boxplot(vals, labels=[f"{g}\n(n={n})" for g, n in zip(GROUP_ORDER, ns)], showfliers=True, whis=1.5)
+        ax.boxplot(vals, labels=[f"{g}\\n(n={n})" for g, n in zip(GROUP_ORDER, ns)], showfliers=True, whis=1.5)
 
         for i, v in enumerate(vals, start=1):
             j = rng.normal(0.0, 0.06, size=len(v))
@@ -752,6 +779,683 @@ def plot_delta_Ha_by_syllable_across_birds(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# NEW: Mean remaining syllables to end-of-song (per syllable)
+# ──────────────────────────────────────────────────────────────────────────────
+def _get_mean_remaining_csv_col(merged: pd.DataFrame) -> Optional[str]:
+    return _first_existing_col(merged, ["mean_remaining_to_end_csv", "mean_remaining_table_csv"])
+
+
+def build_mean_remaining_long_df(merged: pd.DataFrame) -> pd.DataFrame:
+    """
+    Builds a long table with one row per (bird, syllable):
+      animal_id, group, syllable, mean_remaining_pre, mean_remaining_post, delta_mean_remaining,
+      n_songs_pre, n_songs_post
+    """
+    mr_col = _get_mean_remaining_csv_col(merged)
+    if mr_col is None:
+        raise KeyError(
+            "Merged df has no per-bird mean-remaining table path column. Expected one of: "
+            "mean_remaining_to_end_csv, mean_remaining_table_csv."
+        )
+
+    rows: List[Dict[str, object]] = []
+    for _, r in merged.iterrows():
+        aid = str(r["animal_id"])
+        grp = str(r["group"])
+        p = Path(str(r[mr_col]))
+        if not p.exists():
+            continue
+        mdf = pd.read_csv(p)
+        needed = {"syllable", "mean_remaining_pre", "mean_remaining_post"}
+        if not needed.issubset(set(mdf.columns)):
+            continue
+
+        mdf["syllable"] = mdf["syllable"].astype(str)
+        mdf["mean_remaining_pre"] = pd.to_numeric(mdf["mean_remaining_pre"], errors="coerce")
+        mdf["mean_remaining_post"] = pd.to_numeric(mdf["mean_remaining_post"], errors="coerce")
+        if "n_songs_pre" in mdf.columns:
+            mdf["n_songs_pre"] = pd.to_numeric(mdf["n_songs_pre"], errors="coerce")
+        else:
+            mdf["n_songs_pre"] = np.nan
+        if "n_songs_post" in mdf.columns:
+            mdf["n_songs_post"] = pd.to_numeric(mdf["n_songs_post"], errors="coerce")
+        else:
+            mdf["n_songs_post"] = np.nan
+
+        ok = np.isfinite(mdf["mean_remaining_pre"].to_numpy(float)) & np.isfinite(mdf["mean_remaining_post"].to_numpy(float))
+        mdf = mdf.loc[ok].copy()
+        if mdf.empty:
+            continue
+
+        mdf["delta_mean_remaining"] = mdf["mean_remaining_post"] - mdf["mean_remaining_pre"]
+
+        for _, rr in mdf.iterrows():
+            rows.append(
+                {
+                    "animal_id": aid,
+                    "group": grp,
+                    "syllable": str(rr["syllable"]),
+                    "mean_remaining_pre": float(rr["mean_remaining_pre"]),
+                    "mean_remaining_post": float(rr["mean_remaining_post"]),
+                    "delta_mean_remaining": float(rr["delta_mean_remaining"]),
+                    "n_songs_pre": float(rr["n_songs_pre"]) if np.isfinite(rr["n_songs_pre"]) else np.nan,
+                    "n_songs_post": float(rr["n_songs_post"]) if np.isfinite(rr["n_songs_post"]) else np.nan,
+                    "mean_remaining_csv_path": str(p),
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def plot_delta_mean_remaining_overall_by_group(
+    delta_df: pd.DataFrame,
+    *,
+    out_path: Union[str, Path],
+    seed: int = 0,
+) -> Dict[str, object]:
+    """
+    Overall Δ(mean remaining) distribution by group.
+    Points: syllable×bird.
+    Stats: bird-level mean Δ(mean remaining).
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if delta_df is None or delta_df.empty:
+        raise ValueError("delta_df is empty; nothing to plot.")
+
+    bird_means = (
+        delta_df.groupby(["animal_id", "group"], as_index=False)["delta_mean_remaining"]
+        .mean()
+        .rename(columns={"delta_mean_remaining": "mean_delta_mean_remaining"})
+    )
+
+    vals: List[np.ndarray] = []
+    n_pairs: List[int] = []
+    for g in GROUP_ORDER:
+        v = delta_df.loc[delta_df["group"] == g, "delta_mean_remaining"].to_numpy(float)
+        v = v[np.isfinite(v)]
+        vals.append(v)
+        n_pairs.append(int(len(v)))
+
+    fig, ax = plt.subplots(figsize=(10.8, 5.6))
+    ax.boxplot(vals, labels=[f"{g}\\n(n_pairs={n})" for g, n in zip(GROUP_ORDER, n_pairs)], showfliers=True, whis=1.5)
+
+    rng = np.random.default_rng(seed)
+    for i, v in enumerate(vals, start=1):
+        j = rng.normal(0.0, 0.06, size=len(v))
+        ax.scatter(np.full(len(v), i) + j, v, s=18, alpha=0.55)
+
+    ax.set_ylabel("Δ mean remaining = post − pre (syllables)")
+    ax.set_title("Change in mean remaining syllables to song end (Δ remaining) aggregated across birds")
+    _remove_top_right_spines(ax)
+
+    comb_b = bird_means.loc[bird_means["group"] == GROUP_COMBINED, "mean_delta_mean_remaining"].to_numpy(float)
+    single_b = bird_means.loc[bird_means["group"] == GROUP_SINGLE, "mean_delta_mean_remaining"].to_numpy(float)
+    sham_b = bird_means.loc[bird_means["group"] == GROUP_SHAM, "mean_delta_mean_remaining"].to_numpy(float)
+
+    t1, p1 = _welch_ttest(comb_b, sham_b)
+    t2, p2 = _welch_ttest(single_b, sham_b)
+
+    y0 = _safe_ymax_from_groups(vals, default=0.0)
+    span = _safe_span_from_groups(vals, default=1.0)
+    base = y0 + 0.10 * span
+    h = 0.03 * span
+
+    _add_sig_bracket(ax, 1, 3, base, h, f"Bird-mean Welch p={_format_p(p1)}", text_offset=0.01 * span)
+    _add_sig_bracket(ax, 2, 3, base + 0.10 * span, h, f"Bird-mean Welch p={_format_p(p2)}", text_offset=0.01 * span)
+
+    ax.set_ylim(ax.get_ylim()[0], y0 + 0.30 * span)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+
+    return {
+        "tests_bird_mean": {
+            "combined_vs_sham": {"t": float(t1) if np.isfinite(t1) else np.nan, "p": float(p1)},
+            "single_vs_sham": {"t": float(t2) if np.isfinite(t2) else np.nan, "p": float(p2)},
+        },
+        "out_path": str(out_path),
+    }
+
+
+def plot_delta_mean_remaining_by_syllable_across_birds(
+    delta_df: pd.DataFrame,
+    *,
+    out_dir: Union[str, Path],
+    min_birds_per_group: int = 3,
+    seed: int = 0,
+) -> Path:
+    """
+    One figure per syllable: bird-level mean Δ(mean remaining) across groups.
+
+    Writes summary CSV to:
+      out_dir.parent / "delta_mean_remaining_by_syllable__stats.csv"
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if delta_df is None or delta_df.empty:
+        raise ValueError("delta_df is empty; nothing to plot.")
+
+    syllables = sorted(delta_df["syllable"].astype(str).unique().tolist())
+    stats_rows: List[Dict[str, object]] = []
+    rng = np.random.default_rng(seed)
+
+    for syl in syllables:
+        d = delta_df[delta_df["syllable"].astype(str) == str(syl)].copy()
+        if d.empty:
+            continue
+
+        bird_vals = (
+            d.groupby(["animal_id", "group"], as_index=False)["delta_mean_remaining"]
+            .mean()
+            .rename(columns={"delta_mean_remaining": "delta_mean_remaining_bird"})
+        )
+
+        vals: List[np.ndarray] = []
+        ns: List[int] = []
+        for g in GROUP_ORDER:
+            v = bird_vals.loc[bird_vals["group"] == g, "delta_mean_remaining_bird"].to_numpy(float)
+            v = v[np.isfinite(v)]
+            vals.append(v)
+            ns.append(int(len(v)))
+
+        if ns[2] < min_birds_per_group:
+            continue
+
+        t1, p1 = _welch_ttest(vals[0], vals[2])  # combined vs sham
+        t2, p2 = _welch_ttest(vals[1], vals[2])  # single vs sham
+
+        fig, ax = plt.subplots(figsize=(10.0, 5.4))
+        ax.boxplot(vals, labels=[f"{g}\\n(n={n})" for g, n in zip(GROUP_ORDER, ns)], showfliers=True, whis=1.5)
+
+        for i, v in enumerate(vals, start=1):
+            j = rng.normal(0.0, 0.06, size=len(v))
+            ax.scatter(np.full(len(v), i) + j, v, s=26, alpha=0.85)
+
+        ax.set_ylabel("Δ mean remaining (syllables)")
+        ax.set_title(f"Δ mean remaining by group for syllable {syl}")
+        _remove_top_right_spines(ax)
+
+        y0 = _safe_ymax_from_groups(vals, default=0.0)
+        span = _safe_span_from_groups(vals, default=1.0)
+        base = y0 + 0.10 * span
+        h = 0.03 * span
+
+        _add_sig_bracket(ax, 1, 3, base, h, f"Welch p={_format_p(p1)}", text_offset=0.01 * span)
+        _add_sig_bracket(ax, 2, 3, base + 0.10 * span, h, f"Welch p={_format_p(p2)}", text_offset=0.01 * span)
+        ax.set_ylim(ax.get_ylim()[0], y0 + 0.30 * span)
+
+        fig.tight_layout()
+        out_png = out_dir / f"delta_mean_remaining__syllable_{str(syl)}.png"
+        fig.savefig(out_png, dpi=200)
+        plt.close(fig)
+
+        stats_rows.append(
+            {
+                "syllable": str(syl),
+                "n_combined": ns[0],
+                "n_single": ns[1],
+                "n_sham": ns[2],
+                "combined_vs_sham_t": float(t1) if np.isfinite(t1) else np.nan,
+                "combined_vs_sham_p": float(p1),
+                "single_vs_sham_t": float(t2) if np.isfinite(t2) else np.nan,
+                "single_vs_sham_p": float(p2),
+                "plot_path": str(out_png),
+            }
+        )
+
+    stats_df = pd.DataFrame(stats_rows)
+    out_csv = out_dir.parent / "delta_mean_remaining_by_syllable__stats.csv"
+    stats_df.to_csv(out_csv, index=False)
+    return out_csv
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# NEW: Variance-tier ΔH_a (top-variance syllables vs low-variance syllables)
+# ──────────────────────────────────────────────────────────────────────────────
+def _get_variance_summary_csv_col(merged: pd.DataFrame) -> Optional[str]:
+    return _first_existing_col(merged, ["variance_summary_csv", "variance_summary_by_syllable_csv"])
+
+
+def _load_variance_summary(path: Path) -> Optional[pd.DataFrame]:
+    if not path.exists():
+        return None
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return None
+    needed = {"syllable", "var_summary"}
+    if not needed.issubset(set(df.columns)):
+        return None
+    df = df.copy()
+    df["syllable"] = df["syllable"].astype(str)
+    df["var_summary"] = pd.to_numeric(df["var_summary"], errors="coerce")
+    df = df[np.isfinite(df["var_summary"].to_numpy(float))].copy()
+    return df
+
+
+def build_variance_tier_delta_Ha_bird_df(
+    merged: pd.DataFrame,
+    *,
+    top_variance_percentile: float = 70.0,
+) -> pd.DataFrame:
+    """
+    Returns one row per bird:
+      animal_id, group,
+      mean_delta_Ha_high, mean_delta_Ha_low,
+      n_high, n_low,
+      high_syllables (comma-separated)
+
+    Uses:
+      - variance_summary_csv (syllable, var_summary) to choose "high variance" set
+      - Ha_table_csv to compute delta_Ha per syllable
+    """
+    ha_col = _get_ha_csv_path_col(merged)
+    var_col = _get_variance_summary_csv_col(merged)
+    if ha_col is None or var_col is None:
+        raise KeyError(
+            "Need both per-bird Ha table and variance summary paths in the batch summary. "
+            "Expected Ha_table_csv (or ha_csv_path) and variance_summary_csv."
+        )
+
+    rows: List[Dict[str, object]] = []
+
+    for _, r in merged.iterrows():
+        aid = str(r["animal_id"])
+        grp = str(r["group"])
+
+        ha_path = Path(str(r[ha_col]))
+        var_path = Path(str(r[var_col]))
+
+        if not ha_path.exists() or not var_path.exists():
+            continue
+
+        vdf = _load_variance_summary(var_path)
+        if vdf is None or vdf.empty:
+            continue
+
+        # Pick top-variance syllables based on percentile threshold of var_summary
+        q = np.nanpercentile(vdf["var_summary"].to_numpy(float), float(top_variance_percentile))
+        high = vdf.loc[vdf["var_summary"] >= q, "syllable"].astype(str).tolist()
+        high_set = set(high)
+
+        hdf = pd.read_csv(ha_path)
+        needed = {"syllable", "H_pre", "H_post"}
+        if not needed.issubset(set(hdf.columns)):
+            continue
+        hdf = hdf.copy()
+        hdf["syllable"] = hdf["syllable"].astype(str)
+        hdf["H_pre"] = pd.to_numeric(hdf["H_pre"], errors="coerce")
+        hdf["H_post"] = pd.to_numeric(hdf["H_post"], errors="coerce")
+        ok = np.isfinite(hdf["H_pre"].to_numpy(float)) & np.isfinite(hdf["H_post"].to_numpy(float))
+        hdf = hdf.loc[ok].copy()
+        if hdf.empty:
+            continue
+        hdf["delta_Ha"] = hdf["H_post"] - hdf["H_pre"]
+
+        high_df = hdf[hdf["syllable"].isin(high_set)].copy()
+        low_df = hdf[~hdf["syllable"].isin(high_set)].copy()
+
+        mean_high = float(np.nanmean(high_df["delta_Ha"].to_numpy(float))) if not high_df.empty else np.nan
+        mean_low = float(np.nanmean(low_df["delta_Ha"].to_numpy(float))) if not low_df.empty else np.nan
+
+        rows.append(
+            {
+                "animal_id": aid,
+                "group": grp,
+                "mean_delta_Ha_high": mean_high,
+                "mean_delta_Ha_low": mean_low,
+                "n_high": int(len(high_df)),
+                "n_low": int(len(low_df)),
+                "high_syllables": ",".join(sorted(high_set)),
+                "variance_summary_csv": str(var_path),
+                "Ha_table_csv": str(ha_path),
+                "variance_percentile_threshold": float(top_variance_percentile),
+                "var_summary_threshold": float(q) if np.isfinite(q) else np.nan,
+            }
+        )
+
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out["mean_delta_Ha_high"] = pd.to_numeric(out["mean_delta_Ha_high"], errors="coerce")
+        out["mean_delta_Ha_low"] = pd.to_numeric(out["mean_delta_Ha_low"], errors="coerce")
+    return out
+
+
+def build_variance_tier_delta_Ha_long_df(
+    merged: pd.DataFrame,
+    *,
+    top_variance_percentile: float = 70.0,
+) -> pd.DataFrame:
+    """Returns a LONG table with one row per (bird, syllable).
+
+    Columns:
+      animal_id, group, syllable, H_pre, H_post, delta_Ha, var_summary, variance_tier
+
+    The 'high' tier is defined *within each bird* as syllables whose var_summary is
+    >= the given percentile threshold (e.g., 70th percentile = top 30%).
+
+    Requires per-bird paths in the batch summary:
+      - Ha_table_csv (or ha_csv_path)
+      - variance_summary_csv (or variance_summary_by_syllable_csv)
+    """
+    ha_col = _get_ha_csv_path_col(merged)
+    var_col = _get_variance_summary_csv_col(merged)
+    if ha_col is None or var_col is None:
+        raise KeyError(
+            "Need both per-bird Ha table and variance summary paths in the batch summary. "
+            "Expected Ha_table_csv (or ha_csv_path) and variance_summary_csv."
+        )
+
+    rows: List[Dict[str, object]] = []
+
+    for _, r in merged.iterrows():
+        aid = str(r["animal_id"])
+        grp = str(r["group"])
+
+        ha_path = Path(str(r[ha_col]))
+        var_path = Path(str(r[var_col]))
+
+        if not ha_path.exists() or not var_path.exists():
+            continue
+
+        vdf = _load_variance_summary(var_path)
+        if vdf is None or vdf.empty:
+            continue
+
+        q = np.nanpercentile(vdf["var_summary"].to_numpy(float), float(top_variance_percentile))
+        high_set = set(vdf.loc[vdf["var_summary"] >= q, "syllable"].astype(str).tolist())
+
+        hdf = pd.read_csv(ha_path)
+        needed = {"syllable", "H_pre", "H_post"}
+        if not needed.issubset(set(hdf.columns)):
+            continue
+
+        hdf = hdf.copy()
+        hdf["syllable"] = hdf["syllable"].astype(str)
+        hdf["H_pre"] = pd.to_numeric(hdf["H_pre"], errors="coerce")
+        hdf["H_post"] = pd.to_numeric(hdf["H_post"], errors="coerce")
+        ok = np.isfinite(hdf["H_pre"].to_numpy(float)) & np.isfinite(hdf["H_post"].to_numpy(float))
+        hdf = hdf.loc[ok].copy()
+        if hdf.empty:
+            continue
+
+        hdf["delta_Ha"] = hdf["H_post"] - hdf["H_pre"]
+
+        # Attach var_summary per syllable (may be missing for some syllables)
+        vdf_small = vdf[["syllable", "var_summary"]].copy()
+        merged_s = hdf.merge(vdf_small, on="syllable", how="left")
+
+        for _, rr in merged_s.iterrows():
+            syl = str(rr["syllable"])
+            tier = "high" if syl in high_set else "low"
+            vs = rr.get("var_summary", float('nan'))
+            rows.append(
+                {
+                    "animal_id": aid,
+                    "group": grp,
+                    "syllable": syl,
+                    "H_pre": float(rr["H_pre"]),
+                    "H_post": float(rr["H_post"]),
+                    "delta_Ha": float(rr["delta_Ha"]),
+                    "var_summary": float(vs) if np.isfinite(vs) else np.nan,
+                    "variance_tier": tier,
+                    "variance_summary_csv": str(var_path),
+                    "Ha_table_csv": str(ha_path),
+                    "variance_percentile_threshold": float(top_variance_percentile),
+                    "var_summary_threshold": float(q) if np.isfinite(q) else np.nan,
+                }
+            )
+
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out["delta_Ha"] = pd.to_numeric(out["delta_Ha"], errors="coerce")
+        out["var_summary"] = pd.to_numeric(out["var_summary"], errors="coerce")
+    return out
+
+
+
+def plot_variance_tier_boxplots_by_group(
+    tier_df: pd.DataFrame,
+    *,
+    out_path_high: Union[str, Path],
+    out_path_low: Union[str, Path],
+    top_variance_percentile: Optional[float] = None,
+    seed: int = 0,
+) -> Dict[str, object]:
+    """Variance-tier ΔHₐ plots that mirror the overall ΔHₐ plot style.
+
+    This makes TWO figures (high-variance and low-variance).
+
+    IMPORTANT: Every point is a (bird, syllable) pair (syllable×bird).
+    Stats are computed on bird-level means within each tier (to avoid pseudo-replication).
+
+    Expected columns in tier_df:
+      - animal_id
+      - group
+      - variance_tier in {'high','low'}
+      - delta_Ha  (preferred; per syllable)
+
+    For backward compatibility, if delta_Ha is missing but delta_Ha_mean exists,
+    it will plot bird-level points instead.
+    """
+    out_path_high = Path(out_path_high)
+    out_path_low = Path(out_path_low)
+    out_path_high.parent.mkdir(parents=True, exist_ok=True)
+    out_path_low.parent.mkdir(parents=True, exist_ok=True)
+
+    if tier_df is None or tier_df.empty:
+        raise ValueError('tier_df is empty; nothing to plot.')
+
+    ycol = 'delta_Ha' if 'delta_Ha' in tier_df.columns else 'delta_Ha_mean'
+    if ycol not in tier_df.columns:
+        raise KeyError("tier_df must contain 'delta_Ha' (syllable-level) or 'delta_Ha_mean' (bird-level).")
+
+    def _plot_one(tier: str, out_path: Path) -> Dict[str, object]:
+        d = tier_df[tier_df['variance_tier'].astype(str).str.lower() == tier].copy()
+        if d.empty:
+            raise ValueError(f'No rows for variance_tier={tier!r}.')
+
+        vals: List[np.ndarray] = []
+        ns: List[int] = []
+        for g in GROUP_ORDER:
+            v = pd.to_numeric(d.loc[d['group'] == g, ycol], errors='coerce').to_numpy(float)
+            v = v[np.isfinite(v)]
+            vals.append(v)
+            ns.append(int(len(v)))
+
+        fig, ax = plt.subplots(figsize=(10.8, 5.6))
+        ax.boxplot(
+            vals,
+            labels=[f"{g}\n(n_pairs={n})" for g, n in zip(GROUP_ORDER, ns)],
+            showfliers=True,
+            whis=1.5,
+        )
+
+        rng = np.random.default_rng(seed)
+        for i, v in enumerate(vals, start=1):
+            j = rng.normal(0.0, 0.06, size=len(v))
+            ax.scatter(np.full(len(v), i) + j, v, s=18, alpha=0.55)
+
+        ax.set_ylabel('ΔHₐ = Hₐ_post − Hₐ_pre (bits)')
+
+        ptxt = ''
+        if top_variance_percentile is not None and np.isfinite(float(top_variance_percentile)):
+            ptxt = f" (threshold: ≥{float(top_variance_percentile):g}th percentile within bird)"
+
+        ax.set_title(f"Per-syllable entropy change (ΔHₐ) by group\n{tier.capitalize()}-variance syllables{ptxt}")
+        _remove_top_right_spines(ax)
+
+        # Stats on bird means within this tier
+        if ycol == 'delta_Ha':
+            bird_means = (
+                d.groupby(['animal_id', 'group'], as_index=False)['delta_Ha']
+                .mean()
+                .rename(columns={'delta_Ha': 'mean_delta_Ha'})
+            )
+            comb_b = bird_means.loc[bird_means['group'] == GROUP_COMBINED, 'mean_delta_Ha'].to_numpy(float)
+            single_b = bird_means.loc[bird_means['group'] == GROUP_SINGLE, 'mean_delta_Ha'].to_numpy(float)
+            sham_b = bird_means.loc[bird_means['group'] == GROUP_SHAM, 'mean_delta_Ha'].to_numpy(float)
+        else:
+            comb_b = pd.to_numeric(d.loc[d['group'] == GROUP_COMBINED, ycol], errors='coerce').to_numpy(float)
+            single_b = pd.to_numeric(d.loc[d['group'] == GROUP_SINGLE, ycol], errors='coerce').to_numpy(float)
+            sham_b = pd.to_numeric(d.loc[d['group'] == GROUP_SHAM, ycol], errors='coerce').to_numpy(float)
+
+        t1, p1 = _welch_ttest(comb_b, sham_b)
+        t2, p2 = _welch_ttest(single_b, sham_b)
+
+        y0 = _safe_ymax_from_groups(vals, default=0.0)
+        span = _safe_span_from_groups(vals, default=1.0)
+        base = y0 + 0.10 * span
+        h = 0.03 * span
+
+        _add_sig_bracket(ax, 1, 3, base, h, f"Bird-mean Welch p={_format_p(p1)}", text_offset=0.01 * span)
+        _add_sig_bracket(ax, 2, 3, base + 0.10 * span, h, f"Bird-mean Welch p={_format_p(p2)}", text_offset=0.01 * span)
+
+        ax.set_ylim(ax.get_ylim()[0], y0 + 0.30 * span)
+
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=200)
+        plt.close(fig)
+
+        return {
+            'tests_bird_mean': {
+                'combined_vs_sham': {
+                    't': float(t1) if np.isfinite(t1) else np.nan,
+                    'p': float(p1),
+                    'n_comb': int(np.isfinite(comb_b).sum()),
+                    'n_sham': int(np.isfinite(sham_b).sum()),
+                },
+                'single_vs_sham': {
+                    't': float(t2) if np.isfinite(t2) else np.nan,
+                    'p': float(p2),
+                    'n_single': int(np.isfinite(single_b).sum()),
+                    'n_sham': int(np.isfinite(sham_b).sum()),
+                },
+            },
+            'n_pairs_by_group': dict(zip(GROUP_ORDER, ns)),
+            'out_path': str(out_path),
+        }
+
+    high_res = _plot_one('high', out_path_high)
+    low_res = _plot_one('low', out_path_low)
+
+    return {
+        'high': high_res,
+        'low': low_res,
+        'out_high': str(out_path_high),
+        'out_low': str(out_path_low),
+    }
+
+
+def plot_variance_tier_paired_within_group(
+    bird_tier_df: pd.DataFrame,
+    *,
+    out_path: Union[str, Path],
+    seed: int = 0,
+) -> Dict[str, object]:
+    """
+    For each lesion group, compare within-bird:
+      mean_delta_Ha_high vs mean_delta_Ha_low (paired).
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    df = bird_tier_df.copy()
+    df = df[np.isfinite(df["mean_delta_Ha_high"].to_numpy(float)) & np.isfinite(df["mean_delta_Ha_low"].to_numpy(float))].copy()
+    if df.empty:
+        raise ValueError("No birds with both high and low tier values.")
+
+    group_color = {GROUP_COMBINED: "C0", GROUP_SINGLE: "C1", GROUP_SHAM: "C2"}
+
+    centers = np.array([1.0, 4.0, 7.0], dtype=float)
+    dx = 0.35
+    x_high = centers - dx
+    x_low = centers + dx
+
+    all_vals = np.concatenate([df["mean_delta_Ha_high"].to_numpy(float), df["mean_delta_Ha_low"].to_numpy(float)])
+    all_vals = all_vals[np.isfinite(all_vals)]
+    y_min = float(np.min(all_vals))
+    y_max = float(np.max(all_vals))
+    span = max(1e-6, y_max - y_min)
+
+    fig, ax = plt.subplots(figsize=(13.5, 6.8))
+
+    high_handle = ax.scatter([], [], s=80, facecolor="none", edgecolor="black", linewidth=1.6, label="Top-variance (open)")
+    low_handle = ax.scatter([], [], s=80, facecolor="black", edgecolor="black", linewidth=1.0, label="Low-variance (filled)")
+
+    stats_by_group: Dict[str, Dict[str, float]] = {}
+
+    for gi, g in enumerate(GROUP_ORDER):
+        dfg = df[df["group"] == g].copy().sort_values("animal_id")
+        high = dfg["mean_delta_Ha_high"].to_numpy(float)
+        low = dfg["mean_delta_Ha_low"].to_numpy(float)
+        n = int(len(dfg))
+
+        ax.boxplot(
+            [high, low],
+            positions=[x_high[gi], x_low[gi]],
+            widths=0.42,
+            showfliers=False,
+            patch_artist=False,
+        )
+
+        jit = _jitter(n, seed=seed + gi, scale=0.02)
+        c = group_color.get(g, "0.3")
+
+        for i in range(n):
+            ax.plot([x_high[gi] + jit[i], x_low[gi] + jit[i]], [high[i], low[i]],
+                    color=c, alpha=0.45, linewidth=1.3)
+
+        ax.scatter(
+            np.full(n, x_high[gi]) + jit,
+            high,
+            s=70,
+            facecolor="none",
+            edgecolor=c,
+            linewidth=1.9,
+            zorder=3,
+        )
+        ax.scatter(
+            np.full(n, x_low[gi]) + jit,
+            low,
+            s=70,
+            facecolor=c,
+            edgecolor=c,
+            linewidth=1.0,
+            zorder=3,
+        )
+
+        W, p = wilcoxon_signed_rank_paired(high, low, seed=seed)
+        stats_by_group[g] = {"n": float(n), "W": float(W) if np.isfinite(W) else np.nan, "p": float(p)}
+
+        local_max = float(np.nanmax(np.r_[high, low])) if n > 0 else y_max
+        base = local_max + 0.07 * span
+        h = 0.03 * span
+        label = f"p={_format_p(p)}\\n(n={n})"
+        _add_sig_bracket(ax, x_high[gi], x_low[gi], base, h, label, text_offset=0.015 * span)
+
+    ax.set_xticks(centers)
+    ax.set_xticklabels(list(GROUP_ORDER), rotation=15, ha="right")
+    ax.set_ylabel("Mean ΔHₐ per bird (bits)")
+    ax.set_title("Within-bird comparison: ΔHₐ in high-variance vs low-variance syllables")
+
+    ax.set_ylim(y_min - 0.05 * span, y_max + 0.45 * span)
+
+    _remove_top_right_spines(ax)
+    ax.legend(handles=[high_handle, low_handle], frameon=False, loc="upper left")
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+
+    return {"stats_by_group": stats_by_group, "out_path": str(out_path)}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Main orchestration
 # ──────────────────────────────────────────────────────────────────────────────
 def make_aggregate_entropy_figures(
@@ -761,9 +1465,20 @@ def make_aggregate_entropy_figures(
     batch_summary_csv: Optional[Union[str, Path]] = None,
     metadata_sheet_name: str = "animal_hit_type_summary",
     out_dir: Optional[Union[str, Path]] = None,
+
     make_delta_TTE: bool = True,
+
     make_delta_Ha: bool = True,
     make_delta_Ha_per_syllable: bool = True,
+
+    # NEW:
+    make_mean_remaining: bool = True,
+    make_mean_remaining_per_syllable: bool = False,
+
+    make_variance_tier_delta_Ha: bool = True,
+    top_variance_percentile: float = 70.0,      # top 30% variance syllables
+    make_variance_tier_paired: bool = True,
+
     seed: int = 0,
 ) -> Dict[str, object]:
     root_dir = Path(root_dir)
@@ -810,7 +1525,7 @@ def make_aggregate_entropy_figures(
         W = d.get("W", np.nan)
         p = d.get("p", np.nan)
         lines.append(f"  {g}: n={int(n) if np.isfinite(n) else 'n/a'}, W={W}, p={p}")
-    tte_stats_txt.write_text("\n".join(lines) + "\n")
+    tte_stats_txt.write_text("\\n".join(lines) + "\\n")
     paths["TTE_pre_post_by_group__paired_stats"] = str(tte_stats_txt)
 
     # --- ΔTTE across groups ---
@@ -826,7 +1541,7 @@ def make_aggregate_entropy_figures(
         dlines.append("Between-group tests on ΔTTE = TE_post - TE_pre (Welch t-test):")
         dlines.append(f"  Combined vs Sham: t={t['combined_vs_sham']['t']}, p={t['combined_vs_sham']['p']}")
         dlines.append(f"  Single vs Sham:   t={t['single_vs_sham']['t']}, p={t['single_vs_sham']['p']}")
-        dstat.write_text("\n".join(dlines) + "\n")
+        dstat.write_text("\\n".join(dlines) + "\\n")
         paths["delta_TTE_by_group__stats"] = str(dstat)
 
     # --- ΔH_a (syllable-level) ---
@@ -856,6 +1571,76 @@ def make_aggregate_entropy_figures(
         except Exception as e:
             results["delta_Ha_error"] = str(e)
 
+    # --- NEW: mean remaining syllables to end-of-song ---
+    if make_mean_remaining:
+        try:
+            mr_df = build_mean_remaining_long_df(merged)
+            mr_csv = out_dir / "mean_remaining__all_birds_all_syllables_long.csv"
+            mr_df.to_csv(mr_csv, index=False)
+            paths["mean_remaining_long_csv"] = str(mr_csv)
+
+            mr_plot = out_dir / "mean_remaining_delta_overall_by_group__boxplot.png"
+            mr_res = plot_delta_mean_remaining_overall_by_group(mr_df, out_path=mr_plot, seed=seed)
+            paths["mean_remaining_delta_overall_by_group__boxplot"] = str(mr_plot)
+            results["mean_remaining_delta_overall_by_group"] = mr_res
+
+            if make_mean_remaining_per_syllable:
+                mr_syl_dir = out_dir / "mean_remaining_delta_by_syllable"
+                mr_stats_csv = plot_delta_mean_remaining_by_syllable_across_birds(
+                    mr_df,
+                    out_dir=mr_syl_dir,
+                    min_birds_per_group=3,
+                    seed=seed,
+                )
+                paths["mean_remaining_delta_by_syllable_dir"] = str(mr_syl_dir)
+                paths["mean_remaining_delta_by_syllable_stats_csv"] = str(mr_stats_csv)
+
+        except Exception as e:
+            results["mean_remaining_error"] = str(e)
+
+    # --- NEW: variance-tier ΔH_a analysis ---
+    if make_variance_tier_delta_Ha:
+        try:
+            # LONG table: one row per (bird, syllable) with variance tier labels
+            tier_long_df = build_variance_tier_delta_Ha_long_df(
+                merged,
+                top_variance_percentile=float(top_variance_percentile),
+            )
+            tier_long_csv = out_dir / "variance_tier__delta_Ha_points_long.csv"
+            tier_long_df.to_csv(tier_long_csv, index=False)
+            paths["variance_tier_delta_Ha_points_long_csv"] = str(tier_long_csv)
+
+            # Also keep bird-level means (used for paired high-vs-low plot)
+            tier_df = build_variance_tier_delta_Ha_bird_df(
+                merged,
+                top_variance_percentile=float(top_variance_percentile),
+            )
+            tier_csv = out_dir / "variance_tier__delta_Ha_bird_means.csv"
+            tier_df.to_csv(tier_csv, index=False)
+            paths["variance_tier_delta_Ha_bird_means_csv"] = str(tier_csv)
+
+            high_plot = out_dir / "variance_tier__delta_Ha_high_by_group__boxplot.png"
+            low_plot = out_dir / "variance_tier__delta_Ha_low_by_group__boxplot.png"
+            tier_res = plot_variance_tier_boxplots_by_group(
+                tier_long_df,
+                out_path_high=high_plot,
+                out_path_low=low_plot,
+                top_variance_percentile=float(top_variance_percentile),
+                seed=seed,
+            )
+            paths["variance_tier__delta_Ha_high_by_group__boxplot"] = str(high_plot)
+            paths["variance_tier__delta_Ha_low_by_group__boxplot"] = str(low_plot)
+            results["variance_tier_boxplots"] = tier_res
+
+            if make_variance_tier_paired:
+                paired_plot = out_dir / "variance_tier__delta_Ha_high_vs_low__paired_within_group.png"
+                paired_res = plot_variance_tier_paired_within_group(tier_df, out_path=paired_plot, seed=seed)
+                paths["variance_tier__paired_plot"] = str(paired_plot)
+                results["variance_tier_paired"] = paired_res
+
+        except Exception as e:
+            results["variance_tier_error"] = str(e)
+
     return {"paths": paths, "results": results}
 
 
@@ -864,15 +1649,26 @@ def make_aggregate_entropy_figures(
 # ──────────────────────────────────────────────────────────────────────────────
 def _main():
     import argparse
-    p = argparse.ArgumentParser(description="Aggregate TTE/ΔTTE/ΔHa plots across birds into entropy_figures/aggregate/")
+    p = argparse.ArgumentParser(
+        description="Aggregate entropy plots across birds into entropy_figures/aggregate/"
+    )
     p.add_argument("--root", required=True, type=str, help="Root directory containing bird folders")
     p.add_argument("--metadata-xlsx", required=True, type=str, help="Path to metadata Excel with hit types")
     p.add_argument("--sheet-name", default="animal_hit_type_summary", type=str, help="Excel sheet name")
     p.add_argument("--batch-summary-csv", default=None, type=str, help="Optional override to batch summary CSV")
     p.add_argument("--out-dir", default=None, type=str, help="Optional output directory")
+
     p.add_argument("--no-delta-tte", action="store_true", help="Disable ΔTTE across-group plot")
-    p.add_argument("--no-delta-ha", action="store_true", help="Disable ΔHa plots (requires ha_csv_path in batch summary)")
+    p.add_argument("--no-delta-ha", action="store_true", help="Disable ΔHa plots")
     p.add_argument("--no-delta-ha-per-syllable", action="store_true", help="Disable per-syllable ΔHa plots")
+
+    p.add_argument("--no-mean-remaining", action="store_true", help="Disable mean-remaining Δ plots")
+    p.add_argument("--mean-remaining-per-syllable", action="store_true", help="Enable per-syllable mean-remaining Δ plots")
+
+    p.add_argument("--no-variance-tier", action="store_true", help="Disable variance-tier ΔHa analysis")
+    p.add_argument("--top-variance-percentile", default=70.0, type=float, help="Percentile threshold for TOP variance syllables (default=70)")
+    p.add_argument("--no-variance-tier-paired", action="store_true", help="Disable paired high-vs-low variance plot")
+
     args = p.parse_args()
 
     res = make_aggregate_entropy_figures(
@@ -881,9 +1677,19 @@ def _main():
         batch_summary_csv=args.batch_summary_csv,
         metadata_sheet_name=args.sheet_name,
         out_dir=args.out_dir,
+
         make_delta_TTE=not args.no_delta_tte,
+
         make_delta_Ha=not args.no_delta_ha,
         make_delta_Ha_per_syllable=not args.no_delta_ha_per_syllable,
+
+        make_mean_remaining=not args.no_mean_remaining,
+        make_mean_remaining_per_syllable=bool(args.mean_remaining_per_syllable),
+
+        make_variance_tier_delta_Ha=not args.no_variance_tier,
+        top_variance_percentile=float(args.top_variance_percentile),
+        make_variance_tier_paired=not args.no_variance_tier_paired,
+
         seed=0,
     )
     print(res["paths"])
@@ -914,10 +1720,19 @@ res = eagg.make_aggregate_entropy_figures(
     root_dir=root_dir,
     metadata_xlsx=metadata_xlsx,
     metadata_sheet_name="animal_hit_type_summary",
+
     make_delta_TTE=True,
-    make_delta_Ha=True,                 # requires ha_csv_path in batch summary
+
+    make_delta_Ha=True,
     make_delta_Ha_per_syllable=True,
+
+    make_mean_remaining=True,
+    make_mean_remaining_per_syllable=False,
+
+    make_variance_tier_delta_Ha=True,
+    top_variance_percentile=70.0,
+    make_variance_tier_paired=True,
 )
 
-print(res["paths"]["TTE_pre_post_by_group__paired"])
+print(res["paths"]["variance_tier__delta_Ha_high_by_group__boxplot"])
 """

@@ -23,28 +23,30 @@ Seasonality control:
       max_days_post=40 -> include only (t, t+40]  (or >= t if include_treatment_day=True)
 
 Plotting improvements:
-  - Plot titles are now rendered as a FIGURE suptitle (prevents overlap/cutoff)
-  - Optional parameter line is appended automatically:
+  - Plot titles rendered as FIGURE suptitle (prevents overlap/cutoff)
+  - Optional parameter line appended automatically:
         window: pre≤Xd, post≤Yd | min_transitions=Z
   - Optional soft-wrapping of long titles onto multiple lines
 
-Also includes plotting utilities:
-  • plot_Ha_boxplot_pre_post_connected(...)     # BLUE/ORANGE points + connecting lines + stats
-  • plot_Ha_boxplot_pre_post_by_label(...)      # TWO-PANEL: entropy + usage, colored by syllable
+Extra analyses (ADDED):
+  1) Neighbor histograms:
+     - For any target syllable a, plot BOTH:
+         • most common followers (next | a)
+         • most common predecessors (prev | a)
+     - Can batch-save for all syllables.
 
-NEW (context + remaining-to-end):
-  1) Context histograms:
-     • plot_context_histograms_pre_post_for_syllable(...)
-       - For a given target syllable a: most common PRECEDERS (prev -> a) and FOLLOWERS (a -> next),
-         shown pre vs post.
-     • plot_context_histograms_all_syllables(...)
-       - Generates one context histogram figure per syllable label.
+  2) Remaining-to-end:
+     - For each syllable a, compute the mean number of syllables remaining in the song
+       AFTER each occurrence of a (collapsed-repeats optional).
+     - Plot pre vs post means for each syllable with connecting lines.
+     - Includes an optional legend (requested).
 
-  2) Remaining-to-end metric:
-     • compute_pre_post_mean_remaining_to_end(...)
-       - For each syllable a, computes the mean number of syllables remaining after a until end of song.
-     • plot_mean_remaining_to_end_pre_post_by_label(...)
-       - Plots each syllable’s mean remaining length pre vs post, colored by syllable.
+  3) Variance-tier entropy plots:
+     - Load a per-syllable phrase-duration variance table (CSV or Excel).
+     - For a given animal_id, select the top 30% variance syllables (configurable).
+     - Make a boxplot of H_a (pre vs post) for:
+         • high-variance syllables
+         • the remaining low-variance syllables
 
 NOTE:
   - This module intentionally does NOT import organize_decoded_with_segments.py
@@ -55,7 +57,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union, Iterable
 import ast
 import json
 
@@ -218,6 +220,14 @@ def _sorted_labels_natural(labels: Sequence[str]) -> List[str]:
     return sorted(labs)
 
 
+def _sanitize_for_filename(s: str) -> str:
+    """Keep filenames portable."""
+    s2 = str(s).strip().replace(" ", "_")
+    for ch in ["/", "\\", ":", "*", "?", '"', "<", ">", "|"]:
+        s2 = s2.replace(ch, "_")
+    return s2
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Distinct categorical colors (30+ unique)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -283,7 +293,7 @@ def _append_param_line(
 ) -> Optional[str]:
     """
     Append a new line like:
-      window: pre≤40d, post≤40d | min_transitions=5
+      window: pre≤40d, post≤40d | min_transitions=50
     Only includes items that are not None.
     """
     items: List[str] = []
@@ -306,7 +316,7 @@ def _append_param_line(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Entropy
+# Entropy core
 # ──────────────────────────────────────────────────────────────────────────────
 def _entropy_from_probs(probs: np.ndarray, log_base: float = 2.0) -> float:
     probs = np.asarray(probs, dtype=float)
@@ -764,6 +774,26 @@ def _follower_counts_for_target(
     return counts
 
 
+def _predecessor_counts_for_target(
+    sequences: Sequence[Sequence[str]],
+    target: str,
+    *,
+    collapse_repeats: bool = True,
+    ignore_labels: Optional[Sequence[str]] = None,
+) -> Dict[str, int]:
+    """Counts of prev syllable given current == target."""
+    ignore = set(ignore_labels or [])
+    counts: Dict[str, int] = {}
+    for seq in sequences:
+        labs = [str(x) for x in seq if str(x) not in ignore]
+        if collapse_repeats:
+            labs = _collapse_consecutive(labs)
+        for prev, cur in zip(labs[:-1], labs[1:]):
+            if cur == target:
+                counts[prev] = counts.get(prev, 0) + 1
+    return counts
+
+
 def compute_pre_post_Ha(
     organized_df: pd.DataFrame,
     *,
@@ -1029,7 +1059,7 @@ def format_test_summary(stats: Dict[str, object]) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Plots
+# Plots: connected pre/post boxplot (all syllables or subset)
 # ──────────────────────────────────────────────────────────────────────────────
 def plot_Ha_boxplot_pre_post_connected(
     ha_df: pd.DataFrame,
@@ -1066,7 +1096,6 @@ def plot_Ha_boxplot_pre_post_connected(
     stats = paired_entropy_tests(ha_df, n_perm=stats_n_perm, seed=stats_seed)
 
     fig, ax = plt.subplots(figsize=(5.8, 5.2))
-
     ax.boxplot([pre_all, post_all], labels=["Pre", "Post"], showfliers=True, whis=1.5)
 
     if overlay_points:
@@ -1317,12 +1346,16 @@ def plot_Ha_boxplot_pre_post_by_label(
     return stats
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Followers / Predecessors plots for ONE target syllable
+# ──────────────────────────────────────────────────────────────────────────────
 def plot_followers_pre_post(
     pre: EntropyResult,
     post: EntropyResult,
     out_path: Union[str, Path],
     title: Optional[str] = None,
 ) -> None:
+    """Bar plot for P(next | target) pre vs post."""
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1334,8 +1367,8 @@ def plot_followers_pre_post(
     width = 0.42
 
     fig, ax = plt.subplots(figsize=(max(7, 0.45 * len(keys)), 4.2))
-    ax.bar(x - width / 2, pre_vals, width, label=f"Pre (H={pre.entropy:.3g}, n={pre.n_transitions})")
-    ax.bar(x + width / 2, post_vals, width, label=f"Post (H={post.entropy:.3g}, n={post.n_transitions})")
+    ax.bar(x - width / 2, pre_vals, width, label=f"Pre (H={pre.entropy:.2f}, n={pre.n_transitions})")
+    ax.bar(x + width / 2, post_vals, width, label=f"Post (H={post.entropy:.2f}, n={post.n_transitions})")
 
     ax.set_xticks(x)
     ax.set_xticklabels(keys, rotation=45, ha="right")
@@ -1353,41 +1386,7 @@ def plot_followers_pre_post(
     plt.close(fig)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Context counts: preceders and followers (NEW)
-# ──────────────────────────────────────────────────────────────────────────────
-def _preceder_counts_for_target(
-    sequences: Sequence[Sequence[str]],
-    target: str,
-    *,
-    collapse_repeats: bool = True,
-    ignore_labels: Optional[Sequence[str]] = None,
-) -> Dict[str, int]:
-    """
-    Counts prev -> target transitions: returns {prev_syllable: count} for events where next==target.
-    """
-    ignore = set(ignore_labels or [])
-    counts: Dict[str, int] = {}
-    for seq in sequences:
-        labs = [str(x) for x in seq if str(x) not in ignore]
-        if collapse_repeats:
-            labs = _collapse_consecutive(labs)
-        if len(labs) < 2:
-            continue
-        for prev, cur in zip(labs[:-1], labs[1:]):
-            if cur == target:
-                counts[prev] = counts.get(prev, 0) + 1
-    return counts
-
-
-def _counts_to_probs(counts: Dict[str, int]) -> Dict[str, float]:
-    n = float(sum(counts.values()))
-    if n <= 0:
-        return {}
-    return {k: float(v) / n for k, v in counts.items()}
-
-
-def plot_context_histograms_pre_post_for_syllable(
+def plot_predecessors_pre_post(
     organized_df: pd.DataFrame,
     *,
     target: str,
@@ -1396,19 +1395,82 @@ def plot_context_histograms_pre_post_for_syllable(
     include_treatment_day: bool = False,
     collapse_repeats: bool = True,
     ignore_labels: Optional[Sequence[str]] = None,
-    order_col: str = "syllable_order",
     max_days_pre: Optional[int] = None,
     max_days_post: Optional[int] = None,
-    top_k: int = 10,
-    normalize: bool = True,   # True = probabilities, False = raw counts
     title: Optional[str] = None,
-    show: bool = False,
+) -> None:
+    """Bar plot for P(prev | target) pre vs post."""
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    pre_df, post_df = split_pre_post(
+        organized_df,
+        treatment_date=treatment_date,
+        include_treatment_day=include_treatment_day,
+        max_days_pre=max_days_pre,
+        max_days_post=max_days_post,
+    )
+    pre_seqs = get_syllable_order_sequences(pre_df) if not pre_df.empty else []
+    post_seqs = get_syllable_order_sequences(post_df) if not post_df.empty else []
+
+    pre_counts = _predecessor_counts_for_target(pre_seqs, target=target, collapse_repeats=collapse_repeats,
+                                               ignore_labels=ignore_labels)
+    post_counts = _predecessor_counts_for_target(post_seqs, target=target, collapse_repeats=collapse_repeats,
+                                                ignore_labels=ignore_labels)
+
+    def _to_probs(d: Dict[str, int]) -> Dict[str, float]:
+        n = float(sum(d.values()))
+        if n <= 0:
+            return {}
+        return {k: v / n for k, v in d.items()}
+
+    pre_probs = _to_probs(pre_counts)
+    post_probs = _to_probs(post_counts)
+
+    keys = sorted(set(pre_probs.keys()) | set(post_probs.keys()))
+    pre_vals = [pre_probs.get(k, 0.0) for k in keys]
+    post_vals = [post_probs.get(k, 0.0) for k in keys]
+
+    x = np.arange(len(keys))
+    width = 0.42
+    fig, ax = plt.subplots(figsize=(max(7, 0.45 * len(keys)), 4.2))
+    ax.bar(x - width / 2, pre_vals, width, label=f"Pre (n={sum(pre_counts.values())})")
+    ax.bar(x + width / 2, post_vals, width, label=f"Post (n={sum(post_counts.values())})")
+    ax.set_xticks(x)
+    ax.set_xticklabels(keys, rotation=45, ha="right")
+    ax.set_ylabel("P(prev | target)")
+    ax.set_xlabel(f"Previous syllable (given {target})")
+    ax.legend(loc="best", frameon=False)
+
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    if title:
+        ax.set_title(_soft_wrap_title(title, parts_per_line=2) or "")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+
+
+def plot_neighbors_hist_pre_post(
+    organized_df: pd.DataFrame,
+    *,
+    target: str,
+    treatment_date: Union[str, pd.Timestamp],
+    out_path: Union[str, Path],
+    include_treatment_day: bool = False,
+    collapse_repeats: bool = True,
+    ignore_labels: Optional[Sequence[str]] = None,
+    max_days_pre: Optional[int] = None,
+    max_days_post: Optional[int] = None,
+    top_k: Optional[int] = 12,
+    title: Optional[str] = None,
 ) -> None:
     """
-    Two-panel figure for ONE target syllable:
-      Left: most common PRECEDERS (prev | target)
-      Right: most common FOLLOWERS (next | target)
-    Each panel shows pre vs post side-by-side bars.
+    One figure with TWO panels:
+      Left:  P(prev | target)  (most common predecessors)
+      Right: P(next | target)  (most common followers)
+
+    If top_k is not None, show the top_k categories by total count (pre+post).
     """
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1420,152 +1482,151 @@ def plot_context_histograms_pre_post_for_syllable(
         max_days_pre=max_days_pre,
         max_days_post=max_days_post,
     )
-    pre_seqs = get_syllable_order_sequences(pre_df, col=order_col) if not pre_df.empty else []
-    post_seqs = get_syllable_order_sequences(post_df, col=order_col) if not post_df.empty else []
+    pre_seqs = get_syllable_order_sequences(pre_df) if not pre_df.empty else []
+    post_seqs = get_syllable_order_sequences(post_df) if not post_df.empty else []
 
-    # counts
-    pre_prev = _preceder_counts_for_target(pre_seqs, target, collapse_repeats=collapse_repeats, ignore_labels=ignore_labels)
-    post_prev = _preceder_counts_for_target(post_seqs, target, collapse_repeats=collapse_repeats, ignore_labels=ignore_labels)
+    pre_prev = _predecessor_counts_for_target(pre_seqs, target=target, collapse_repeats=collapse_repeats,
+                                              ignore_labels=ignore_labels)
+    post_prev = _predecessor_counts_for_target(post_seqs, target=target, collapse_repeats=collapse_repeats,
+                                               ignore_labels=ignore_labels)
 
-    pre_next = _follower_counts_for_target(pre_seqs, target, collapse_repeats=collapse_repeats, ignore_labels=ignore_labels)
-    post_next = _follower_counts_for_target(post_seqs, target, collapse_repeats=collapse_repeats, ignore_labels=ignore_labels)
+    pre_next = _follower_counts_for_target(pre_seqs, target=target, collapse_repeats=collapse_repeats,
+                                          ignore_labels=ignore_labels)
+    post_next = _follower_counts_for_target(post_seqs, target=target, collapse_repeats=collapse_repeats,
+                                           ignore_labels=ignore_labels)
 
-    pre_prev_n = int(sum(pre_prev.values()))
-    post_prev_n = int(sum(post_prev.values()))
-    pre_next_n = int(sum(pre_next.values()))
-    post_next_n = int(sum(post_next.values()))
-
-    # probs (optional)
-    pre_prev_v = _counts_to_probs(pre_prev) if normalize else {k: float(v) for k, v in pre_prev.items()}
-    post_prev_v = _counts_to_probs(post_prev) if normalize else {k: float(v) for k, v in post_prev.items()}
-    pre_next_v = _counts_to_probs(pre_next) if normalize else {k: float(v) for k, v in pre_next.items()}
-    post_next_v = _counts_to_probs(post_next) if normalize else {k: float(v) for k, v in post_next.items()}
-
-    # choose top-k categories by combined (pre+post) counts
-    def _top_keys(counts_a: Dict[str, int], counts_b: Dict[str, int]) -> List[str]:
-        comb: Dict[str, int] = {}
-        for k, v in counts_a.items():
-            comb[k] = comb.get(k, 0) + int(v)
-        for k, v in counts_b.items():
-            comb[k] = comb.get(k, 0) + int(v)
-        keys = sorted(comb.keys(), key=lambda k: comb[k], reverse=True)
-        return keys[: max(1, int(top_k))]
+    def _top_keys(pre_d: Dict[str, int], post_d: Dict[str, int]) -> List[str]:
+        keys = sorted(set(pre_d) | set(post_d))
+        totals = {k: int(pre_d.get(k, 0) + post_d.get(k, 0)) for k in keys}
+        keys_sorted = sorted(keys, key=lambda k: totals[k], reverse=True)
+        if top_k is not None:
+            keys_sorted = keys_sorted[: int(top_k)]
+        return keys_sorted
 
     prev_keys = _top_keys(pre_prev, post_prev)
     next_keys = _top_keys(pre_next, post_next)
 
-    fig_w = max(9.0, 0.60 * float(max(len(prev_keys), len(next_keys), 1)))
-    fig, (axL, axR) = plt.subplots(1, 2, figsize=(fig_w, 4.6))
+    def _probs(counts: Dict[str, int], keys: List[str]) -> List[float]:
+        n = float(sum(counts.values()))
+        if n <= 0:
+            return [0.0 for _ in keys]
+        return [float(counts.get(k, 0)) / n for k in keys]
 
-    def _bar_compare(ax, keys, pre_map, post_map, xlabel):
-        x = np.arange(len(keys))
-        w = 0.42
-        pre_vals = [pre_map.get(k, 0.0) for k in keys]
-        post_vals = [post_map.get(k, 0.0) for k in keys]
-        ax.bar(x - w/2, pre_vals, w, label="Pre")
-        ax.bar(x + w/2, post_vals, w, label="Post")
-        ax.set_xticks(x)
-        ax.set_xticklabels(keys, rotation=45, ha="right")
-        ax.set_xlabel(xlabel)
-        ax.set_ylabel("Probability" if normalize else "Count")
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(max(10, 0.5 * (len(prev_keys) + len(next_keys))), 4.2))
 
-    _bar_compare(axL, prev_keys, pre_prev_v, post_prev_v, xlabel=f"Prev syllable (→ {target})")
-    _bar_compare(axR, next_keys, pre_next_v, post_next_v, xlabel=f"Next syllable (given {target})")
+    # Predecessors
+    x1 = np.arange(len(prev_keys))
+    w = 0.42
+    ax1.bar(x1 - w / 2, _probs(pre_prev, prev_keys), w, label=f"Pre (n={sum(pre_prev.values())})")
+    ax1.bar(x1 + w / 2, _probs(post_prev, prev_keys), w, label=f"Post (n={sum(post_prev.values())})")
+    ax1.set_xticks(x1)
+    ax1.set_xticklabels(prev_keys, rotation=45, ha="right")
+    ax1.set_ylabel("P(prev | target)")
+    ax1.set_title(f"Predecessors of {target}")
+    ax1.spines["top"].set_visible(False)
+    ax1.spines["right"].set_visible(False)
 
-    axL.set_title(f"Preceders (n_pre={pre_prev_n}, n_post={post_prev_n})")
-    axR.set_title(f"Followers (n_pre={pre_next_n}, n_post={post_next_n})")
-    axR.legend(frameon=False, loc="best")
+    # Followers
+    x2 = np.arange(len(next_keys))
+    ax2.bar(x2 - w / 2, _probs(pre_next, next_keys), w, label=f"Pre (n={sum(pre_next.values())})")
+    ax2.bar(x2 + w / 2, _probs(post_next, next_keys), w, label=f"Post (n={sum(post_next.values())})")
+    ax2.set_xticks(x2)
+    ax2.set_xticklabels(next_keys, rotation=45, ha="right")
+    ax2.set_ylabel("P(next | target)")
+    ax2.set_title(f"Followers of {target}")
+    ax2.spines["top"].set_visible(False)
+    ax2.spines["right"].set_visible(False)
 
-    title2 = _append_param_line(
-        _soft_wrap_title(title or f"Context for a={target} (pre vs post)", parts_per_line=2),
-        max_days_pre=max_days_pre,
-        max_days_post=max_days_post,
-        min_transitions=None,
-    )
-    if title2:
-        fig.suptitle(title2, y=0.98, fontsize=10)
+    ax2.legend(loc="best", frameon=False)
 
-    fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.93])
+    if title:
+        fig.suptitle(_soft_wrap_title(title, parts_per_line=2) or "", y=0.99, fontsize=11)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.95] if title else None)
     fig.savefig(out_path, dpi=200)
-    if show:
-        plt.show()
-    else:
-        plt.close(fig)
+    plt.close(fig)
 
 
-def plot_context_histograms_all_syllables(
+def plot_neighbors_hist_for_all_targets(
     organized_df: pd.DataFrame,
     *,
     treatment_date: Union[str, pd.Timestamp],
     out_dir: Union[str, Path],
+    targets: Optional[Sequence[str]] = None,
     include_treatment_day: bool = False,
     collapse_repeats: bool = True,
     ignore_labels: Optional[Sequence[str]] = None,
-    order_col: str = "syllable_order",
     max_days_pre: Optional[int] = None,
     max_days_post: Optional[int] = None,
-    top_k: int = 10,
-    normalize: bool = True,
+    top_k: Optional[int] = 12,
 ) -> List[Path]:
     """
-    Generates ONE context figure per syllable label: preceders + followers (pre vs post).
-    Returns list of saved paths.
+    Batch-save neighbor histogram figures for many targets.
+    Returns a list of saved paths.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    pre_df, post_df = split_pre_post(
-        organized_df,
-        treatment_date=treatment_date,
-        include_treatment_day=include_treatment_day,
-        max_days_pre=max_days_pre,
-        max_days_post=max_days_post,
-    )
-    pre_seqs = get_syllable_order_sequences(pre_df, col=order_col) if not pre_df.empty else []
-    post_seqs = get_syllable_order_sequences(post_df, col=order_col) if not post_df.empty else []
-
-    pre_counts_all = _bigram_counts_by_prev(pre_seqs, collapse_repeats=collapse_repeats, ignore_labels=ignore_labels)
-    post_counts_all = _bigram_counts_by_prev(post_seqs, collapse_repeats=collapse_repeats, ignore_labels=ignore_labels)
-
-    targets = set(pre_counts_all.keys()) | set(post_counts_all.keys())
-    if "syllables_present" in organized_df.columns:
-        for v in organized_df["syllables_present"].tolist():
-            targets.update(_coerce_listlike(v))
-
-    ignore = set(ignore_labels or [])
-    targets = {str(t) for t in targets if str(t) not in ignore}
-    targets_sorted = _sorted_labels_natural(list(targets))
+    if targets is None:
+        # Infer targets from syllable_order + syllables_present if available
+        labs: set[str] = set()
+        if "syllable_order" in organized_df.columns:
+            for v in organized_df["syllable_order"].tolist():
+                labs.update(_coerce_listlike(v))
+        if "syllables_present" in organized_df.columns:
+            for v in organized_df["syllables_present"].tolist():
+                labs.update(_coerce_listlike(v))
+        targets2 = _sorted_labels_natural(list(labs))
+    else:
+        targets2 = [str(t) for t in targets]
 
     saved: List[Path] = []
-    for a in targets_sorted:
-        p = out_dir / f"context_hist__a={a}.png"
-        plot_context_histograms_pre_post_for_syllable(
+    for t in targets2:
+        p = out_dir / f"neighbors__target_{_sanitize_for_filename(t)}.png"
+        plot_neighbors_hist_pre_post(
             organized_df,
-            target=a,
+            target=str(t),
             treatment_date=treatment_date,
             out_path=p,
             include_treatment_day=include_treatment_day,
             collapse_repeats=collapse_repeats,
             ignore_labels=ignore_labels,
-            order_col=order_col,
             max_days_pre=max_days_pre,
             max_days_post=max_days_post,
             top_k=top_k,
-            normalize=normalize,
-            title=None,
-            show=False,
+            title=f"Neighbors for target={t} (pre vs post)",
         )
         saved.append(p)
-
     return saved
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Remaining-to-end metric (NEW)
+# Remaining-to-end computation (mean # syllables after each occurrence)
 # ──────────────────────────────────────────────────────────────────────────────
-def compute_pre_post_mean_remaining_to_end(
+def _remaining_counts_for_sequence(
+    seq: Sequence[str],
+    *,
+    collapse_repeats: bool = True,
+    ignore_labels: Optional[Sequence[str]] = None,
+) -> Dict[str, List[int]]:
+    """
+    For each occurrence of a syllable a at position i in the (possibly collapsed) sequence,
+    record remaining = len(seq) - i - 1.
+    Returns dict syllable -> list of remaining counts (one entry per occurrence).
+    """
+    ignore = set(ignore_labels or [])
+    labs = [str(x) for x in seq if str(x) not in ignore]
+    if collapse_repeats:
+        labs = _collapse_consecutive(labs)
+    out: Dict[str, List[int]] = {}
+    L = len(labs)
+    for i, a in enumerate(labs):
+        rem = int(max(0, L - i - 1))
+        out.setdefault(a, []).append(rem)
+    return out
+
+
+def compute_mean_remaining_to_end_pre_post(
     organized_df: pd.DataFrame,
     *,
     treatment_date: Union[str, pd.Timestamp],
@@ -1578,12 +1639,7 @@ def compute_pre_post_mean_remaining_to_end(
     min_occurrences: int = 1,
 ) -> pd.DataFrame:
     """
-    For each syllable a, compute mean # of syllables after a until end of song.
-
-    For each occurrence at position i in a sequence of length L:
-        remaining = (L - i - 1)
-
-    Returns DataFrame with:
+    Returns a DataFrame with one row per syllable:
       syllable, mean_pre, mean_post, delta, n_occ_pre, n_occ_post
     """
     pre_df, post_df = split_pre_post(
@@ -1593,40 +1649,34 @@ def compute_pre_post_mean_remaining_to_end(
         max_days_pre=max_days_pre,
         max_days_post=max_days_post,
     )
+
     pre_seqs = get_syllable_order_sequences(pre_df, col=order_col) if not pre_df.empty else []
     post_seqs = get_syllable_order_sequences(post_df, col=order_col) if not post_df.empty else []
 
-    ignore = set(ignore_labels or [])
-
     def _accumulate(seqs: List[List[str]]) -> Dict[str, List[int]]:
-        out: Dict[str, List[int]] = {}
-        for seq in seqs:
-            labs = [str(x) for x in seq if str(x) not in ignore]
-            if collapse_repeats:
-                labs = _collapse_consecutive(labs)
-            L = len(labs)
-            if L == 0:
-                continue
-            for i, a in enumerate(labs):
-                if a in ignore:
-                    continue
-                rem = L - i - 1
-                out.setdefault(a, []).append(int(rem))
-        return out
+        acc: Dict[str, List[int]] = {}
+        for s in seqs:
+            d = _remaining_counts_for_sequence(s, collapse_repeats=collapse_repeats, ignore_labels=ignore_labels)
+            for k, v in d.items():
+                acc.setdefault(k, []).extend(v)
+        return acc
 
-    pre_map = _accumulate(pre_seqs)
-    post_map = _accumulate(post_seqs)
+    pre_acc = _accumulate(pre_seqs)
+    post_acc = _accumulate(post_seqs)
 
-    targets = set(pre_map.keys()) | set(post_map.keys())
+    targets = set(pre_acc) | set(post_acc)
+    ignore = set(ignore_labels or [])
+    targets = {t for t in targets if t not in ignore}
     targets_sorted = _sorted_labels_natural(list(targets))
 
     rows: List[Dict[str, object]] = []
     for a in targets_sorted:
-        pre_vals = np.asarray(pre_map.get(a, []), dtype=float)
-        post_vals = np.asarray(post_map.get(a, []), dtype=float)
+        pre_vals = np.asarray(pre_acc.get(a, []), dtype=float)
+        post_vals = np.asarray(post_acc.get(a, []), dtype=float)
 
         npre = int(pre_vals.size)
         npost = int(post_vals.size)
+
         if npre < min_occurrences and npost < min_occurrences:
             continue
 
@@ -1648,108 +1698,672 @@ def compute_pre_post_mean_remaining_to_end(
     return pd.DataFrame(rows).reset_index(drop=True)
 
 
-def plot_mean_remaining_to_end_pre_post_by_label(
-    remain_df: pd.DataFrame,
+def plot_mean_remaining_to_end_pre_post(
+    rem_df: pd.DataFrame,
     *,
     out_path: Union[str, Path],
     title: Optional[str] = None,
     show: bool = False,
     connect_pairs: bool = True,
+    legend: bool = True,
     legend_max_labels: int = 60,
     legend_fontsize: float = 7.0,
     legend_ncol: int = 2,
-    # for title clarity (optional)
-    max_days_pre: Optional[int] = None,
-    max_days_post: Optional[int] = None,
-    min_occurrences: Optional[int] = None,
+    legend_loc: str = "center left",
+    legend_bbox_to_anchor: Tuple[float, float] = (1.02, 0.5),
+    stats_seed: int = 0,
 ) -> None:
     """
-    One figure: each syllable label gets a pre and post point (mean remaining length),
-    optionally connected with a line, colored by syllable.
+    Plot: each syllable is a line from mean_pre to mean_post (y-axis = mean remaining).
+    Includes an optional legend (requested).
     """
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    df = remain_df.copy()
-    if df.empty:
-        raise ValueError("remain_df is empty; nothing to plot.")
+    if rem_df is None or rem_df.empty:
+        raise ValueError("rem_df is empty; nothing to plot.")
 
+    df = rem_df.copy()
     df["syllable"] = df["syllable"].astype(str)
     df["mean_pre"] = pd.to_numeric(df["mean_pre"], errors="coerce")
     df["mean_post"] = pd.to_numeric(df["mean_post"], errors="coerce")
 
     dfp = df[np.isfinite(df["mean_pre"]) & np.isfinite(df["mean_post"])].copy()
-    uniq = _sorted_labels_natural(dfp["syllable"].tolist())
-    if len(uniq) == 0:
-        raise ValueError("No paired syllables with finite mean_pre and mean_post to plot.")
+    if dfp.empty:
+        raise ValueError("No rows with finite mean_pre and mean_post.")
 
+    uniq = _sorted_labels_natural(dfp["syllable"].tolist())
     colors = _get_distinct_qual_colors(max(len(uniq), 30))
     color_map: Dict[str, tuple] = {lab: colors[i] for i, lab in enumerate(uniq)}
 
-    fig, ax = plt.subplots(figsize=(7.0, 5.2))
-    rng = np.random.default_rng(0)
-    jitter = rng.normal(0.0, 0.05, size=len(dfp))
+    fig, ax = plt.subplots(figsize=(6.6, 5.0))
+
+    rng = np.random.default_rng(stats_seed)
+    jitter = rng.normal(loc=0.0, scale=0.05, size=len(dfp)) if len(dfp) else np.array([])
     x1 = 1.0 + jitter
     x2 = 2.0 + jitter
+
+    handles = []
+    labels = []
 
     for i, (_, row) in enumerate(dfp.iterrows()):
         lab = row["syllable"]
         c = color_map.get(lab, (0, 0, 0, 1))
         y1 = float(row["mean_pre"])
         y2 = float(row["mean_post"])
+
         if connect_pairs:
             ax.plot([x1[i], x2[i]], [y1, y2], linewidth=1, alpha=0.65, color=c)
         ax.scatter([x1[i]], [y1], s=26, alpha=0.92, color=c)
         ax.scatter([x2[i]], [y2], s=26, alpha=0.92, color=c)
 
+        if legend and (len(uniq) <= legend_max_labels):
+            handles.append(plt.Line2D([0], [0], marker="o", linestyle="None", color=c, markersize=6))
+            npre = row.get("n_occ_pre", np.nan)
+            npost = row.get("n_occ_post", np.nan)
+            npre_s = "NA" if not np.isfinite(float(npre)) else str(int(float(npre)))
+            npost_s = "NA" if not np.isfinite(float(npost)) else str(int(float(npost)))
+            labels.append(f"{lab} (n_pre={npre_s}, n_post={npost_s})")
+
     ax.set_xticks([1, 2])
     ax.set_xticklabels(["Pre", "Post"])
-    ax.set_ylabel("Mean # syllables remaining until end of song")
+    ax.set_ylabel("Mean # syllables remaining to end")
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
 
-    # Title with parameter line
-    title2 = _append_param_line(
-        _soft_wrap_title(title or "Mean remaining syllables to end (pre vs post)", parts_per_line=2),
-        max_days_pre=max_days_pre,
-        max_days_post=max_days_post,
-        min_transitions=None,
-    )
-    if min_occurrences is not None:
-        extra = f"min_occurrences={int(min_occurrences)}"
-        title2 = (title2 + f"\n{extra}") if title2 else extra
-    if title2:
-        fig.suptitle(title2, y=0.98, fontsize=10)
+    if title:
+        fig.suptitle(_soft_wrap_title(title, parts_per_line=2) or "", y=0.98, fontsize=11)
 
-    # Figure legend (optional)
-    if len(uniq) <= legend_max_labels:
-        handles = []
-        labels = []
-        lookup = df.set_index("syllable")[["n_occ_pre", "n_occ_post"]]
-        for lab in uniq:
-            c = color_map[lab]
-            npre = lookup.loc[lab, "n_occ_pre"] if lab in lookup.index else np.nan
-            npost = lookup.loc[lab, "n_occ_post"] if lab in lookup.index else np.nan
-            npre_s = "NA" if not np.isfinite(float(npre)) else str(int(float(npre)))
-            npost_s = "NA" if not np.isfinite(float(npost)) else str(int(float(npost)))
-            handles.append(plt.Line2D([0], [0], marker="o", linestyle="None", color=c, markersize=6))
-            labels.append(f"{lab} (n_pre={npre_s}, n_post={npost_s})")
+    if legend:
+        if len(uniq) > legend_max_labels:
+            ax.text(
+                0.02, 0.02,
+                f"Legend omitted: {len(uniq)} syllables > legend_max_labels={legend_max_labels}",
+                transform=ax.transAxes,
+                va="bottom",
+                ha="left",
+                fontsize=8,
+            )
+        else:
+            fig.legend(
+                handles,
+                labels,
+                frameon=False,
+                loc=legend_loc,
+                bbox_to_anchor=legend_bbox_to_anchor,
+                title="Syllable label",
+                ncol=int(max(1, legend_ncol)),
+                fontsize=float(legend_fontsize),
+                borderaxespad=0.0,
+                handletextpad=0.4,
+                columnspacing=0.8,
+            )
 
-        fig.legend(
-            handles, labels, frameon=False, loc="center left",
-            bbox_to_anchor=(1.02, 0.5), ncol=int(max(1, legend_ncol)),
-            fontsize=float(legend_fontsize),
-        )
-        fig.tight_layout(rect=[0.0, 0.0, 0.78, 0.90])
-    else:
-        ax.text(0.02, 0.02, f"Legend omitted: {len(uniq)} labels", transform=ax.transAxes, fontsize=8)
-        fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.90])
-
+    fig.tight_layout(rect=[0.0, 0.0, 0.78, 0.92] if legend else [0.0, 0.0, 1.0, 0.92])
     fig.savefig(out_path, dpi=200)
     if show:
         plt.show()
     else:
         plt.close(fig)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Variance-tier selection (load per-syllable phrase-duration variance)
+# ──────────────────────────────────────────────────────────────────────────────
+def load_variance_table(
+    variance_path: Union[str, Path],
+    *,
+    sheet_name: Optional[str] = None,
+) -> pd.DataFrame:
+    """
+    Load a variance table from CSV or Excel.
+
+    Expected columns (case-insensitive):
+      - Animal ID (or animal_id)
+      - Syllable (or syllable)
+      - Var_ms2 (or variance, var, etc.)
+
+    The provided file can also include DayRel; if present, it can be used to focus on pre rows.
+    """
+    p = Path(variance_path)
+    if not p.exists():
+        raise FileNotFoundError(p)
+
+    suf = p.suffix.lower()
+    if suf in [".xlsx", ".xls"]:
+        df = pd.read_excel(p, sheet_name=sheet_name or 0)
+    elif suf in [".csv", ".tsv"]:
+        df = pd.read_csv(p, sep="\t" if suf == ".tsv" else ",")
+    else:
+        raise ValueError(f"Unsupported variance file type: {p.suffix}. Use .csv or .xlsx/.xls")
+
+    return df
+
+
+def summarize_variance_by_syllable(
+    variance_df: pd.DataFrame,
+    *,
+    animal_id: str,
+    use_pre_only: bool = True,
+    dayrel_col_candidates: Sequence[str] = ("DayRel", "dayrel", "day_rel", "day_relative"),
+    animal_col_candidates: Sequence[str] = ("Animal ID", "animal_id", "AnimalID"),
+    syll_col_candidates: Sequence[str] = ("Syllable", "syllable", "label"),
+    var_col_candidates: Sequence[str] = ("Var_ms2", "var_ms2", "variance", "Var", "var"),
+    agg: str = "median",
+    min_rows_per_syllable: int = 5,
+) -> pd.DataFrame:
+    """
+    Returns a per-syllable variance summary table with columns:
+      syllable, var_summary, n_rows_used
+
+    If DayRel is present and use_pre_only=True, uses rows with DayRel < 0.
+    """
+    df = variance_df.copy()
+
+    a_col = _find_col_case_insensitive(df, list(animal_col_candidates))
+    s_col = _find_col_case_insensitive(df, list(syll_col_candidates))
+    v_col = _find_col_case_insensitive(df, list(var_col_candidates))
+    d_col = _find_col_case_insensitive(df, list(dayrel_col_candidates))
+
+    if a_col is None or s_col is None or v_col is None:
+        raise KeyError(
+            f"Variance table missing required columns. Found columns: {list(df.columns)}. "
+            f"Need Animal ID, Syllable, and a variance column (e.g., Var_ms2)."
+        )
+
+    sub = df[df[a_col].astype(str) == str(animal_id)].copy()
+    if sub.empty:
+        raise ValueError(f"No rows for animal_id={animal_id} in variance table.")
+
+    if use_pre_only and (d_col is not None):
+        sub[d_col] = pd.to_numeric(sub[d_col], errors="coerce")
+        sub = sub[np.isfinite(sub[d_col]) & (sub[d_col] < 0)].copy()
+
+    sub["syllable"] = sub[s_col].astype(str)
+    sub["_var_"] = pd.to_numeric(sub[v_col], errors="coerce")
+    sub = sub[np.isfinite(sub["_var_"])].copy()
+
+    if sub.empty:
+        raise ValueError("Variance subset is empty after filtering/parsing.")
+
+    if agg not in {"median", "mean"}:
+        raise ValueError("agg must be 'median' or 'mean'.")
+
+    grouped = sub.groupby("syllable")["_var_"]
+    if agg == "median":
+        var_sum = grouped.median()
+    else:
+        var_sum = grouped.mean()
+    n_rows = grouped.size()
+
+    out = pd.DataFrame({"syllable": var_sum.index.astype(str), "var_summary": var_sum.values, "n_rows_used": n_rows.values})
+    out = out[out["n_rows_used"] >= int(min_rows_per_syllable)].copy()
+    out = out.sort_values("var_summary", ascending=False).reset_index(drop=True)
+    return out
+
+
+def select_top_variance_syllables(
+    variance_summary_df: pd.DataFrame,
+    *,
+    top_frac: float = 0.30,
+) -> List[str]:
+    """
+    Select top fraction of syllables by var_summary.
+    """
+    if variance_summary_df is None or variance_summary_df.empty:
+        return []
+    top_frac = float(top_frac)
+    top_frac = min(max(top_frac, 0.0), 1.0)
+    n = int(np.ceil(top_frac * len(variance_summary_df)))
+    n = max(n, 1) if len(variance_summary_df) else 0
+    return variance_summary_df["syllable"].astype(str).tolist()[:n]
+
+
+def plot_Ha_boxplots_by_variance_tier(
+    ha_df: pd.DataFrame,
+    *,
+    variance_path: Union[str, Path],
+    animal_id: str,
+    out_dir: Union[str, Path],
+    top_frac: float = 0.30,
+    use_pre_only: bool = True,
+    variance_sheet_name: Optional[str] = None,
+    variance_agg: str = "median",
+    min_rows_per_syllable: int = 5,
+    title_prefix: Optional[str] = None,
+    show: bool = False,
+    # pass-through for title clarity
+    max_days_pre: Optional[int] = None,
+    max_days_post: Optional[int] = None,
+    min_transitions: Optional[int] = None,
+) -> Dict[str, object]:
+    """
+    Creates two figures in out_dir:
+      - Ha_high_variance_pre_post.png
+      - Ha_low_variance_pre_post.png
+
+    Returns dict with selected labels and paths.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    var_df = load_variance_table(variance_path, sheet_name=variance_sheet_name)
+    var_sum = summarize_variance_by_syllable(
+        var_df,
+        animal_id=animal_id,
+        use_pre_only=use_pre_only,
+        agg=variance_agg,
+        min_rows_per_syllable=min_rows_per_syllable,
+    )
+    top_labels = set(select_top_variance_syllables(var_sum, top_frac=top_frac))
+
+    df = ha_df.copy()
+    df["syllable"] = df["syllable"].astype(str)
+
+    high = df[df["syllable"].isin(top_labels)].copy()
+    low = df[~df["syllable"].isin(top_labels)].copy()
+
+    res: Dict[str, object] = {
+        "animal_id": str(animal_id),
+        "top_frac": float(top_frac),
+        "n_top_syllables": int(len(top_labels)),
+        "top_syllables": sorted(list(top_labels), key=lambda x: (_try_int(x) is None, _try_int(x) or 0, x)),
+        "paths": {},
+    }
+
+    if high.empty:
+        res["note_high"] = "No overlap between top-variance syllables and ha_df syllables."
+    else:
+        title_high = f"{title_prefix + ' | ' if title_prefix else ''}{animal_id} | Top {int(top_frac*100)}% variance syllables: Hₐ pre vs post"
+        stats_high = plot_Ha_boxplot_pre_post_connected(
+            high,
+            out_path=out_dir / "Ha_high_variance_pre_post.png",
+            title=title_high,
+            show=show,
+            max_days_pre=max_days_pre,
+            max_days_post=max_days_post,
+            min_transitions=min_transitions,
+        )
+        res["stats_high"] = stats_high
+        res["paths"]["high"] = str(out_dir / "Ha_high_variance_pre_post.png")
+
+    if low.empty:
+        res["note_low"] = "Low-variance tier is empty after filtering."
+    else:
+        title_low = f"{title_prefix + ' | ' if title_prefix else ''}{animal_id} | Remaining low-variance syllables: Hₐ pre vs post"
+        stats_low = plot_Ha_boxplot_pre_post_connected(
+            low,
+            out_path=out_dir / "Ha_low_variance_pre_post.png",
+            title=title_low,
+            show=show,
+            max_days_pre=max_days_pre,
+            max_days_post=max_days_post,
+            min_transitions=min_transitions,
+        )
+        res["stats_low"] = stats_low
+        res["paths"]["low"] = str(out_dir / "Ha_low_variance_pre_post.png")
+
+    # Also save the summary table used
+    var_sum.to_csv(out_dir / "variance_summary_by_syllable.csv", index=False)
+    res["paths"]["variance_summary"] = str(out_dir / "variance_summary_by_syllable.csv")
+
+    return res
+
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# High-level "do everything" wrapper (used by scripts and CLI)
+# ──────────────────────────────────────────────────────────────────────────────
+def make_entropy_by_syllable_outputs(
+    *,
+    decoded_database_json: Union[str, Path],
+    song_detection_json: Union[str, Path],
+    metadata_xlsx: Optional[Union[str, Path]] = None,
+    metadata_sheet_name: Optional[str] = None,
+    treatment_date: Optional[str] = None,
+    animal_id: Optional[str] = None,
+    out_dir: Optional[Union[str, Path]] = None,
+
+    include_treatment_day: bool = False,
+    collapse_repeats: bool = True,
+    ignore_labels: Optional[Sequence[str]] = None,
+
+    log_base: float = 2.0,
+    min_transitions: int = 1,
+
+    # optional seasonality windows (days relative to treatment date)
+    max_days_pre: Optional[int] = None,
+    max_days_post: Optional[int] = None,
+
+    # optional neighbor histograms (prev+next) for each syllable
+    make_neighbors_hist: bool = True,
+    neighbors_top_k: Optional[int] = 12,
+    neighbors_targets: Optional[Sequence[str]] = None,
+
+    # optional remaining-to-end plot
+    make_mean_remaining_to_end: bool = True,
+    mean_remaining_min_occurrences: int = 10,
+    mean_remaining_legend_max_labels: int = 60,
+
+    # optional variance-tier entropy boxplots
+    make_variance_tiers: bool = False,
+    variance_path: Optional[Union[str, Path]] = None,
+    variance_sheet_name: Optional[str] = None,
+    variance_top_frac: float = 0.30,
+    variance_use_pre_only: bool = True,
+    variance_agg: str = "median",
+    variance_min_rows_per_syllable: int = 5,
+
+    # optional show plots interactively
+    show: bool = False,
+) -> Dict[str, object]:
+    """
+    End-to-end runner that:
+      1) merges split songs + appends annotations using detection timing
+      2) resolves treatment date (arg or Excel lookup)
+      3) builds organized_df
+      4) computes H_a for all syllables (pre vs post)
+      5) saves:
+           - Ha_all_syllables__boxplot_connected.png
+           - Ha_all_syllables__boxplot_by_label__with_usage.png
+           - mean_remaining_to_end_pre_vs_post.png (optional; includes legend)
+           - neighbors histograms (optional)
+           - variance-tier boxplots (optional)
+           - TE_pre_post_summary.txt
+
+    Returns dict with paths and key results (ha_df, TE summaries).
+    """
+    decoded_database_json = Path(decoded_database_json)
+    song_detection_json = Path(song_detection_json)
+
+    if out_dir is None:
+        out_dir = song_detection_json.parent / "entropy_by_syllable_outputs"
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Merge (split-song aware)
+    merged_df = build_merged_annotations_df(
+        decoded_database_json=decoded_database_json,
+        song_detection_json=song_detection_json,
+    )
+
+    # Resolve treatment date
+    t_dt, animal_id_used, t_src = resolve_treatment_date(
+        treatment_date_arg=treatment_date,
+        metadata_xlsx=metadata_xlsx,
+        animal_id_arg=animal_id,
+        merged_df=merged_df,
+        sheet_name=metadata_sheet_name,
+    )
+
+    # Organized DF
+    organized = build_organized_from_merged_df(merged_df, treatment_date=t_dt)
+    organized_df = organized.organized_df
+
+    # H_a table
+    ha_df = compute_pre_post_Ha_all_syllables(
+        organized_df,
+        treatment_date=t_dt,
+        include_treatment_day=include_treatment_day,
+        collapse_repeats=collapse_repeats,
+        ignore_labels=ignore_labels,
+        log_base=log_base,
+        min_transitions=min_transitions,
+        max_days_pre=max_days_pre,
+        max_days_post=max_days_post,
+    )
+
+    # TE summaries
+    pre_TE, post_TE = compute_pre_post_total_transition_entropy(
+        organized_df,
+        treatment_date=t_dt,
+        include_treatment_day=include_treatment_day,
+        collapse_repeats=collapse_repeats,
+        ignore_labels=ignore_labels,
+        log_base=log_base,
+        max_days_pre=max_days_pre,
+        max_days_post=max_days_post,
+    )
+
+    # Save TE summary
+    te_path = out_dir / "TE_pre_post_summary.txt"
+    with open(te_path, "w") as f:
+        f.write(f"animal_id: {animal_id_used}\n")
+        f.write(f"treatment_date: {t_dt.date()} (source={t_src})\n")
+        f.write(f"log_base: {log_base}\n")
+        f.write(f"collapse_repeats: {collapse_repeats}\n")
+        f.write(f"ignore_labels: {ignore_labels}\n")
+        f.write(f"window: max_days_pre={max_days_pre}, max_days_post={max_days_post}\n\n")
+
+        f.write("PRE:\n")
+        f.write(f"  TE: {pre_TE.total_entropy}\n")
+        f.write(f"  n_total_transitions: {pre_TE.n_total_transitions}\n\n")
+
+        f.write("POST:\n")
+        f.write(f"  TE: {post_TE.total_entropy}\n")
+        f.write(f"  n_total_transitions: {post_TE.n_total_transitions}\n\n")
+
+        if np.isfinite(pre_TE.total_entropy) and np.isfinite(post_TE.total_entropy):
+            f.write(f"DELTA (post - pre): {post_TE.total_entropy - pre_TE.total_entropy}\n")
+
+    # Save main plots
+    paths: Dict[str, str] = {}
+
+    p1 = out_dir / "Ha_all_syllables__boxplot_connected.png"
+    plot_Ha_boxplot_pre_post_connected(
+        ha_df,
+        out_path=p1,
+        title=f"{animal_id_used} | Hₐ across syllables (pre vs post)",
+        show=show,
+        max_days_pre=max_days_pre,
+        max_days_post=max_days_post,
+        min_transitions=min_transitions,
+    )
+    paths["Ha_boxplot_connected"] = str(p1)
+
+    p2 = out_dir / "Ha_all_syllables__boxplot_by_label__with_usage.png"
+    plot_Ha_boxplot_pre_post_by_label(
+        ha_df,
+        out_path=p2,
+        title=f"{animal_id_used} | Per-syllable Hₐ (colored by syllable; legend shows n_pre/n_post)",
+        show=show,
+        max_days_pre=max_days_pre,
+        max_days_post=max_days_post,
+        min_transitions=min_transitions,
+    )
+    paths["Ha_boxplot_by_label_with_usage"] = str(p2)
+
+    # Remaining-to-end plot (requested legend included)
+    rem_df = None
+    if make_mean_remaining_to_end:
+        rem_df = compute_mean_remaining_to_end_pre_post(
+            organized_df,
+            treatment_date=t_dt,
+            include_treatment_day=include_treatment_day,
+            collapse_repeats=collapse_repeats,
+            ignore_labels=ignore_labels,
+            max_days_pre=max_days_pre,
+            max_days_post=max_days_post,
+            min_occurrences=mean_remaining_min_occurrences,
+        )
+
+        p3 = out_dir / "mean_remaining_to_end_pre_vs_post.png"
+        plot_mean_remaining_to_end_pre_post(
+            rem_df,
+            out_path=p3,
+            title=f"{animal_id_used} | Mean syllables remaining to end (pre vs post)",
+            legend=True,
+            legend_max_labels=mean_remaining_legend_max_labels,
+            show=show,
+        )
+        paths["mean_remaining_to_end"] = str(p3)
+
+    # Neighbors histograms (prev + next for each syllable)
+    neigh_paths: List[str] = []
+    if make_neighbors_hist:
+        neigh_dir = out_dir / "neighbors_histograms"
+        saved = plot_neighbors_hist_for_all_targets(
+            organized_df,
+            treatment_date=t_dt,
+            out_dir=neigh_dir,
+            targets=neighbors_targets,
+            include_treatment_day=include_treatment_day,
+            collapse_repeats=collapse_repeats,
+            ignore_labels=ignore_labels,
+            max_days_pre=max_days_pre,
+            max_days_post=max_days_post,
+            top_k=neighbors_top_k,
+        )
+        neigh_paths = [str(p) for p in saved]
+        paths["neighbors_hist_dir"] = str(neigh_dir)
+
+    # Variance-tier boxplots
+    var_res: Optional[Dict[str, object]] = None
+    if make_variance_tiers:
+        if variance_path is None:
+            raise ValueError("make_variance_tiers=True requires variance_path=...")
+
+        var_res = plot_Ha_boxplots_by_variance_tier(
+            ha_df,
+            variance_path=variance_path,
+            animal_id=animal_id_used,
+            out_dir=out_dir / "variance_tiers",
+            top_frac=variance_top_frac,
+            use_pre_only=variance_use_pre_only,
+            variance_sheet_name=variance_sheet_name,
+            variance_agg=variance_agg,
+            min_rows_per_syllable=variance_min_rows_per_syllable,
+            title_prefix="Variance tier",
+            show=show,
+            max_days_pre=max_days_pre,
+            max_days_post=max_days_post,
+            min_transitions=min_transitions,
+        )
+        paths["variance_tiers_dir"] = str(out_dir / "variance_tiers")
+
+    # Save data tables
+    ha_csv = out_dir / "Ha_pre_post_by_syllable.csv"
+    ha_df.to_csv(ha_csv, index=False)
+    paths["Ha_table_csv"] = str(ha_csv)
+
+    if rem_df is not None and isinstance(rem_df, pd.DataFrame) and not rem_df.empty:
+        rem_csv = out_dir / "mean_remaining_to_end_pre_post.csv"
+        rem_df.to_csv(rem_csv, index=False)
+        paths["mean_remaining_table_csv"] = str(rem_csv)
+
+    return {
+        "animal_id": animal_id_used,
+        "treatment_date": str(pd.to_datetime(t_dt).date()),
+        "treatment_date_source": t_src,
+        "out_dir": str(out_dir),
+        "paths": paths,
+        "ha_df": ha_df,
+        "rem_df": rem_df,
+        "pre_TE": pre_TE,
+        "post_TE": post_TE,
+        "variance_tiers": var_res,
+        "neighbors_hist_paths": neigh_paths,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CLI
+# ──────────────────────────────────────────────────────────────────────────────
+def _build_arg_parser():
+    import argparse
+
+    p = argparse.ArgumentParser(description="Compute per-syllable transition entropy H_a (pre vs post).")
+    p.add_argument("--decoded", required=True, help="Path to *_decoded_database.json")
+    p.add_argument("--detect", required=True, help="Path to *_song_detection.json")
+
+    p.add_argument("--metadata-xlsx", default=None, help="Excel file with treatment dates (optional if --treatment-date given)")
+    p.add_argument("--metadata-sheet", default=None, help="Sheet name in metadata-xlsx (optional)")
+
+    p.add_argument("--treatment-date", default=None, help="Treatment date override (YYYY-MM-DD). If omitted, uses metadata-xlsx lookup.")
+    p.add_argument("--animal-id", default=None, help="Animal ID override for metadata lookup")
+
+    p.add_argument("--out-dir", default=None, help="Output directory (default: sibling 'entropy_by_syllable_outputs')")
+
+    p.add_argument("--include-treatment-day", action="store_true", help="Include treatment day in both pre and post")
+    p.add_argument("--no-collapse-repeats", action="store_true", help="Do NOT collapse consecutive repeats")
+    p.add_argument("--ignore-label", action="append", default=None, help="Label(s) to ignore; can be passed multiple times")
+    p.add_argument("--log-base", type=float, default=2.0, help="Log base for entropy (default 2 -> bits)")
+    p.add_argument("--min-transitions", type=int, default=1, help="Minimum transitions for a syllable to be included")
+
+    p.add_argument("--max-days-pre", type=int, default=None, help="Limit to days in [t-max_days_pre, t) (or ≤t if include-treatment-day)")
+    p.add_argument("--max-days-post", type=int, default=None, help="Limit to days in (t, t+max_days_post] (or ≥t if include-treatment-day)")
+
+    p.add_argument("--no-neighbors", action="store_true", help="Do NOT make per-target neighbor histograms")
+    p.add_argument("--neighbors-top-k", type=int, default=12, help="Top K neighbors to show in histograms (default 12)")
+
+    p.add_argument("--no-remaining", action="store_true", help="Do NOT make mean remaining-to-end plot")
+    p.add_argument("--remaining-min-occ", type=int, default=10, help="Min occurrences per syllable for remaining-to-end plot")
+
+    p.add_argument("--variance-path", default=None, help="CSV/XLSX variance table (enables variance-tier plots)")
+    p.add_argument("--variance-sheet", default=None, help="Excel sheet name for variance table (optional)")
+    p.add_argument("--variance-top-frac", type=float, default=0.30, help="Top fraction by variance (default 0.30)")
+    p.add_argument("--variance-use-pre-only", action="store_true", help="Use DayRel<0 rows when available (default True).")
+    p.add_argument("--variance-use-all", action="store_true", help="Override: do NOT restrict to pre rows even if DayRel present.")
+    p.add_argument("--variance-agg", type=str, default="median", choices=["median", "mean"], help="How to summarize variance per syllable")
+    p.add_argument("--variance-min-rows", type=int, default=5, help="Min rows per syllable in variance table to be eligible")
+
+    p.add_argument("--show", action="store_true", help="Show figures interactively")
+    return p
+
+
+def main():
+    args = _build_arg_parser().parse_args()
+
+    make_variance = args.variance_path is not None
+    variance_use_pre_only = True
+    if args.variance_use_all:
+        variance_use_pre_only = False
+    elif args.variance_use_pre_only:
+        variance_use_pre_only = True
+
+    res = make_entropy_by_syllable_outputs(
+        decoded_database_json=args.decoded,
+        song_detection_json=args.detect,
+        metadata_xlsx=args.metadata_xlsx,
+        metadata_sheet_name=args.metadata_sheet,
+        treatment_date=args.treatment_date,
+        animal_id=args.animal_id,
+        out_dir=args.out_dir,
+
+        include_treatment_day=args.include_treatment_day,
+        collapse_repeats=not args.no_collapse_repeats,
+        ignore_labels=args.ignore_label,
+
+        log_base=args.log_base,
+        min_transitions=args.min_transitions,
+
+        max_days_pre=args.max_days_pre,
+        max_days_post=args.max_days_post,
+
+        make_neighbors_hist=not args.no_neighbors,
+        neighbors_top_k=args.neighbors_top_k,
+
+        make_mean_remaining_to_end=not args.no_remaining,
+        mean_remaining_min_occurrences=args.remaining_min_occ,
+
+        make_variance_tiers=make_variance,
+        variance_path=args.variance_path,
+        variance_sheet_name=args.variance_sheet,
+        variance_top_frac=args.variance_top_frac,
+        variance_use_pre_only=variance_use_pre_only,
+        variance_agg=args.variance_agg,
+        variance_min_rows_per_syllable=args.variance_min_rows,
+
+        show=args.show,
+    )
+
+    print(f"[entropy_by_syllable] Wrote outputs to: {res['out_dir']}")
+    for k, v in res.get("paths", {}).items():
+        print(f"  {k}: {v}")
+
+
+if __name__ == "__main__":
+    main()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1764,6 +2378,9 @@ importlib.reload(ebs)
 song_detection = Path("/Volumes/my_own_SSD/updated_AreaX_outputs/USA5288/USA5288_song_detection.json")
 decoded        = Path("/Volumes/my_own_SSD/updated_AreaX_outputs/USA5288/USA5288_decoded_database.json")
 metadata_xlsx  = Path("/Volumes/my_own_SSD/updated_AreaX_outputs/Area_X_lesion_metadata_with_hit_types.xlsx")
+
+# Example variance file (CSV or Excel)
+variance_table = Path("/Volumes/my_own_SSD/updated_AreaX_outputs/aggregate_variance_points_by_bird_and_syllable.csv")
 
 MAX_DAYS_PRE  = 40
 MAX_DAYS_POST = 40
@@ -1797,21 +2414,7 @@ organized_df = ebs.build_organized_from_merged_df(
     treatment_date=treatment_dt,
 ).organized_df
 
-print("Animal:", animal_id_used, "| Treatment:", treatment_dt.date(), "| source:", src)
-
-# 4) Compute TOTAL transition entropy TE (pre vs post), restricted to ±40 days
-TE_pre, TE_post = ebs.compute_pre_post_total_transition_entropy(
-    organized_df,
-    treatment_date=treatment_dt,
-    include_treatment_day=False,
-    collapse_repeats=True,
-    ignore_labels=["silence", "-"],
-    log_base=2.0,
-    max_days_pre=MAX_DAYS_PRE,
-    max_days_post=MAX_DAYS_POST,
-)
-
-# 5) ALL syllables H_a table (also restricted to ±40 days)
+# 4) H_a table (restricted to ±40 days)
 ha_df = ebs.compute_pre_post_Ha_all_syllables(
     organized_df,
     treatment_date=treatment_dt,
@@ -1824,70 +2427,53 @@ ha_df = ebs.compute_pre_post_Ha_all_syllables(
     max_days_post=MAX_DAYS_POST,
 )
 
-out_dir = Path("/Volumes/my_own_SSD/updated_AreaX_outputs/USA5288/entropy_extended")
-(out_dir / "Ha").mkdir(parents=True, exist_ok=True)
+out_dir = Path("/Volumes/my_own_SSD/updated_AreaX_outputs/USA5288/entropy_new_outputs")
+out_dir.mkdir(parents=True, exist_ok=True)
 
-title = (
-    f"{animal_id_used} | Hₐ pre vs post (colored by syllable)"
-    f" | TE_pre={TE_pre.total_entropy:.2f} (n={TE_pre.n_total_transitions})"
-    f" | TE_post={TE_post.total_entropy:.2f} (n={TE_post.n_total_transitions})"
-    f" | treat={treatment_dt.date()}"
+# 5) Mean remaining-to-end plot (WITH legend)
+rem_df = ebs.compute_mean_remaining_to_end_pre_post(
+    organized_df,
+    treatment_date=treatment_dt,
+    include_treatment_day=False,
+    collapse_repeats=True,
+    ignore_labels=["silence", "-"],
+    max_days_pre=MAX_DAYS_PRE,
+    max_days_post=MAX_DAYS_POST,
+    min_occurrences=10,
+)
+ebs.plot_mean_remaining_to_end_pre_post(
+    rem_df,
+    out_path=out_dir / "mean_remaining_to_end_pre_vs_post.png",
+    title=f"{animal_id_used} | Mean syllables remaining to end (pre vs post) | treat={treatment_dt.date()}",
+    legend=True,
+    legend_max_labels=60,
 )
 
-stats2 = ebs.plot_Ha_boxplot_pre_post_by_label(
+# 6) Batch neighbor histograms (prev + next) for all targets
+ebs.plot_neighbors_hist_for_all_targets(
+    organized_df,
+    treatment_date=treatment_dt,
+    out_dir=out_dir / "neighbors_histograms",
+    ignore_labels=["silence", "-"],
+    max_days_pre=MAX_DAYS_PRE,
+    max_days_post=MAX_DAYS_POST,
+    top_k=12,
+)
+
+# 7) Variance-tier entropy plots (top 30% variance vs rest)
+res_var = ebs.plot_Ha_boxplots_by_variance_tier(
     ha_df,
-    out_path=out_dir / "Ha" / "Ha_all_syllables__boxplot_by_label__with_usage.png",
-    title=title,
-    connect_pairs=True,
-    annotate_stats=True,
-    legend_fontsize=7,
-    legend_ncol=2,
-    show_usage_panel=True,
-    usage_log_scale=True,
+    variance_path=variance_table,
+    animal_id=animal_id_used,
+    out_dir=out_dir / "variance_tiers",
+    top_frac=0.30,
+    use_pre_only=True,           # uses DayRel<0 if present
+    variance_agg="median",
+    min_rows_per_syllable=5,
+    title_prefix="Entropy vs variance tier",
     max_days_pre=MAX_DAYS_PRE,
     max_days_post=MAX_DAYS_POST,
     min_transitions=MIN_TRANSITIONS,
-    wrap_title_parts_per_line=2,
 )
-print("Stats:", stats2)
-
-ha_df.to_csv(out_dir / "Ha_all_syllables_pre_post.csv", index=False)
-
-# 6) NEW: Context histograms (one per syllable)
-ctx_dir = out_dir / "context_hists"
-paths = ebs.plot_context_histograms_all_syllables(
-    organized_df,
-    treatment_date=treatment_dt,
-    out_dir=ctx_dir,
-    include_treatment_day=False,
-    collapse_repeats=True,
-    ignore_labels=["silence", "-"],
-    max_days_pre=MAX_DAYS_PRE,
-    max_days_post=MAX_DAYS_POST,
-    top_k=10,
-    normalize=True,
-)
-print("Saved context histograms:", len(paths))
-
-# 7) NEW: Mean remaining-to-end metric
-remain_df = ebs.compute_pre_post_mean_remaining_to_end(
-    organized_df,
-    treatment_date=treatment_dt,
-    include_treatment_day=False,
-    collapse_repeats=True,
-    ignore_labels=["silence", "-"],
-    max_days_pre=MAX_DAYS_PRE,
-    max_days_post=MAX_DAYS_POST,
-    min_occurrences=10,
-)
-remain_df.to_csv(out_dir / "mean_remaining_to_end_pre_post.csv", index=False)
-
-ebs.plot_mean_remaining_to_end_pre_post_by_label(
-    remain_df,
-    out_path=out_dir / "mean_remaining_to_end__pre_vs_post.png",
-    title=f"{animal_id_used} | mean remaining syllables to end",
-    max_days_pre=MAX_DAYS_PRE,
-    max_days_post=MAX_DAYS_POST,
-    min_occurrences=10,
-)
+print(res_var)
 """
