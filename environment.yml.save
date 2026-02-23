@@ -1,0 +1,44 @@
+O
+X
+name: syntax_analysis
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+
+  # Core scientific stack
+  - numpy
+  - pandas
+  - scipy
+  - scikit-learn
+  - statsmodels
+
+  # Plotting / viz
+  - matplotlib
+  - seaborn
+  - plotly
+  - kaleido
+
+  # Notebooks
+  - jupyterlab
+  - notebook
+  - ipykernel
+
+  # IDE
+  - spyder
+  - spyder-kernels
+
+  # Utilities
+  - tqdm
+  - joblib
+  - pyyaml
+  - openpyxl
+
+  # Audio/signal helpers (useful for birdsong)
+  - librosa
+  - soundfile
+  - numba
+  - h5py
+  - scikit-image
+  - networkx
