@@ -73,6 +73,14 @@ import matplotlib.pyplot as plt
 # scikit-learn for KNN distances
 from sklearn.neighbors import NearestNeighbors
 
+# Optional SciPy for stats on boxplots
+try:
+    from scipy import stats as _scipy_stats  # type: ignore
+    _HAVE_SCIPY = True
+except Exception:
+    _HAVE_SCIPY = False
+
+
 
 # -----------------------------
 # Config
@@ -84,9 +92,6 @@ class PrePostConfig:
     metadata_sheet: str
 
     out_dir: Optional[Path] = None
-    stats_csv: Optional[Path] = None  # optional existing combined CSV to use/extend
-    hit_type_col: Optional[str] = None  # optional override for hit type column in metadata sheet
-    treatment_date_col: Optional[str] = None  # optional override for treatment date column in metadata sheet
     recursive: bool = False
 
     array_key: str = "predictions"
@@ -263,123 +268,134 @@ def _map_hit_type_to_group(hit_type: str) -> str:
     return str(hit_type)
 
 
-def _find_column(
-    df: pd.DataFrame,
-    *,
-    preferred: List[str],
-    contains_all: Optional[List[str]] = None,
-    contains_any: Optional[List[str]] = None,
-) -> Optional[str]:
-    cols = list(df.columns)
-    norm = {c: str(c).strip().lower().replace("_", " ") for c in cols}
-
-    for pref in preferred:
-        p = pref.strip().lower().replace("_", " ")
-        for c, n in norm.items():
-            if n == p:
-                return c
-
-    if contains_all:
-        keys = [k.lower() for k in contains_all]
-        for c, n in norm.items():
-            if all(k in n for k in keys):
-                return c
-
-    if contains_any:
-        keys = [k.lower() for k in contains_any]
-        for c, n in norm.items():
-            if any(k in n for k in keys):
-                return c
-
-    return None
-
-
-def build_animal_metadata_map(metadata_xlsx: Path, metadata_sheet: str, *, verbose: bool = False,
-                             hit_type_col: Optional[str] = None, treatment_date_col: Optional[str] = None
-                             ) -> Dict[str, Dict[str, Any]]:
-    """Load animal_id -> metadata dict.
-
-    Returns dict values with keys:
-      animal_id, treatment_date (datetime or None), hit_type, hit_type_norm, group
+def build_animal_metadata_map(metadata_xlsx: Path, metadata_sheet: str, *, verbose: bool = False) -> Dict[str, Dict[str, Any]]:
     """
-    metadata_xlsx = Path(metadata_xlsx)
+    Returns {animal_id: {"treatment_date": datetime|None, "hit_type": str|None, "group": str}}
+    """
+    xlsx = Path(metadata_xlsx)
+    if not xlsx.exists():
+        raise FileNotFoundError(f"metadata_xlsx not found: {xlsx}")
 
-    df_main = pd.read_excel(metadata_xlsx, sheet_name=metadata_sheet)
+    # read the requested sheet (usually hit type summary)
+    df_main = pd.read_excel(xlsx, sheet_name=metadata_sheet)
 
-    animal_col = _find_column(df_main, preferred=["Animal ID", "animal_id"], contains_any=["animal id", "animal"])
+    # try to find animal id col
+    animal_col = None
+    for c in df_main.columns:
+        if str(c).strip().lower() in ("animal id", "animal_id", "animalid", "bird", "bird id"):
+            animal_col = c
+            break
     if animal_col is None:
-        raise ValueError(f"Could not find Animal ID column in sheet '{metadata_sheet}'.")
+        # fallback: first col
+        animal_col = df_main.columns[0]
 
-    # Treatment date column (may be absent)
-    treat_col = treatment_date_col or _find_column(df_main, preferred=["Treatment date", "treatment_date"], contains_all=["treatment", "date"])
+    # hit type column (prefer 'Lesion hit type' over e.g. 'Medial Area X hit type')
+    hit_col = None
+    cols = list(df_main.columns)
 
-    # Hit type: strongly prefer Lesion hit type
-    if hit_type_col is not None:
-        hit_col = hit_type_col
-    else:
-        hit_col = _find_column(df_main, preferred=["Lesion hit type", "lesion_hit_type"], contains_all=["lesion", "hit", "type"])
-        if hit_col is None:
-            hit_col = _find_column(df_main, preferred=[], contains_all=["hit", "type"])
+    def _cl(x: object) -> str:
+        return str(x).strip().lower()
 
-    # If no treatment date column, fall back to 'metadata' sheet
+    # 1) exact match(s)
+    for c in cols:
+        if _cl(c) == "lesion hit type":
+            hit_col = c
+            break
+
+    # 2) contains both 'lesion' and 'hit type'
+    if hit_col is None:
+        for c in cols:
+            cl = _cl(c)
+            if ("lesion" in cl) and ("hit type" in cl):
+                hit_col = c
+                break
+
+    # 3) any 'hit type' column, but avoid 'medial' if possible
+    if hit_col is None:
+        candidates = [c for c in cols if "hit type" in _cl(c)]
+        if candidates:
+            non_medial = [c for c in candidates if "medial" not in _cl(c)]
+            hit_col = (non_medial[0] if non_medial else candidates[0])
+
+    if verbose:
+        print(f"[meta] hit_type column: {hit_col!r}")
+
+    # treatment date might be present here, but often it's in "metadata"
+    treat_col = None
+    for c in df_main.columns:
+        if "treatment date" in str(c).lower():
+            treat_col = c
+            break
+
+    # always also try metadata sheet for treatment dates (more reliable)
     df_meta = None
-    animal_col_meta = None
-    treat_col_meta = None
-    if treat_col is None:
-        try:
-            df_meta = pd.read_excel(metadata_xlsx, sheet_name="metadata")
-            animal_col_meta = _find_column(df_meta, preferred=["Animal ID", "animal_id"], contains_any=["animal id", "animal"])
-            treat_col_meta = _find_column(df_meta, preferred=["Treatment date", "treatment_date"], contains_all=["treatment", "date"])
-        except Exception:
-            df_meta = None
+    try:
+        df_meta = pd.read_excel(xlsx, sheet_name="metadata")
+    except Exception:
+        df_meta = None
+
+    meta_animal_col = None
+    meta_treat_col = None
+    if df_meta is not None:
+        for c in df_meta.columns:
+            if str(c).strip().lower() in ("animal id", "animal_id", "animalid", "bird", "bird id"):
+                meta_animal_col = c
+                break
+        for c in df_meta.columns:
+            if "treatment date" in str(c).lower():
+                meta_treat_col = c
+                break
 
     out: Dict[str, Dict[str, Any]] = {}
 
+    if verbose:
+        print(f"[meta] metadata_sheet={metadata_sheet!r}  animal_id_col={animal_col!r}  hit_type_col={hit_col!r}")
+        print(f"[meta] metadata sheet 'metadata'  animal_id_col={meta_animal_col!r}  treatment_date_col={meta_treat_col!r}")
+
+    # build hit type mapping from df_main
     for _, row in df_main.iterrows():
-        animal = str(row.get(animal_col, "")).strip()
-        if not animal:
+        aid = str(row.get(animal_col, "")).strip()
+        if not aid:
             continue
 
-        td = _treatment_dt_from_any(row.get(treat_col)) if treat_col is not None else None
-
-        hit = row.get(hit_col) if hit_col is not None else None
-        # Guard: if we picked a generic column with values like 'bilateral', prefer a lesion hit type if present
+        hit = None
         if hit_col is not None:
-            s = str(hit).strip().lower() if hit is not None else ""
-            if s in {"bilateral", "unilateral", "unknown", "nan", ""}:
-                better = _find_column(df_main, preferred=["Lesion hit type", "lesion_hit_type"], contains_all=["lesion", "hit", "type"])
-                if better is not None:
-                    hit = row.get(better, hit)
-                    hit_col = better
+            hit = row.get(hit_col, None)
 
-        hit_type = str(hit) if hit is not None and str(hit).strip() != "" else None
-        hit_norm = _normalize_hit_type(hit_type) if hit_type is not None else None
-        group = _map_hit_type_to_group(hit_norm) if hit_norm is not None else "unknown"
+        td = None
+        if treat_col is not None:
+            td = row.get(treat_col, None)
 
-        out[animal] = {
-            "animal_id": animal,
-            "treatment_date": td,
-            "hit_type": hit_type,
-            "hit_type_norm": hit_norm,
-            "group": group,
+        out[aid] = {
+            "hit_type": None if (hit is None or (isinstance(hit, float) and np.isnan(hit))) else str(hit),
+            "treatment_date": _treatment_dt_from_any(td),
         }
 
-    if df_meta is not None and animal_col_meta is not None and treat_col_meta is not None:
-        for _, row in df_meta.iterrows():
-            animal = str(row.get(animal_col_meta, "")).strip()
-            if not animal:
+    # overlay treatment dates from metadata sheet if missing
+    if df_meta is not None and meta_animal_col is not None and meta_treat_col is not None:
+        # take first non-null per animal (metadata has multiple rows per animal)
+        for aid, sub in df_meta.groupby(df_meta[meta_animal_col].astype(str).str.strip()):
+            if not aid:
                 continue
-            td = _treatment_dt_from_any(row.get(treat_col_meta))
-            if animal not in out:
-                out[animal] = {"animal_id": animal}
-            if out[animal].get("treatment_date") is None:
-                out[animal]["treatment_date"] = td
+            td_series = sub[meta_treat_col].dropna()
+            td_val = td_series.iloc[0] if len(td_series) else None
+            td_dt = _treatment_dt_from_any(td_val)
+            if aid not in out:
+                out[aid] = {"hit_type": None, "treatment_date": td_dt}
+            else:
+                if out[aid].get("treatment_date") is None and td_dt is not None:
+                    out[aid]["treatment_date"] = td_dt
 
-    if verbose:
-        n_td = sum(1 for v in out.values() if v.get("treatment_date") is not None)
-        print(f"[meta] loaded {len(out)} animals; treatment dates available for {n_td}")
+    # add group label
+    for aid, meta in out.items():
+        meta["group"] = _map_hit_type_to_group(meta.get("hit_type", None))
+
     return out
 
+
+# -----------------------------
+# Intrinsic dimension (Levina–Bickel)
+# -----------------------------
 def levina_bickel_id(
     X: np.ndarray,
     *,
@@ -443,37 +459,12 @@ def _choose_defaults(computer_power: str) -> Dict[str, Any]:
 
 
 def _find_npz_files(root_dir: Path, recursive: bool) -> List[Path]:
-    """Find candidate bird-level NPZ files.
+    pat = "**/*.npz" if recursive else "*.npz"
+    files = [p for p in root_dir.glob(pat) if p.is_file()]
+    # ignore small segment npzs if user points at a directory with both (optional)
+    # keep only "top-level bird npz" where filename equals folder name or starts with USA
+    return sorted(files)
 
-    Heuristics:
-      - Prefer files named like 'USA####.npz'
-      - Prefer when file stem matches its parent directory name
-      - Skip obvious per-segment NPZs (contain '_segment_')
-    """
-    root_dir = Path(root_dir)
-    paths = list(root_dir.rglob("*.npz")) if recursive else list(root_dir.glob("*.npz"))
-
-    out: List[Path] = []
-    for p in paths:
-        name = p.name.lower()
-        if "_segment_" in name or "segment_" in name:
-            continue
-
-        stem = p.stem
-        parent = p.parent.name
-
-        if re.fullmatch(r"USA\d+", stem):
-            out.append(p)
-            continue
-
-        if stem == parent and len(stem) >= 3:
-            out.append(p)
-            continue
-
-    if not out:
-        out = [p for p in paths if "_segment_" not in p.name.lower()]
-
-    return sorted(set(out))
 
 def _load_npz_keys(npz_path: Path, keys: Iterable[str]) -> Dict[str, Any]:
     d = np.load(npz_path, allow_pickle=True)
@@ -744,319 +735,347 @@ def _scatter_pre_post_by_group(df: pd.DataFrame, out_png: Path, title: str) -> N
     plt.close(fig)
 
 
-def _box_delta_by_group(df: pd.DataFrame, out_png: Path, title: str) -> None:
+def _p_to_stars(p: float) -> str:
+    if not np.isfinite(p):
+        return "n/a"
+    if p < 1e-3:
+        return "***"
+    if p < 1e-2:
+        return "**"
+    if p < 5e-2:
+        return "*"
+    return "n.s."
+
+
+def _holm_adjust(pvals: List[float]) -> List[float]:
+    """Holm–Bonferroni adjusted p-values (strong FWER control)."""
+    m = len(pvals)
+    if m == 0:
+        return []
+    order = np.argsort(pvals)
+    adj = np.empty(m, dtype=float)
+    running_max = 0.0
+    for rank, idx in enumerate(order):
+        p = float(pvals[idx])
+        factor = (m - rank)
+        p_adj = min(1.0, p * factor)
+        running_max = max(running_max, p_adj)  # ensure monotone
+        adj[idx] = running_max
+    return [float(x) for x in adj]
+
+
+def _rank_biserial_from_u(u: float, n1: int, n2: int) -> float:
+    """Rank-biserial correlation from Mann–Whitney U (range [-1, 1])."""
+    if n1 <= 0 or n2 <= 0:
+        return float("nan")
+    return float(1.0 - (2.0 * u) / (n1 * n2))
+
+
+def _annotate_sig(ax: plt.Axes, x1: float, x2: float, y: float, h: float, text: str) -> None:
+    """Draw a bracket between x1 and x2 at height y, with label text."""
+    ax.plot([x1, x1, x2, x2], [y, y + h, y + h, y], linewidth=1)
+    ax.text((x1 + x2) / 2.0, y + h, text, ha="center", va="bottom", fontsize=9)
+
+
+def _box_delta_by_group(
+    df: pd.DataFrame,
+    out_png: Path,
+    title: str,
+    out_stats_txt: Optional[Path] = None,
+    alpha: float = 0.05,
+    correction: str = "holm",
+) -> None:
+    """
+    Boxplot of per-cluster Δ(post-pre) split by lesion-hit-type group, plus stats.
+
+    Stats computed on the same values that appear in the boxplot (cluster-level):
+      - Omnibus: Kruskal–Wallis (if >=2 groups with n>=2)
+      - Pairwise: Mann–Whitney U, Holm-corrected by default (or Bonferroni)
+
+    Also writes a sensitivity analysis collapsing to per-bird mean Δ (bird-level),
+    because per-cluster rows are not strictly independent within bird.
+    """
     fig, ax = plt.subplots(1, 1, figsize=(10, 5))
     ax.set_title(title)
     ax.set_ylabel("Δ intrinsic dimension (post − pre)")
     ax.grid(True, axis="y", alpha=0.3)
 
-    data = []
-    labels = []
+    data: List[np.ndarray] = []
+    labels: List[str] = []
+    grp_vals: Dict[str, np.ndarray] = {}
+
     for grp in _GROUP_ORDER:
         sub = df[df["group"] == grp]
-        if len(sub) == 0:
-            data.append([])
+        vals = sub["delta_dim"].to_numpy(dtype=float) if len(sub) else np.array([], dtype=float)
+        vals = vals[np.isfinite(vals)]
+        grp_vals[grp] = vals
+        data.append(vals)
+        labels.append(f"{grp}\n(n={len(vals)})")
+
+    stats_lines: List[str] = []
+    stats_lines.append(f"{title}")
+    stats_lines.append(f"Generated: {_dt.datetime.now().isoformat(timespec='seconds')}")
+    stats_lines.append("")
+    stats_lines.append("=== Cluster-level (matches boxplot) ===")
+    for grp in _GROUP_ORDER:
+        v = grp_vals[grp]
+        if len(v) == 0:
+            stats_lines.append(f"{grp}: n=0")
         else:
-            data.append(sub["delta_dim"].values)
-        labels.append(f"{grp}\n(n={len(sub)})")
+            stats_lines.append(f"{grp}: n={len(v)}  mean={float(np.mean(v)):.6g}  median={float(np.median(v)):.6g}")
 
     if all(len(x) == 0 for x in data):
         ax.text(0.5, 0.5, "No valid cluster estimates to plot.", ha="center", va="center", transform=ax.transAxes)
+        if out_stats_txt is not None:
+            out_stats_txt.write_text("\n".join(stats_lines) + "\n\n(No data)\n")
+        fig.tight_layout()
+        fig.savefig(out_png, dpi=200)
+        plt.close(fig)
+        return
+
+    bp = ax.boxplot(data, tick_labels=labels, patch_artist=True)
+    ax.axhline(0, linestyle="--", linewidth=1)
+
+    # --- stats + annotations (cluster-level) ---
+    if not _HAVE_SCIPY:
+        stats_lines.append("")
+        stats_lines.append("SciPy not available: skipping significance tests.")
     else:
-        bp = ax.boxplot(data, labels=labels, patch_artist=True)
-        ax.axhline(0, linestyle="--", linewidth=1)
+        # valid groups for tests: require >=2 points
+        valid = [(i, grp, v) for i, (grp, v) in enumerate(grp_vals.items(), start=1) if len(v) >= 2]
+        if len(valid) < 2:
+            stats_lines.append("")
+            stats_lines.append("Not enough data for tests (need >=2 groups with n>=2).")
+        else:
+            # omnibus
+            try:
+                H, p_omni = _scipy_stats.kruskal(*[v for _, _, v in valid])
+                stats_lines.append("")
+                stats_lines.append(f"Kruskal–Wallis across groups: H={float(H):.6g}, p={float(p_omni):.6g}")
+            except Exception as e:
+                stats_lines.append("")
+                stats_lines.append(f"Kruskal–Wallis failed: {e}")
+
+            # pairwise MWU
+            from itertools import combinations
+            pairs = list(combinations(valid, 2))
+            raw_ps: List[float] = []
+            results = []
+            for (i1, g1, v1), (i2, g2, v2) in pairs:
+                try:
+                    mwu = _scipy_stats.mannwhitneyu(v1, v2, alternative="two-sided")
+                    p = float(mwu.pvalue)
+                    u = float(mwu.statistic)
+                    rbc = _rank_biserial_from_u(u, len(v1), len(v2))
+                except Exception:
+                    p = float("nan")
+                    u = float("nan")
+                    rbc = float("nan")
+                raw_ps.append(p)
+                results.append((i1, g1, len(v1), i2, g2, len(v2), u, p, rbc))
+
+            # multiple-comparisons correction
+            m = len(raw_ps)
+            if correction.lower().startswith("bonf"):
+                adj_ps = [min(1.0, (p * m)) if np.isfinite(p) else float("nan") for p in raw_ps]
+                corr_name = "Bonferroni"
+            else:
+                # default Holm
+                adj_ps = _holm_adjust([p if np.isfinite(p) else 1.0 for p in raw_ps])
+                # restore NaNs where appropriate
+                adj_ps = [float("nan") if not np.isfinite(p) else float(a) for p, a in zip(raw_ps, adj_ps)]
+                corr_name = "Holm"
+
+            stats_lines.append("")
+            stats_lines.append(f"Pairwise Mann–Whitney U (two-sided), {corr_name}-corrected:")
+            for (i1, g1, n1, i2, g2, n2, u, p, rbc), p_adj in zip(results, adj_ps):
+                stats_lines.append(
+                    f"  {g1} (n={n1}) vs {g2} (n={n2}): U={u:.6g}, p={p:.6g}, p_adj={p_adj:.6g}, rank-biserial={rbc:.4f}"
+                )
+
+            # annotate on plot (only the 3 comparisons max, so it stays readable)
+            # Use corrected p-values for stars.
+            # Determine y-scale
+            all_vals = np.concatenate([x for x in data if len(x)], axis=0)
+            y_max = float(np.nanmax(all_vals))
+            y_min = float(np.nanmin(all_vals))
+            y_rng = y_max - y_min
+            if not np.isfinite(y_rng) or y_rng <= 0:
+                y_rng = 1.0
+            base = y_max + 0.05 * y_rng
+            step = 0.08 * y_rng
+            h = 0.02 * y_rng
+
+            # bracket order: sham-vs-visible, sham-vs-combined, visible-vs-combined (in x positions 1,2,3)
+            # Only annotate if both groups had n>=2 and p_adj is finite.
+            for k, ((i1, g1, n1, i2, g2, n2, u, p, rbc), p_adj) in enumerate(zip(results, adj_ps)):
+                if not np.isfinite(p_adj):
+                    continue
+                label = f"{_p_to_stars(p_adj)} (p={p_adj:.3g})" if p_adj < 0.1 else f"{_p_to_stars(p_adj)}"
+                _annotate_sig(ax, i1, i2, base + k * step, h, label)
+
+            ax.set_ylim(top=base + max(1, len(results)) * step + 0.1 * y_rng)
+
+    # --- sensitivity analysis: bird-level collapsed ---
+    stats_lines.append("")
+    stats_lines.append("=== Bird-level sensitivity (mean Δ per bird) ===")
+    if "animal_id" in df.columns:
+        df_b = df.copy()
+        df_b = df_b[np.isfinite(df_b["delta_dim"].to_numpy(dtype=float))]
+        df_b = df_b.groupby(["animal_id", "group"], as_index=False)["delta_dim"].mean()
+
+        grp_vals_b: Dict[str, np.ndarray] = {}
+        for grp in _GROUP_ORDER:
+            v = df_b.loc[df_b["group"] == grp, "delta_dim"].to_numpy(dtype=float)
+            v = v[np.isfinite(v)]
+            grp_vals_b[grp] = v
+            if len(v) == 0:
+                stats_lines.append(f"{grp}: n_birds=0")
+            else:
+                stats_lines.append(f"{grp}: n_birds={len(v)}  mean={float(np.mean(v)):.6g}  median={float(np.median(v)):.6g}")
+
+        if _HAVE_SCIPY:
+            valid_b = [(grp, v) for grp, v in grp_vals_b.items() if len(v) >= 2]
+            if len(valid_b) >= 2:
+                try:
+                    H, p_omni = _scipy_stats.kruskal(*[v for _, v in valid_b])
+                    stats_lines.append(f"Kruskal–Wallis (bird-level): H={float(H):.6g}, p={float(p_omni):.6g}")
+                except Exception as e:
+                    stats_lines.append(f"Kruskal–Wallis (bird-level) failed: {e}")
+
+                from itertools import combinations
+                pairs_b = list(combinations(valid_b, 2))
+                raw_ps_b = []
+                for (g1, v1), (g2, v2) in pairs_b:
+                    try:
+                        mwu = _scipy_stats.mannwhitneyu(v1, v2, alternative="two-sided")
+                        raw_ps_b.append(float(mwu.pvalue))
+                    except Exception:
+                        raw_ps_b.append(float("nan"))
+
+                if correction.lower().startswith("bonf"):
+                    adj_b = [min(1.0, p * len(raw_ps_b)) if np.isfinite(p) else float("nan") for p in raw_ps_b]
+                    corr_name_b = "Bonferroni"
+                else:
+                    adj_tmp = _holm_adjust([p if np.isfinite(p) else 1.0 for p in raw_ps_b])
+                    adj_b = [float("nan") if not np.isfinite(p) else float(a) for p, a in zip(raw_ps_b, adj_tmp)]
+                    corr_name_b = "Holm"
+
+                stats_lines.append(f"Pairwise MWU (bird-level), {corr_name_b}-corrected:")
+                for ((g1, v1), (g2, v2)), p, p_adj in zip(pairs_b, raw_ps_b, adj_b):
+                    stats_lines.append(f"  {g1} (n={len(v1)}) vs {g2} (n={len(v2)}): p={p:.6g}, p_adj={p_adj:.6g}")
+            else:
+                stats_lines.append("Not enough birds for tests (need >=2 groups with n_birds>=2).")
+        else:
+            stats_lines.append("SciPy not available: skipping bird-level tests.")
+    else:
+        stats_lines.append("No animal_id column found; cannot compute bird-level sensitivity.")
+
+    if out_stats_txt is not None:
+        out_stats_txt.write_text("\n".join(stats_lines) + "\n")
 
     fig.tight_layout()
     fig.savefig(out_png, dpi=200)
     plt.close(fig)
-
 
 # -----------------------------
 # Driver
 # -----------------------------
+def run_root_directory_pre_post_treatment(cfg: PrePostConfig) -> Dict[str, str]:
+    defaults = _choose_defaults(cfg.computer_power)
 
+    workers = cfg.workers if cfg.workers and cfg.workers > 0 else defaults["workers"]
+    n_jobs = cfg.n_jobs if cfg.n_jobs and cfg.n_jobs > 0 else defaults["n_jobs"]
+    cap = cfg.max_points_per_cluster_period if cfg.max_points_per_cluster_period is not None else defaults["cap"]
 
-def _safe_float_series(x: pd.Series) -> np.ndarray:
-    vals = pd.to_numeric(x, errors="coerce").to_numpy(dtype=float)
-    return vals[np.isfinite(vals)]
+    # avoid oversubscription: if multiple processes, reduce threads
+    if workers > 1 and n_jobs > 1:
+        n_jobs = max(1, int(math.floor(n_jobs / workers)))
 
-
-def _delta_stats_by_group(df: pd.DataFrame, out_txt: Path) -> None:
-    """Test Δ distributions across groups and write a summary text file."""
-    out_txt = Path(out_txt)
-
-    # Keep only rows with finite delta
-    d = df.copy()
-    d["delta_dim"] = pd.to_numeric(d.get("delta_dim"), errors="coerce")
-    d = d[np.isfinite(d["delta_dim"].to_numpy(dtype=float))]
-
-    groups = sorted(d["group"].dropna().unique().tolist())
-    gdata = {g: _safe_float_series(d.loc[d["group"] == g, "delta_dim"]) for g in groups}
-    gdata = {g: v for g, v in gdata.items() if v.size > 0}
-
-    lines: List[str] = []
-    k_val = int(d["k"].iloc[0]) if ("k" in d.columns and len(d)) else -1
-    lines.append(f"Delta intrinsic dimension (post - pre) stats (k={k_val})")
-    lines.append(f"Generated: {_dt.datetime.now().isoformat(timespec='seconds')}")
-    lines.append("")
-    for g, v in gdata.items():
-        lines.append(f"{g}: n={v.size}  mean={float(np.mean(v)):.4f}  median={float(np.median(v)):.4f}")
-    lines.append("")
-    try:
-        from scipy import stats as _scipy_stats  # type: ignore
-        have = True
-    except Exception:
-        have = False
-
-    if len(gdata) >= 2 and have:
-        H, p = _scipy_stats.kruskal(*[v for v in gdata.values()])
-        lines.append(f"Kruskal-Wallis across groups: H={H:.4f}, p={p:.6g}")
-        lines.append("")
-        keys = list(gdata.keys())
-        ps = []
-        pairs = []
-        for i in range(len(keys)):
-            for j in range(i + 1, len(keys)):
-                a, b = keys[i], keys[j]
-                U, p2 = _scipy_stats.mannwhitneyu(gdata[a], gdata[b], alternative='two-sided')
-                pairs.append((a, b, float(U), float(p2)))
-                ps.append(float(p2))
-        # Holm correction
-        ps = np.array(ps, dtype=float)
-        order = np.argsort(ps)
-        m = len(ps)
-        adj = np.empty_like(ps)
-        for rank, idx in enumerate(order):
-            adj[idx] = min(1.0, ps[idx] * (m - rank))
-        lines.append("Pairwise Mann–Whitney U (two-sided), Holm-adjusted p-values:")
-        for (a, b, U, p2), p_adj in zip(pairs, adj):
-            lines.append(f"  {a} vs {b}: U={U:.2f}, p={p2:.6g}, p_holm={p_adj:.6g}")
-    else:
-        lines.append("Not enough groups with data for statistical tests (or SciPy unavailable).")
-
-    out_txt.write_text("\n".join(lines))
-
-
-def _scatter_pre_post_colorcoded_by_group(df: pd.DataFrame, out_png: Path, *, title: str, k: int) -> None:
-    out_png = Path(out_png)
-    fig, ax = plt.subplots(figsize=(7, 7))
-    ax.set_title(title)
-    ax.set_xlabel("Pre dimension")
-    ax.set_ylabel("Post dimension")
-    ax.plot([0, 1], [0, 1], "--", linewidth=1)
-
-    groups = sorted(df["group"].dropna().unique().tolist())
-    any_points = False
-    for g in groups:
-        sub = df[df["group"] == g]
-        if len(sub) == 0:
-            continue
-        any_points = True
-        ax.scatter(sub["pre_dim"].to_numpy(float), sub["post_dim"].to_numpy(float), s=20, alpha=0.8, label=g)
-
-    if not any_points:
-        ax.text(0.5, 0.5, "No points", ha="center", va="center", fontsize=14)
-    else:
-        ax.legend(frameon=False, fontsize=9, loc="best")
-
-    fig.tight_layout()
-    fig.savefig(out_png, dpi=200)
-    plt.close(fig)
-
-
-def _make_plots_and_stats(df: pd.DataFrame, out_dir: Path, k: int) -> Dict[str, str]:
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # If group labels look wrong/missing, rebuild them from hit_type(_norm).
-    expected = {
-        "sham saline injection",
-        "Area X visible (single hit)",
-        "Combined (visible ML + not visible)",
-    }
-    if "group" not in df.columns:
-        df = df.copy()
-        df["group"] = "unknown"
-
-    present = set(df["group"].dropna().astype(str).unique().tolist())
-    if not (present & expected):
-        if "hit_type_norm" in df.columns:
-            df = df.copy()
-            df["group"] = df["hit_type_norm"].apply(lambda x: _map_hit_type_to_group(_normalize_hit_type(x) if pd.notna(x) else ""))
-        elif "hit_type" in df.columns:
-            df = df.copy()
-            df["group"] = df["hit_type"].apply(lambda x: _map_hit_type_to_group(_normalize_hit_type(x) if pd.notna(x) else ""))
-
-    plot_scatter = out_dir / f"pre_vs_post_scatter_by_hit_k{k}.png"
-    plot_delta = out_dir / f"delta_dim_by_hit_type_k{k}.png"
-    plot_scatter_color = out_dir / f"pre_vs_post_scatter_colorcoded_by_hit_type_k{k}.png"
-    stats_txt = out_dir / f"delta_dim_stats_by_hit_type_k{k}.txt"
-
-    _scatter_pre_post_by_group(df, plot_scatter, title=f"Pre vs Post intrinsic dimension by hit type (k={k})")
-    _box_delta_by_group(df, plot_delta, title=f"Δ intrinsic dimension (post − pre) by hit type (k={k})")
-    _scatter_pre_post_colorcoded_by_group(df, plot_scatter_color, title=f"Pre vs Post intrinsic dimension (color-coded by hit type) (k={k})", k=k)
-
-    try:
-        _delta_stats_by_group(df, stats_txt)
-    except Exception as e:
-        stats_txt.write_text(f"Failed to compute stats: {e}\n")
-
-    return {
-        "plot_scatter": str(plot_scatter),
-        "plot_delta": str(plot_delta),
-        "plot_scatter_color": str(plot_scatter_color),
-        "stats_txt": str(stats_txt),
-    }
-
-def run_root_directory_pre_post_treatment(cfg: PrePostConfig, *, force_recompute: bool = False, resume: bool = True) -> Dict[str, str]:
-    root_dir = Path(cfg.root_dir)
-    out_dir = Path(cfg.out_dir) if cfg.out_dir is not None else root_dir / f"lb_pre_post_dimensionality_k{cfg.k}"
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    combined_csv = Path(cfg.stats_csv) if cfg.stats_csv is not None else out_dir / f"lb_pre_post_cluster_dimensionality_k{cfg.k}.csv"
-
-    # Build metadata map
-    animal_meta = build_animal_metadata_map(
-        metadata_xlsx=Path(cfg.metadata_xlsx),
-        metadata_sheet=cfg.metadata_sheet,
-        verbose=cfg.verbose_dates,
-        hit_type_col=cfg.hit_type_col,
-        treatment_date_col=cfg.treatment_date_col,
-    )
-
-    # Find NPZs
-    npz_paths = _find_npz_files(root_dir, recursive=cfg.recursive)
-
-    existing_df: Optional[pd.DataFrame] = None
-    processed_npz: set[str] = set()
-    if combined_csv.exists() and not force_recompute:
-        try:
-            existing_df = pd.read_csv(combined_csv)
-            if "npz_path" in existing_df.columns:
-                processed_npz = set(existing_df["npz_path"].astype(str).unique().tolist())
-            print(f"[cache] found existing combined CSV: {combined_csv}  (rows={len(existing_df)})")
-
-            # Refresh hit_type/group columns from the metadata map (useful if an older CSV was generated
-            # with a different hit-type column, e.g., 'bilateral' instead of lesion hit type).
-            try:
-                if "animal_id" in existing_df.columns and len(animal_meta) > 0:
-                    meta_df = pd.DataFrame([{
-                        "animal_id": k,
-                        "hit_type_meta": v.get("hit_type"),
-                        "hit_type_norm_meta": v.get("hit_type_norm"),
-                        "group_meta": v.get("group"),
-                    } for k, v in animal_meta.items()])
-                    if len(meta_df) > 0:
-                        tmp = existing_df.merge(meta_df, on="animal_id", how="left")
-                        for col, mcol in [("hit_type", "hit_type_meta"), ("hit_type_norm", "hit_type_norm_meta"), ("group", "group_meta")]:
-                            if mcol in tmp.columns:
-                                if col in tmp.columns:
-                                    tmp[col] = tmp[mcol].where(tmp[mcol].notna() & (tmp[mcol].astype(str).str.len() > 0), tmp[col])
-                                else:
-                                    tmp[col] = tmp[mcol]
-                        existing_df = tmp.drop(columns=[c for c in ["hit_type_meta", "hit_type_norm_meta", "group_meta"] if c in tmp.columns])
-            except Exception:
-                pass
-        except Exception:
-            existing_df = None
-            processed_npz = set()
-
-    # If no NPZs (e.g., running on a machine without the data), but CSV exists, just plot.
-    if (not npz_paths) and (existing_df is not None):
-        plot_paths = _make_plots_and_stats(existing_df, out_dir, cfg.k)
-        plot_paths["results_csv"] = str(combined_csv)
-        plot_paths["out_dir"] = str(out_dir)
-        return plot_paths
-
-    # Determine compute list
-    if existing_df is not None and (not resume):
-        # Plot only
-        plot_paths = _make_plots_and_stats(existing_df, out_dir, cfg.k)
-        plot_paths["results_csv"] = str(combined_csv)
-        plot_paths["out_dir"] = str(out_dir)
-        return plot_paths
-
-    todo = []
-    for p in npz_paths:
-        if (not force_recompute) and (str(p) in processed_npz):
-            continue
-        todo.append(p)
-
-    # If nothing new to compute, plot existing
-    if existing_df is not None and (not todo):
-        plot_paths = _make_plots_and_stats(existing_df, out_dir, cfg.k)
-        plot_paths["results_csv"] = str(combined_csv)
-        plot_paths["out_dir"] = str(out_dir)
-        return plot_paths
-
-    # Decide workers/n_jobs/cap defaults
-    cfg_eff = cfg
-    workers = cfg.workers
-    n_jobs = cfg.n_jobs
-    cap = cfg.max_points_per_cluster_period
-
-    if cfg.computer_power.lower() == "pro":
-        if workers == 0:
-            workers = max(1, (os.cpu_count() or 8) // 2)
-        if n_jobs == 0:
-            n_jobs = max(1, (os.cpu_count() or 8) // 2)
-        if cap is None:
-            cap = 20000
-    else:
-        if workers == 0:
-            workers = 1
-        if n_jobs == 0:
-            n_jobs = 2
-        if cap is None:
-            cap = 15000
-
+    # update an effective cfg (dataclass is frozen, so recreate)
     cfg_eff = PrePostConfig(**{**cfg.__dict__, "workers": workers, "n_jobs": n_jobs, "max_points_per_cluster_period": cap})
 
-    print(f"[pre/post] NPZ files found: {len(npz_paths)}  (todo={len(todo)}, workers={workers}, n_jobs={n_jobs}, cap={cap})")
+    root_dir = cfg_eff.root_dir
+    out_dir = cfg_eff.out_dir if cfg_eff.out_dir is not None else (root_dir / f"lb_pre_post_dimensionality_k{cfg_eff.k}")
+    _safe_mkdir(out_dir)
 
-    all_rows: List[Dict[str, Any]] = []
-    if existing_df is not None and resume and not force_recompute:
-        all_rows.extend(existing_df.to_dict(orient="records"))
+    # locate NPZs
+    npz_files = _find_npz_files(root_dir, cfg_eff.recursive)
+    if len(npz_files) == 0:
+        print(f"[warn] No NPZ files found under: {root_dir}")
+    # load metadata
+    animal_meta = build_animal_metadata_map(cfg_eff.metadata_xlsx, cfg_eff.metadata_sheet, verbose=cfg_eff.verbose_dates)
+
+    # decide which NPZs to process
+    tasks: List[Tuple[Path, Dict[str, Any]]] = []
+    for p in npz_files:
+        aid = _infer_animal_id(p)
+        meta = animal_meta.get(aid, {"hit_type": None, "treatment_date": None, "group": "unknown"})
+        # if treatment date missing and no override, skip later in process_one_npz (but count here)
+        tasks.append((p, meta))
+
+    print(f"[pre/post] NPZ files found: {len(npz_files)}  (workers={cfg_eff.workers}, n_jobs={cfg_eff.n_jobs}, cap={cfg_eff.max_points_per_cluster_period})")
 
     t0 = time.time()
+    all_rows: List[Dict[str, Any]] = []
 
-    def _run_one(p: Path) -> List[Dict[str, Any]]:
-        animal_id = _infer_animal_id(p)
-        meta = animal_meta.get(animal_id, {"animal_id": animal_id, "treatment_date": None, "hit_type": None, "hit_type_norm": None, "group": "unknown"})
-        return process_one_npz(p, meta, cfg_eff)
-
-    if workers <= 1 or len(todo) <= 1:
-        for p in todo:
-            all_rows.extend(_run_one(p))
+    if cfg_eff.workers <= 1 or len(tasks) <= 1:
+        for p, meta in tasks:
+            all_rows.extend(process_one_npz(p, meta, cfg_eff))
     else:
-        import concurrent.futures as _fut
-        with _fut.ProcessPoolExecutor(max_workers=workers) as ex:
-            futs = {ex.submit(_run_one, p): p for p in todo}
-            for fu in _fut.as_completed(futs):
-                p = futs[fu]
+        # multiprocessing across NPZs
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+
+        # NOTE: cfg_eff must be picklable; dataclass is fine.
+        with ProcessPoolExecutor(max_workers=cfg_eff.workers) as ex:
+            futs = [ex.submit(process_one_npz, p, meta, cfg_eff) for p, meta in tasks]
+            for fut in as_completed(futs):
                 try:
-                    all_rows.extend(fu.result())
+                    rows = fut.result()
                 except Exception as e:
-                    print(f"[error] {p}: {e}")
+                    print("[error] worker failed:", repr(e))
+                    continue
+                all_rows.extend(rows)
 
+    total_dt = time.time() - t0
+    print(f"[pre/post] TOTAL time: {total_dt:.2f} s")
+
+    # write CSV
+    stamp = _now_stamp()
+    out_csv = out_dir / f"lb_pre_post_cluster_dimensionality_k{cfg_eff.k}_{stamp}.csv"
     df = pd.DataFrame(all_rows)
+    df.to_csv(out_csv, index=False)
+    print(f"Saved results CSV: {out_csv}")
+
+    # plots
+    plot_scatter = out_dir / f"pre_vs_post_scatter_by_hit_k{cfg_eff.k}_{stamp}.png"
+    plot_delta = out_dir / f"delta_dim_by_hit_type_k{cfg_eff.k}_{stamp}.png"
+    stats_txt = out_dir / f"delta_dim_by_hit_type_stats_k{cfg_eff.k}_{stamp}.txt"
+
     if len(df) == 0:
-        df = pd.DataFrame(columns=[
-            "animal_id", "hit_type", "hit_type_norm", "group", "npz_path",
-            "k", "cluster_label", "n_pre", "n_post", "pre_dim", "post_dim", "delta_dim",
-        ])
+        # make placeholder empties (helps pipeline)
+        _scatter_pre_post_by_group(df, plot_scatter, title=f"Pre vs Post intrinsic dimension by hit type (k={cfg_eff.k})")
+        _box_delta_by_group(df, plot_delta, title=f"Δ intrinsic dimension (post − pre) by hit type (k={cfg_eff.k})", out_stats_txt=stats_txt)
+        print(f"Saved plot (empty): {plot_delta}")
+        print(f"Saved plot (empty): {plot_scatter}")
+    else:
+        _scatter_pre_post_by_group(df, plot_scatter, title=f"Pre vs Post intrinsic dimension by hit type (k={cfg_eff.k})")
+        _box_delta_by_group(df, plot_delta, title=f"Δ intrinsic dimension (post − pre) by hit type (k={cfg_eff.k})", out_stats_txt=stats_txt)
+        print(f"Saved plot: {plot_delta}")
+        print(f"Saved plot: {plot_scatter}")
 
-    # Write ONE combined CSV
-    df.to_csv(combined_csv, index=False)
-    print(f"[pre/post] TOTAL time: {time.time() - t0:.2f} s")
-    print(f"Saved combined CSV: {combined_csv}")
+    return {
+        "results_csv": str(out_csv),
+        "plot_delta": str(plot_delta),
+        "plot_scatter": str(plot_scatter),
+        "delta_stats": str(stats_txt),
+        "out_dir": str(out_dir),
+    }
 
-    # Plots + stats
-    plot_paths = _make_plots_and_stats(df, out_dir, cfg.k)
-    plot_paths["results_csv"] = str(combined_csv)
-    plot_paths["out_dir"] = str(out_dir)
-    return plot_paths
 
+# -----------------------------
+# CLI
+# -----------------------------
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="Levina_Bickel_pre_vs_post_treatment.py",
@@ -1109,9 +1128,6 @@ def main() -> None:
         metadata_xlsx=Path(args.metadata_xlsx),
         metadata_sheet=args.metadata_sheet,
         out_dir=Path(args.out_dir) if args.out_dir else None,
-        stats_csv=Path(args.stats_csv) if args.stats_csv else None,
-        hit_type_col=args.hit_type_col,
-        treatment_date_col=args.treatment_date_col,
         recursive=bool(args.recursive),
 
         array_key=args.array_key,
@@ -1139,7 +1155,7 @@ def main() -> None:
         verbose_dates=bool(args.verbose_dates),
     )
 
-    paths = run_root_directory_pre_post_treatment(cfg, force_recompute=args.force_recompute, resume=(not args.no_resume))
+    paths = run_root_directory_pre_post_treatment(cfg)
     print("\nOutputs:")
     for k, v in paths.items():
         print(f"  {k}: {v}")
