@@ -1600,3 +1600,16 @@ paths = lb.run_root_directory_pre_post_analysis(
     metadata_sheet="metadata_with_hit_type",
 )
 print(paths)
+
+
+""" # example usage for copying + pasting into terminal
+
+python Levina_Bickel_pre_vs_post_treatment.py \
+  --root-dir "/Volumes/my_own_SSD/your_npz_root" \
+  --metadata-xlsx "/Volumes/my_own_SSD/updated_AreaX_outputs/Area_X_lesion_metadata_with_hit_types.xlsx" \
+  --metadata-sheet "metadata_with_hit_type" \
+  --recursive \
+  --computer-power studio \
+  --workers 6
+
+"""

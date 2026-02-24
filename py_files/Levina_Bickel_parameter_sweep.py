@@ -1,92 +1,66 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Levina_Bickel_parameter_sweep.py
+"""
+Levina_Bickel_parameter_sweep.py
 
-KNN parameter sweep for Levina–Bickel (LB) intrinsic dimension, per HDBSCAN cluster.
+
+Purpose
+-------
+Run Levina–Bickel (LB) intrinsic-dimension *kNN parameter sweeps* for HDBSCAN clusters
+inside .npz files.
 
 What this script does
 ---------------------
-For each NPZ under --root-dir:
-  - For each HDBSCAN cluster (optionally excluding noise):
-      - Compute LB intrinsic dimension estimates across a k range (k sweep).
-      - Save per-cluster CSV + PNG.
-  - Also compute an "aggregate curve" across clusters for that NPZ (mean ± std).
+For each NPZ:
+  • For each HDBSCAN cluster (optionally excluding noise):
+      - Compute LB m_hat(k) for k in [k_min..k_max] (LB requires k>=2 and k<=n-1)
+      - Save:
+          - per-cluster sweep CSV: k, m_hat, frac_valid
+          - per-cluster sweep PNG
+  • Aggregate across clusters:
+      - mean / std / median of m_hat(k) across clusters (for each k)
+      - Save aggregate curve CSV + PNG
 
-Speed: computer_power profiles
-------------------------------
-This script can tune parallelism with --computer-power:
-  - laptop: sequential across NPZ files; allow sklearn threading within the process.
-  - studio: parallelize across NPZ files using a ProcessPool; keep NN single-threaded per process.
-  - auto: chooses based on CPU count.
-
-Because sweeps can be *very* expensive for large clusters, you can optionally cap
-cluster size with --max-points-per-cluster (subsample without replacement) to
-get a fast, representative sweep.
+Inputs expected in each NPZ
+---------------------------
+Required keys:
+  - array_key (default "predictions"): (N, D)
+  - label_key (default "hdbscan_labels"): (N,)
 
 Dependencies
 ------------
-numpy, pandas, matplotlib, scikit-learn
+numpy, matplotlib, scikit-learn
 
+Usage (CLI)
+-----------
+python Levina_Bickel_parameter_sweep.py --root-dir /path/to/npzs --recursive \
+  --array-key predictions --label-key hdbscan_labels --out-dir /path/to/out \
+  --k-min 2 --k-max 30 --min-cluster-size 10
+
+Spyder usage is included at bottom (triple-quoted block).
 """
 
 from __future__ import annotations
 
 import argparse
-import os
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from datetime import datetime
+import time
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-# Safer for headless / multiprocessing runs
-import matplotlib
-matplotlib.use("Agg")
-
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from sklearn.neighbors import NearestNeighbors
 
-from concurrent.futures import ProcessPoolExecutor, as_completed
-
 
 # ============================================================
-# Compute profile (computer_power)
-# ============================================================
-@dataclass(frozen=True)
-class ComputeProfile:
-    name: str
-    max_workers: int
-    nn_jobs: int
-
-
-def _resolve_profile(computer_power: str = "auto", workers: Optional[int] = None) -> ComputeProfile:
-    cpu = int(os.cpu_count() or 8)
-    cp = (computer_power or "auto").strip().lower()
-
-    if cp == "auto":
-        cp = "laptop" if cpu <= 8 else "studio"
-
-    if cp not in {"laptop", "studio"}:
-        raise ValueError("computer_power must be one of: auto, laptop, studio")
-
-    if cp == "laptop":
-        max_workers = 1
-        nn_jobs = -1
-    else:
-        max_workers = min(max(2, cpu - 1), 6)
-        nn_jobs = 1
-
-    if workers is not None:
-        max_workers = max(1, int(workers))
-        if max_workers > 1:
-            nn_jobs = 1
-
-    return ComputeProfile(name=cp, max_workers=max_workers, nn_jobs=nn_jobs)
-
-
-# ============================================================
-# Utilities
+# Helpers
 # ============================================================
 def _safe_2d(X: np.ndarray) -> np.ndarray:
     X = np.asarray(X)
@@ -95,38 +69,12 @@ def _safe_2d(X: np.ndarray) -> np.ndarray:
     return X
 
 
-def _nan_agg(a: np.ndarray, method: str, axis=None):
-    method = str(method).lower()
-    if method == "mean":
-        return np.nanmean(a, axis=axis)
-    if method == "median":
-        return np.nanmedian(a, axis=axis)
-    raise ValueError(f"Unknown aggregation method: {method!r} (use 'mean' or 'median')")
-
-
 def _make_nn(n_neighbors: int, n_jobs: int) -> NearestNeighbors:
     """sklearn versions vary in whether NearestNeighbors accepts n_jobs."""
     try:
         return NearestNeighbors(n_neighbors=n_neighbors, algorithm="auto", n_jobs=n_jobs)
     except TypeError:
         return NearestNeighbors(n_neighbors=n_neighbors, algorithm="auto")
-
-
-def _write_rows_csv(csv_path: str | Path, rows: List[Dict[str, Any]]) -> None:
-    csv_path = Path(csv_path)
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if not rows:
-        csv_path.write_text("")
-        return
-
-    headers = list(rows[0].keys())
-    import csv
-    with open(csv_path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=headers)
-        w.writeheader()
-        for r in rows:
-            w.writerow(r)
 
 
 def _choose_tick_positions(k_arr: np.ndarray, tick_every: int) -> np.ndarray:
@@ -147,8 +95,26 @@ def _format_k_ticks_with_percent(k_ticks: np.ndarray, n_cluster: int) -> List[st
     return labels
 
 
+def _write_rows_csv(csv_path: str | Path, rows: List[Dict[str, Any]]) -> None:
+    import csv
+
+    csv_path = Path(csv_path)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not rows:
+        csv_path.write_text("")
+        return
+
+    headers = list(rows[0].keys())
+    with open(csv_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=headers)
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+
+
 # ============================================================
-# Levina–Bickel MLE sweep core
+# Levina–Bickel sweep core
 # ============================================================
 def _compute_knn_logs(
     X: np.ndarray,
@@ -156,6 +122,14 @@ def _compute_knn_logs(
     eps: float = 1e-12,
     n_jobs: int = 1,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Compute kNN distances up to k_max.
+
+    Returns:
+      - T: distances to 1..k_max nearest neighbors (excluding self), shape (n, k_max)
+      - logT: log(clamped(T)), shape (n, k_max)
+      - cumsum_logT: cumulative sum of logT along neighbors, shape (n, k_max)
+    """
     X = _safe_2d(X)
     n = X.shape[0]
     if n < 3:
@@ -163,11 +137,11 @@ def _compute_knn_logs(
     if k_max > n - 1:
         raise ValueError(f"k_max={k_max} but n={n}; need k_max <= n-1")
 
-    nn = _make_nn(n_neighbors=k_max + 1, n_jobs=int(n_jobs))
+    nn = _make_nn(n_neighbors=k_max + 1, n_jobs=n_jobs)
     nn.fit(X)
     distances, _ = nn.kneighbors(X)
 
-    T = distances[:, 1:]
+    T = distances[:, 1:]  # drop self-distance (0)
     logT = np.log(np.maximum(T, eps))
     cumsum_logT = np.cumsum(logT, axis=1)
     return T, logT, cumsum_logT
@@ -175,14 +149,21 @@ def _compute_knn_logs(
 
 def levina_bickel_knn_sweep(
     X: np.ndarray,
-    k_min_requested: int = 2,
+    k_min_requested: int = 0,
     k_max_requested: int = 100,
     k_step: int = 1,
     point_agg: str = "median",
     eps: float = 1e-12,
     n_jobs: int = 1,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Sweep LB m_hat(k) for ONE dataset X.
+    """
+    Sweep LB m_hat(k) for ONE dataset X.
+
+    Requested range can start at 0, but LB requires k>=2:
+      k_min_used = max(2, k_min_requested)
+      k_max_used = min(k_max_requested, n-1)
+
+    point_agg: 'mean' or 'median' over points for each k.
 
     Returns:
       k_arr, m_hat_arr, frac_valid_arr
@@ -200,11 +181,19 @@ def levina_bickel_knn_sweep(
     k_arr = np.arange(k_min_used, k_max_used + 1, int(k_step), dtype=int)
     _, logT, cumsum_logT = _compute_knn_logs(X, k_max=int(k_arr.max()), eps=eps, n_jobs=n_jobs)
 
+    def _agg(a: np.ndarray) -> float:
+        if point_agg.lower() == "mean":
+            return float(np.nanmean(a))
+        if point_agg.lower() == "median":
+            return float(np.nanmedian(a))
+        raise ValueError("point_agg must be 'mean' or 'median'")
+
     m_hat_list: List[float] = []
     frac_valid_list: List[float] = []
 
     with np.errstate(divide="ignore", invalid="ignore"):
         for k in k_arr:
+            # sum_{j=1}^{k-1} log(T_k/T_j) = (k-1)*log(T_k) - sum_{j=1}^{k-1} log(T_j)
             logT_k = logT[:, k - 1]
             sum_logT_j = cumsum_logT[:, k - 2]
             log_sums = (k - 1) * logT_k - sum_logT_j
@@ -213,7 +202,7 @@ def levina_bickel_knn_sweep(
             m_k = np.full(n, np.nan, dtype=float)
             m_k[valid] = (k - 1) / log_sums[valid]
 
-            m_hat_list.append(float(_nan_agg(m_k, point_agg)))
+            m_hat_list.append(_agg(m_k))
             frac_valid_list.append(float(np.mean(valid)))
 
     return k_arr, np.asarray(m_hat_list, dtype=float), np.asarray(frac_valid_list, dtype=float)
@@ -229,13 +218,15 @@ def plot_cluster_sweep(
     cluster_id: int,
     point_agg: str,
     tick_every: int = 5,
+    title_prefix: str = "Levina–Bickel k sweep",
     save_path: Optional[str] = None,
+    show: bool = False,
 ) -> None:
     fig, ax = plt.subplots(figsize=(8, 4.5))
     ax.plot(k_arr, m_hat_arr, marker="o")
     ax.set_xlabel("k (KNN)\n(k as % of cluster size)")
     ax.set_ylabel(f"Estimated intrinsic dimension (LB, point_agg={point_agg})")
-    ax.set_title(f"Levina–Bickel k sweep (cluster {cluster_id}, n={n_cluster})")
+    ax.set_title(f"{title_prefix} (cluster {cluster_id}, n={n_cluster})")
     ax.grid(True, alpha=0.3)
 
     k_ticks = _choose_tick_positions(k_arr, tick_every=tick_every)
@@ -244,8 +235,13 @@ def plot_cluster_sweep(
 
     fig.tight_layout()
     if save_path:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(save_path, dpi=150)
-    plt.close(fig)
+        print(f"Saved cluster sweep plot: {save_path}")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
 
 
 def plot_aggregate_curve_across_clusters(
@@ -257,9 +253,11 @@ def plot_aggregate_curve_across_clusters(
     tick_every: int = 5,
     min_clusters_per_k: int = 1,
     save_path: Optional[str] = None,
+    show: bool = False,
 ) -> None:
     mask = np.isfinite(mean_arr) & (n_clusters_arr >= int(min_clusters_per_k))
     if not np.any(mask):
+        print("Aggregate curve: no k values met min_clusters_per_k; skipping plot.")
         return
 
     k = k_global[mask]
@@ -282,34 +280,48 @@ def plot_aggregate_curve_across_clusters(
     fig.tight_layout()
 
     if save_path:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(save_path, dpi=150)
-    plt.close(fig)
+        print(f"Saved aggregate curve plot: {save_path}")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
 
 
 # ============================================================
-# One-NPZ sweep runner
+# NPZ-level sweep
 # ============================================================
+@dataclass
+class SweepConfig:
+    array_key: str = "predictions"
+    label_key: str = "hdbscan_labels"
+    include_noise: bool = False
+    min_cluster_size: int = 10
+    point_agg: str = "median"
+    eps: float = 1e-12
+    n_jobs: int = 1
+
+    # sweep params
+    k_min: int = 0
+    k_max: int = 100
+    k_step: int = 1
+    tick_every: int = 5
+    show: bool = False
+    min_clusters_per_k: int = 3
+
+
 def run_sweeps_for_npz(
     npz_path: str | Path,
     out_dir: str | Path,
-    array_key: str = "predictions",
-    label_key: str = "hdbscan_labels",
-    include_noise: bool = False,
-    min_cluster_size: int = 10,
-    point_agg: str = "median",
-    eps: float = 1e-12,
-    n_jobs: int = 1,
-    k_min: int = 2,
-    k_max: int = 100,
-    k_step: int = 1,
-    tick_every: int = 5,
-    min_clusters_per_k: int = 3,
-    max_points_per_cluster: Optional[int] = None,
-    subsample_seed: int = 0,
+    cfg: SweepConfig,
 ) -> Dict[str, str]:
-    """For ONE NPZ:
+    """
+    For ONE NPZ:
       - run per-cluster sweeps (save PNG+CSV per cluster)
       - compute and plot aggregate curve across clusters
+
+    Returns paths to summary CSV + aggregate CSV/PNG.
     """
     npz_path = Path(npz_path)
     out_dir = Path(out_dir)
@@ -319,99 +331,88 @@ def run_sweeps_for_npz(
     base = npz_path.stem
 
     data = np.load(npz_path, allow_pickle=True)
-    if array_key not in data or label_key not in data:
+    if cfg.array_key not in data or cfg.label_key not in data:
         raise KeyError(
-            f"Missing keys in {npz_path.name}: need {array_key!r} and {label_key!r}. Present: {list(data.keys())}"
+            f"Missing keys in {npz_path.name}: need {cfg.array_key!r} and {cfg.label_key!r}. "
+            f"Present: {list(data.keys())}"
         )
 
-    X = _safe_2d(data[array_key])
-    if X.dtype != np.float32:
-        X = X.astype(np.float32, copy=False)
-
-    labels = np.asarray(data[label_key])
+    X = _safe_2d(data[cfg.array_key])
+    labels = np.asarray(data[cfg.label_key])
     if X.shape[0] != labels.shape[0]:
         raise ValueError(f"X has n={X.shape[0]} rows but labels has n={labels.shape[0]} entries")
 
     cluster_ids = np.unique(labels)
-    if not include_noise:
+    if not cfg.include_noise:
         cluster_ids = cluster_ids[cluster_ids != -1]
 
-    # Sort clusters by size desc
+    # sort clusters by size desc
     cluster_sizes = [(int(cid), int(np.sum(labels == cid))) for cid in cluster_ids]
     cluster_sizes.sort(key=lambda t: t[1], reverse=True)
-
-    rng = np.random.RandomState(int(subsample_seed))
-
-    cluster_dir = out_dir / "clusters"
-    cluster_dir.mkdir(parents=True, exist_ok=True)
 
     cluster_sweeps: Dict[int, Tuple[np.ndarray, np.ndarray, np.ndarray, int]] = {}
     summary_rows: List[Dict[str, Any]] = []
 
+    cluster_dir = out_dir / "clusters"
+    cluster_dir.mkdir(parents=True, exist_ok=True)
+
     for cid, n_c in cluster_sizes:
-        if n_c < max(3, int(min_cluster_size)):
+        if n_c < max(3, int(cfg.min_cluster_size)):
             summary_rows.append({
                 "npz_path": str(npz_path),
                 "cluster_id": cid,
                 "n_cluster": n_c,
-                "n_used": "",
                 "k_min_used": "",
                 "k_max_used": "",
-                "point_agg": point_agg,
+                "point_agg": cfg.point_agg,
                 "plot_path": "",
                 "csv_path": "",
-                "error": f"skipped: n_cluster<{min_cluster_size}",
+                "error": f"skipped: n_cluster<{cfg.min_cluster_size}",
             })
             continue
 
-        idx = np.where(labels == cid)[0]
-        n_used = n_c
-        if max_points_per_cluster is not None and n_c > int(max_points_per_cluster):
-            idx = rng.choice(idx, size=int(max_points_per_cluster), replace=False)
-            n_used = int(idx.size)
-
-        Xc = X[idx]
-
+        Xc = X[labels == cid]
         try:
             k_arr, m_hat_arr, frac_valid_arr = levina_bickel_knn_sweep(
                 Xc,
-                k_min_requested=k_min,
-                k_max_requested=k_max,
-                k_step=k_step,
-                point_agg=point_agg,
-                eps=eps,
-                n_jobs=n_jobs,
+                k_min_requested=cfg.k_min,
+                k_max_requested=cfg.k_max,
+                k_step=cfg.k_step,
+                point_agg=cfg.point_agg,
+                eps=cfg.eps,
+                n_jobs=cfg.n_jobs,
             )
 
             # save per-cluster CSV
-            csv_path = cluster_dir / f"{base}_cluster{cid}_{array_key}_sweep_{ts}.csv"
+            csv_path = cluster_dir / f"{base}_cluster{cid}_{cfg.array_key}_sweep_{ts}.csv"
             with open(csv_path, "w", newline="") as f:
                 f.write("k,m_hat,frac_valid\n")
                 for i in range(len(k_arr)):
                     f.write(f"{int(k_arr[i])},{m_hat_arr[i]},{frac_valid_arr[i]}\n")
 
             # save per-cluster plot
-            plot_path = cluster_dir / f"{base}_cluster{cid}_{array_key}_sweep_{ts}.png"
+            plot_path = cluster_dir / f"{base}_cluster{cid}_{cfg.array_key}_sweep_{ts}.png"
             plot_cluster_sweep(
                 k_arr=k_arr,
                 m_hat_arr=m_hat_arr,
                 n_cluster=n_c,
                 cluster_id=cid,
-                point_agg=point_agg,
-                tick_every=tick_every,
+                point_agg=cfg.point_agg,
+                tick_every=cfg.tick_every,
+                title_prefix=f"Levina–Bickel k sweep ({base})",
                 save_path=str(plot_path),
+                show=cfg.show,
             )
 
-            cluster_sweeps[cid] = (k_arr, m_hat_arr, frac_valid_arr, n_used)
+            cluster_sweeps[cid] = (k_arr, m_hat_arr, frac_valid_arr, n_c)
 
             summary_rows.append({
                 "npz_path": str(npz_path),
                 "cluster_id": cid,
                 "n_cluster": n_c,
-                "n_used": n_used,
                 "k_min_used": int(k_arr.min()) if len(k_arr) else "",
                 "k_max_used": int(k_arr.max()) if len(k_arr) else "",
-                "point_agg": point_agg,
+                "point_agg": cfg.point_agg,
                 "plot_path": str(plot_path),
                 "csv_path": str(csv_path),
                 "error": "",
@@ -422,35 +423,36 @@ def run_sweeps_for_npz(
                 "npz_path": str(npz_path),
                 "cluster_id": cid,
                 "n_cluster": n_c,
-                "n_used": n_used,
                 "k_min_used": "",
                 "k_max_used": "",
-                "point_agg": point_agg,
+                "point_agg": cfg.point_agg,
                 "plot_path": "",
                 "csv_path": "",
                 "error": f"{type(e).__name__}: {e}",
             })
 
-    sweep_summary_csv = out_dir / f"{base}_{array_key}_sweep_summary_{ts}.csv"
+    sweep_summary_csv = out_dir / f"{base}_{cfg.array_key}_sweep_summary_{ts}.csv"
     _write_rows_csv(sweep_summary_csv, summary_rows)
 
     # Aggregate curve across clusters
-    k_min_global = max(2, int(k_min))
-    k_max_global = int(k_max)
-    k_global = np.arange(k_min_global, k_max_global + 1, int(k_step), dtype=int)
+    k_min_global = max(2, int(cfg.k_min))
+    k_max_global = int(cfg.k_max)
+    k_global = np.arange(k_min_global, k_max_global + 1, int(cfg.k_step), dtype=int)
 
     mean_list: List[float] = []
     std_list: List[float] = []
     median_list: List[float] = []
     n_clusters_list: List[int] = []
 
+    # For each k, collect the m_hat(k) from each cluster that has that k available.
     for k in k_global:
         vals: List[float] = []
         for _, (k_arr, m_hat_arr, _, _) in cluster_sweeps.items():
-            if k >= int(k_arr.min()) and k <= int(k_arr.max()):
-                idx = int(k - int(k_arr.min()))
-                if 0 <= idx < len(m_hat_arr) and np.isfinite(m_hat_arr[idx]):
-                    vals.append(float(m_hat_arr[idx]))
+            if k < int(k_arr.min()) or k > int(k_arr.max()):
+                continue
+            idx = int(k - int(k_arr.min()))
+            if 0 <= idx < len(m_hat_arr) and np.isfinite(m_hat_arr[idx]):
+                vals.append(float(m_hat_arr[idx]))
 
         if len(vals) == 0:
             mean_list.append(np.nan)
@@ -469,22 +471,23 @@ def run_sweeps_for_npz(
     median_arr = np.asarray(median_list, dtype=float)
     n_clusters_arr = np.asarray(n_clusters_list, dtype=int)
 
-    agg_csv = out_dir / f"{base}_{array_key}_aggregate_curve_{ts}.csv"
+    agg_csv = out_dir / f"{base}_{cfg.array_key}_aggregate_curve_{ts}.csv"
     with open(agg_csv, "w", newline="") as f:
         f.write("k,mean,std,median,n_clusters\n")
         for i in range(len(k_global)):
             f.write(f"{int(k_global[i])},{mean_arr[i]},{std_arr[i]},{median_arr[i]},{int(n_clusters_arr[i])}\n")
 
-    agg_plot = out_dir / f"{base}_{array_key}_aggregate_curve_{ts}.png"
+    agg_plot = out_dir / f"{base}_{cfg.array_key}_aggregate_curve_{ts}.png"
     plot_aggregate_curve_across_clusters(
         k_global=k_global,
         mean_arr=mean_arr,
         std_arr=std_arr,
         n_clusters_arr=n_clusters_arr,
-        title=f"Aggregate Levina–Bickel curve across clusters ({base}, array={array_key})",
-        tick_every=tick_every,
-        min_clusters_per_k=min_clusters_per_k,
+        title=f"Aggregate Levina–Bickel curve across clusters ({base}, array={cfg.array_key})",
+        tick_every=cfg.tick_every,
+        min_clusters_per_k=cfg.min_clusters_per_k,
         save_path=str(agg_plot),
+        show=cfg.show,
     )
 
     return {
@@ -495,130 +498,107 @@ def run_sweeps_for_npz(
     }
 
 
-# ============================================================
-# Parallel NPZ processing wrapper
-# ============================================================
-def _sweep_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
-    npz_path = payload["npz_path"]
-    out_dir = payload["out_dir"]
-
-    try:
-        res = run_sweeps_for_npz(
-            npz_path=npz_path,
-            out_dir=out_dir,
-            array_key=payload["array_key"],
-            label_key=payload["label_key"],
-            include_noise=payload["include_noise"],
-            min_cluster_size=payload["min_cluster_size"],
-            point_agg=payload["point_agg"],
-            eps=payload["eps"],
-            n_jobs=payload["n_jobs"],
-            k_min=payload["k_min"],
-            k_max=payload["k_max"],
-            k_step=payload["k_step"],
-            tick_every=payload["tick_every"],
-            min_clusters_per_k=payload["min_clusters_per_k"],
-            max_points_per_cluster=payload.get("max_points_per_cluster"),
-            subsample_seed=payload.get("subsample_seed", 0),
-        )
-        return {
-            "npz_path": str(npz_path),
-            **res,
-            "error": "",
-        }
-    except Exception as e:
-        return {
-            "npz_path": str(npz_path),
-            "sweep_summary_csv": "",
-            "aggregate_csv": "",
-            "aggregate_plot": "",
-            "out_dir": str(out_dir),
-            "error": f"{type(e).__name__}: {e}",
-        }
-
-
 def run_root_directory_sweeps(
     root_dir: str | Path,
     out_dir: str | Path | None = None,
     recursive: bool = True,
-    array_key: str = "predictions",
-    label_key: str = "hdbscan_labels",
-    include_noise: bool = False,
-    min_cluster_size: int = 10,
-    point_agg: str = "median",
-    eps: float = 1e-12,
-    k_min: int = 2,
-    k_max: int = 100,
-    k_step: int = 1,
-    tick_every: int = 5,
-    min_clusters_per_k: int = 3,
-    max_points_per_cluster: Optional[int] = None,
-    subsample_seed: int = 0,
-    computer_power: str = "auto",
-    workers: Optional[int] = None,
-    n_jobs: int = 0,
+    cfg: Optional[SweepConfig] = None,
 ) -> str:
-    """Run sweeps for every NPZ under root_dir, saving a master summary CSV."""
+    """
+    Run sweeps for every NPZ under root_dir.
+
+    Returns: path to a master summary CSV that concatenates per-NPZ sweep summaries.
+    """
     root_dir = Path(root_dir)
     if out_dir is None:
-        out_dir = root_dir / "lb_knn_sweep_outputs"
+        out_dir = root_dir / "lb_cluster_sweeps"
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    profile = _resolve_profile(computer_power=computer_power, workers=workers)
+    if cfg is None:
+        cfg = SweepConfig()
 
-    # If user didn't set n_jobs, use profile default.
-    nn_jobs = profile.nn_jobs if int(n_jobs) == 0 else int(n_jobs)
-    # If using multiple processes, force single-threaded NN per process.
-    if profile.max_workers > 1:
-        nn_jobs = 1
+    workers_to_use, n_jobs_to_use = _resources_for_power(computer_power, workers=workers, n_jobs=n_jobs)
+    cfg.n_jobs = int(n_jobs_to_use)
 
     npz_paths = sorted(root_dir.rglob("*.npz") if recursive else root_dir.glob("*.npz"))
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    print(
-        f"\n[LB sweep] computer_power={profile.name} | max_workers={profile.max_workers} | nn_jobs={nn_jobs} | "
-        f"max_points_per_cluster={max_points_per_cluster}\n"
-    )
-
-    payloads: List[Dict[str, Any]] = []
-    for npz_path in npz_paths:
-        per_dir = out_dir / npz_path.stem / "sweeps"
-        per_dir.mkdir(parents=True, exist_ok=True)
-        payloads.append({
-            "npz_path": str(npz_path),
-            "out_dir": str(per_dir),
-            "array_key": array_key,
-            "label_key": label_key,
-            "include_noise": include_noise,
-            "min_cluster_size": int(min_cluster_size),
-            "point_agg": point_agg,
-            "eps": float(eps),
-            "n_jobs": int(nn_jobs),
-            "k_min": int(k_min),
-            "k_max": int(k_max),
-            "k_step": int(k_step),
-            "tick_every": int(tick_every),
-            "min_clusters_per_k": int(min_clusters_per_k),
-            "max_points_per_cluster": (None if max_points_per_cluster is None else int(max_points_per_cluster)),
-            "subsample_seed": int(subsample_seed),
-        })
-
     master_rows: List[Dict[str, Any]] = []
 
-    if profile.max_workers <= 1 or len(payloads) <= 1:
-        for p in payloads:
-            print(f"[sweep] {Path(p['npz_path']).name}")
-            master_rows.append(_sweep_worker(p))
-    else:
-        with ProcessPoolExecutor(max_workers=profile.max_workers) as ex:
-            futs = [ex.submit(_sweep_worker, p) for p in payloads]
-            for fut in as_completed(futs):
-                master_rows.append(fut.result())
+    payloads: List[Dict[str, Any]] = [{
+        "npz_path": str(p),
+        "out_dir": str(out_dir),
+        "cfg": asdict(cfg),
+    } for p in npz_paths]
 
-    master_csv = out_dir / f"LB_sweep_master_{ts}.csv"
+    print(f"[LB sweep] NPZ files: {len(payloads)} (workers={workers_to_use}, n_jobs={cfg.n_jobs})")
+
+    if workers_to_use <= 1:
+        for payload in payloads:
+            npz_path = Path(payload["npz_path"])
+            t0 = time.perf_counter()
+            print(f"[LB sweep] processing: {npz_path}")
+            res = _root_sweep_worker(payload)
+            elapsed = time.perf_counter() - t0
+            if res.get("error"):
+                print(f"[LB sweep] failed: {npz_path.name} after {elapsed:.2f} s ({res['error']})")
+                master_rows.append({
+                    "npz_path": res["npz_path"],
+                    "cluster_id": "",
+                    "n_cluster": "",
+                    "k_min_used": "",
+                    "k_max_used": "",
+                    "point_agg": cfg.point_agg,
+                    "plot_path": "",
+                    "csv_path": "",
+                    "error": res["error"],
+                    "npz_stem": npz_path.stem,
+                })
+                continue
+
+            print(f"[LB sweep] done: {npz_path.name} in {elapsed:.2f} s")
+            df = pd.read_csv(res["sweep_summary_csv"])
+            df["npz_stem"] = npz_path.stem
+            master_rows.extend(df.to_dict(orient="records"))
+    else:
+        fut_meta: Dict[Any, Tuple[str, float]] = {}
+        with ProcessPoolExecutor(max_workers=workers_to_use) as ex:
+            for payload in payloads:
+                npz_name = Path(payload["npz_path"]).name
+                t0 = time.perf_counter()
+                fut = ex.submit(_root_sweep_worker, payload)
+                fut_meta[fut] = (npz_name, t0)
+
+            for fut in as_completed(fut_meta):
+                npz_name, t0 = fut_meta[fut]
+                res = fut.result()
+                elapsed = time.perf_counter() - t0
+                if res.get("error"):
+                    print(f"[LB sweep] failed: {npz_name} after {elapsed:.2f} s ({res['error']})")
+                    master_rows.append({
+                        "npz_path": res.get("npz_path", ""),
+                        "cluster_id": "",
+                        "n_cluster": "",
+                        "k_min_used": "",
+                        "k_max_used": "",
+                        "point_agg": cfg.point_agg,
+                        "plot_path": "",
+                        "csv_path": "",
+                        "error": res["error"],
+                        "npz_stem": res.get("npz_stem", ""),
+                    })
+                    continue
+
+                print(f"[LB sweep] done: {npz_name} in {elapsed:.2f} s")
+                sweep_csv = res["sweep_summary_csv"]
+                df = pd.read_csv(sweep_csv)
+                df["npz_stem"] = res.get("npz_stem", "")
+                master_rows.extend(df.to_dict(orient="records"))
+
+    master_csv = out_dir / f"LB_master_sweep_summaries_{ts}.csv"
     _write_rows_csv(master_csv, master_rows)
-    print(f"\nSaved MASTER CSV: {master_csv}")
+    print(f"\n[LB sweep] MASTER summary saved: {master_csv}")
     return str(master_csv)
 
 
@@ -626,8 +606,7 @@ def run_root_directory_sweeps(
 # CLI
 # ============================================================
 def main() -> None:
-    p = argparse.ArgumentParser(description="Levina–Bickel kNN parameter sweep per HDBSCAN cluster.")
-
+    p = argparse.ArgumentParser(description="Levina–Bickel kNN parameter sweeps for HDBSCAN clusters in NPZ files.")
     p.add_argument("--root-dir", type=str, required=True)
     p.add_argument("--out-dir", type=str, default=None)
     p.add_argument("--recursive", action="store_true")
@@ -637,56 +616,86 @@ def main() -> None:
     p.add_argument("--include-noise", action="store_true")
     p.add_argument("--min-cluster-size", type=int, default=10)
 
-    p.add_argument("--k-min", type=int, default=2)
+    p.add_argument("--point-agg", type=str, default="median", choices=["mean", "median"])
+    p.add_argument("--n-jobs", type=int, default=None, help="Threads inside NearestNeighbors (default depends on --computer-power and --workers).")
+
+    p.add_argument("--k-min", type=int, default=0)
     p.add_argument("--k-max", type=int, default=100)
     p.add_argument("--k-step", type=int, default=1)
-    p.add_argument("--point-agg", type=str, default="median", choices=["mean", "median"])
     p.add_argument("--tick-every", type=int, default=5)
+    p.add_argument("--show", action="store_true")
     p.add_argument("--min-clusters-per-k", type=int, default=3)
-
-    p.add_argument(
-        "--max-points-per-cluster",
-        type=int,
-        default=None,
-        help="Optional subsampling cap per cluster (e.g. 20000) for faster sweeps",
-    )
-    p.add_argument("--subsample-seed", type=int, default=0)
-
-    # Speed knobs
-    p.add_argument("--computer-power", type=str, default="auto", choices=["auto", "laptop", "studio"])
-    p.add_argument("--workers", type=int, default=None, help="Override number of parallel worker processes")
-    p.add_argument(
-        "--n-jobs",
-        type=int,
-        default=0,
-        help="NearestNeighbors n_jobs (0=auto from --computer-power; ignored when workers>1)",
-    )
 
     args = p.parse_args()
 
-    master_csv = run_root_directory_sweeps(
-        root_dir=args.root_dir,
-        out_dir=args.out_dir,
-        recursive=args.recursive,
+    cfg = SweepConfig(
         array_key=args.array_key,
         label_key=args.label_key,
         include_noise=args.include_noise,
         min_cluster_size=args.min_cluster_size,
         point_agg=args.point_agg,
+        n_jobs=(args.n_jobs if args.n_jobs is not None else 1),
         k_min=args.k_min,
         k_max=args.k_max,
         k_step=args.k_step,
         tick_every=args.tick_every,
+        show=args.show,
         min_clusters_per_k=args.min_clusters_per_k,
-        max_points_per_cluster=args.max_points_per_cluster,
-        subsample_seed=args.subsample_seed,
+    )
+
+    master_csv = run_root_directory_sweeps(
+        root_dir=args.root_dir,
+        out_dir=args.out_dir,
+        recursive=args.recursive,
+        cfg=cfg,
         computer_power=args.computer_power,
         workers=args.workers,
         n_jobs=args.n_jobs,
     )
-
     print(master_csv)
 
 
 if __name__ == "__main__":
     main()
+
+
+
+
+# =============================================================================
+# Spyder Console Sample Usage (copy/paste)
+# =============================================================================
+#
+# from pathlib import Path
+# import sys, importlib
+#
+# code_dir = Path("/Users/mirandahulsey-vincent/Documents/allPythonCode/syntax_analysis/py_files")
+# if str(code_dir) not in sys.path:
+#     sys.path.insert(0, str(code_dir))
+#
+# import Levina_Bickel_parameter_sweep as lbs
+# importlib.reload(lbs)
+#
+# root_dir = Path("/Volumes/my_own_SSD/updated_AreaX_outputs")
+#
+# cfg = lbs.SweepConfig(
+#     array_key="predictions",
+#     label_key="hdbscan_labels",
+#     include_noise=False,
+#     min_cluster_size=10,
+#     point_agg="median",
+#     n_jobs=1,
+#     k_min=0,
+#     k_max=30,
+#     k_step=1,
+#     tick_every=5,
+#     show=False,
+#     min_clusters_per_k=3,
+# )
+#
+# master_csv = lbs.run_root_directory_sweeps(
+#     root_dir=root_dir,
+#     out_dir=root_dir / "lb_cluster_sweeps",
+#     recursive=True,
+#     cfg=cfg,
+# )
+# print(master_csv)

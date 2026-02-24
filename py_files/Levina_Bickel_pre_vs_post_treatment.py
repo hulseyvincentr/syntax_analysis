@@ -1,1067 +1,938 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Levina_Bickel_pre_vs_post_treatment.py
+"""
+Levina_Bickel_pre_vs_post_treatment.py
 
-Pre vs Post treatment Levina–Bickel (LB) intrinsic dimension per HDBSCAN cluster.
+Compute Levina–Bickel intrinsic dimensionality estimates PRE vs POST treatment
+from "bird seasonality" style NPZs (with file_indices + file_map).
 
-What this script does
----------------------
-For each NPZ under a root directory:
-  1) Identify the animal_id from the NPZ filename.
-  2) Look up that animal's Treatment date and Lesion hit type in the metadata Excel.
-  3) Split timebins into PRE vs POST by treatment date.
-  4) For each HDBSCAN cluster, compute a Levina–Bickel intrinsic-dimension estimate
-     separately for PRE and POST using a *fixed* k (default k=15).
-  5) Save a results CSV and summary plots.
+Key expectations for each NPZ
+-----------------------------
+Required keys:
+  - file_indices   (N,) int   : per-point file index
+  - file_map       (0-d object holding dict) : maps file_index -> filename (often tuple)
+  - hdbscan_labels (N,) int   : cluster id per point (default cluster key)
+  - predictions    (N, D) float : high-dim features to estimate ID from (default array key)
+Optional keys:
+  - vocalization   (N,) int : 1 for vocalization; default keeps only 1s
 
-Optional: variance-tier labeling
--------------------------------
-If you provide a phrase-duration stats CSV (e.g., usage_balanced_phrase_duration_stats.csv),
-clusters are mapped to a dominant syllable label (mode of ground_truth_labels within cluster)
-and then tagged as "high" vs "low" variance within each bird based on a quantile threshold.
+How PRE/POST is determined
+--------------------------
+We parse a datetime per *source file* referenced in file_map, then label points
+by their file_index as pre/post relative to a treatment date.
 
-Speed: computer_power profiles
-------------------------------
-This script can automatically tune parallelism + optional subsampling via --computer-power:
-  - laptop: conservative; fewer/zero processes; may enable per-cluster subsampling cap.
-  - studio: parallelizes across NPZ files (ProcessPool) and avoids thread oversubscription.
-  - auto: chooses based on CPU count.
+Robust datetime parsing:
+  1) If filename has an Excel-serial-style token as parts[1] (e.g. 45383.35),
+     we interpret it as days since 1899-12-30 (Excel default) including fraction.
+  2) Else we parse parts[2:7] as month, day, hour, minute, second, using a year:
+        - any explicit 4-digit year token in the filename, else
+        - a default year (defaults to treatment_date.year if known, else 2024).
 
-The most reliable way to run parallel processing is from your macOS Terminal
-(not inside Spyder's IPython console).
+Metadata
+--------
+We look up, per animal_id:
+  - treatment date (from a sheet that has "Treatment date", usually "metadata")
+  - lesion hit type (from "animal_hit_type_summary" or similar)
 
-Dependencies
-------------
-numpy, pandas, matplotlib, scikit-learn
+If the sheet you pass via --metadata-sheet does NOT contain "Treatment date",
+we will automatically also read the "metadata" sheet to get treatment dates.
 
+Outputs
+-------
+- CSV of per-cluster pre/post ID estimates
+- Scatter plot (pre vs post) split by 3 lesion-hit-type groups
+- Boxplot of Δ(post - pre) split by group
+
+Example
+-------
+python Levina_Bickel_pre_vs_post_treatment.py \
+  --root-dir "/Volumes/my_own_SSD/updated_AreaX_outputs" \
+  --metadata-xlsx "/Volumes/my_own_SSD/updated_AreaX_outputs/Area_X_lesion_metadata_with_hit_types.xlsx" \
+  --metadata-sheet "animal_hit_type_summary" \
+  --computer-power pro \
+  --workers 4 \
+  --k 15
 """
 
 from __future__ import annotations
 
-import argparse
-import os
-import re
-from dataclasses import dataclass, replace
-from datetime import date
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-
-# Safer for headless / multiprocessing runs
-import matplotlib
-matplotlib.use("Agg")
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+import argparse
+import csv
+import math
+import os
+import time
+import datetime as _dt
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+
+# scikit-learn for KNN distances
 from sklearn.neighbors import NearestNeighbors
 
-from concurrent.futures import ProcessPoolExecutor, as_completed
 
-
-# ============================================================
-# Compute profile (computer_power)
-# ============================================================
+# -----------------------------
+# Config
+# -----------------------------
 @dataclass(frozen=True)
-class ComputeProfile:
-    name: str
-    max_workers: int
-    nn_jobs: int
-    default_max_points_per_cluster_period: Optional[int]
+class PrePostConfig:
+    root_dir: Path
+    metadata_xlsx: Path
+    metadata_sheet: str
+
+    out_dir: Optional[Path] = None
+    recursive: bool = False
+
+    array_key: str = "predictions"
+    cluster_key: str = "hdbscan_labels"
+    file_key: str = "file_indices"
+    date_key: str = "file_map"  # only used for naming; NPZ uses file_map
+
+    include_noise: bool = False  # include cluster label -1
+    vocalization_only: bool = True
+    vocalization_key: str = "vocalization"
+
+    k: int = 15
+    point_agg: str = "mean"  # mean or median of local m_i estimates
+    n_jobs: int = 0          # threads for NearestNeighbors (0 => auto)
+    workers: int = 0         # processes across NPZ files (0 => auto)
+
+    min_points_per_period: int = 200  # min points required in pre and post for a cluster
+    exclude_treatment_day_from_post: bool = False
+    max_points_per_cluster_period: Optional[int] = None  # subsample cap per (cluster, period)
+
+    computer_power: str = "laptop"  # laptop or pro
+
+    # optional overrides
+    override_treatment_date: Optional[str] = None  # YYYY-MM-DD
+    override_hit_type: Optional[str] = None
+
+    verbose_dates: bool = False
 
 
-def _resolve_profile(computer_power: str = "auto", workers: Optional[int] = None) -> ComputeProfile:
-    """Pick a compute profile.
+# -----------------------------
+# Small helpers
+# -----------------------------
+def _now_stamp() -> str:
+    return _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    Notes:
-      - We parallelize across NPZ files using processes.
-      - Inside each process we keep NearestNeighbors single-threaded (nn_jobs=1)
-        to avoid oversubscription.
+
+def _safe_mkdir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+
+def _unwrap_file_map_value(v: Any) -> str:
     """
-    cpu = int(os.cpu_count() or 8)
-    cp = (computer_power or "auto").strip().lower()
-
-    if cp == "auto":
-        # Simple heuristic: <= 8 cores behaves more like a laptop.
-        cp = "laptop" if cpu <= 8 else "studio"
-
-    if cp not in {"laptop", "studio"}:
-        raise ValueError("computer_power must be one of: auto, laptop, studio")
-
-    if cp == "laptop":
-        # Usually best to avoid process-pool overhead on smaller machines.
-        max_workers = 1
-        nn_jobs = -1  # allow sklearn to use threads within the single process
-        # Optional accuracy/speed tradeoff; can be overridden by CLI.
-        default_cap = 5000
-    else:
-        # Mac Studio / high-core desktop: parallelize across NPZ files.
-        max_workers = min(max(2, cpu - 1), 8)
-        nn_jobs = 1
-        default_cap = None
-
-    if workers is not None:
-        max_workers = max(1, int(workers))
-        # If user forces workers>1, avoid thread oversubscription.
-        if max_workers > 1:
-            nn_jobs = 1
-
-    return ComputeProfile(name=cp, max_workers=max_workers, nn_jobs=nn_jobs,
-                          default_max_points_per_cluster_period=default_cap)
+    file_map often stores values like ('filename.npz',) or ['filename.npz', ...]
+    Return a best-effort string path.
+    """
+    x = v
+    # peel single-element containers
+    for _ in range(4):
+        if isinstance(x, (list, tuple, np.ndarray)) and len(x) > 0:
+            x = x[0]
+        else:
+            break
+    return str(x)
 
 
-# ============================================================
-# Utilities
-# ============================================================
-def _safe_2d(X: np.ndarray) -> np.ndarray:
-    X = np.asarray(X)
-    if X.ndim == 1:
-        return X.reshape(-1, 1)
-    return X
+def _infer_animal_id(npz_path: Path) -> str:
+    # Prefer stem (USA5288 from USA5288.npz). If stem has extra suffix, keep first token.
+    stem = npz_path.stem
+    # common: USA5288 or USA5288_embeddings
+    return stem.split("_")[0]
 
 
-def _nan_agg(a: np.ndarray, method: str, axis=None):
-    method = str(method).lower()
-    if method == "mean":
-        return np.nanmean(a, axis=axis)
-    if method == "median":
-        return np.nanmedian(a, axis=axis)
-    raise ValueError(f"Unknown aggregation method: {method!r} (use 'mean' or 'median')")
+# -----------------------------
+# Date parsing
+# -----------------------------
+_EXCEL_ORIGIN = _dt.datetime(1899, 12, 30)
 
 
-def _make_nn(n_neighbors: int, n_jobs: int) -> NearestNeighbors:
-    """sklearn versions vary in whether NearestNeighbors accepts n_jobs."""
+def _parse_excel_serial_days(token: str) -> Optional[_dt.datetime]:
+    """
+    Convert an Excel "serial days" token (float string) into datetime.
+    Example: 45383.35215933 -> 2024-04-01 ...
+    """
     try:
-        return NearestNeighbors(n_neighbors=n_neighbors, algorithm="auto", n_jobs=n_jobs)
-    except TypeError:
-        return NearestNeighbors(n_neighbors=n_neighbors, algorithm="auto")
-
-
-def _write_rows_csv(csv_path: str | Path, rows: List[Dict[str, Any]]) -> None:
-    csv_path = Path(csv_path)
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if not rows:
-        csv_path.write_text("")
-        return
-
-    headers = list(rows[0].keys())
-    import csv
-    with open(csv_path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=headers)
-        w.writeheader()
-        for r in rows:
-            w.writerow(r)
-
-
-def _jitter(x: float, n: int, scale: float = 0.06, seed: int = 0) -> np.ndarray:
-    rng = np.random.RandomState(seed)
-    return x + rng.uniform(-scale, scale, size=n)
-
-
-# ============================================================
-# Levina–Bickel core (fixed k)
-# ============================================================
-_DATE_PATTERNS = [
-    re.compile(r"(?P<y>\d{4})[-_](?P<m>\d{2})[-_](?P<d>\d{2})"),  # 2024-04-09 / 2024_04_09
-    re.compile(r"(?P<y>\d{4})(?P<m>\d{2})(?P<d>\d{2})"),          # 20240409
-]
-
-
-def _parse_date_from_string(s: str) -> Optional[date]:
-    if not isinstance(s, str):
+        x = float(token)
+    except Exception:
         return None
-    for pat in _DATE_PATTERNS:
-        m = pat.search(s)
-        if m:
-            try:
-                y = int(m.group("y"))
-                mo = int(m.group("m"))
-                d = int(m.group("d"))
-                return date(y, mo, d)
-            except Exception:
-                return None
-    return None
+    if not (10000.0 <= x <= 80000.0):
+        # sanity bounds: ~1927 to ~2119
+        return None
+    try:
+        return _EXCEL_ORIGIN + _dt.timedelta(days=float(x))
+    except Exception:
+        return None
 
 
-def infer_point_dates_from_npz(
-    data: np.lib.npyio.NpzFile,
-    n: int,
-    date_key: Optional[str] = None,
-    file_key: str = "file",
-    preferred_date_keys: Optional[List[str]] = None,
-) -> np.ndarray:
-    """Return an array of python datetime.date (dtype=object), length n."""
-    if preferred_date_keys is None:
-        preferred_date_keys = [
-            "recording_date", "date", "date_time", "datetime", "timestamp", "t", "times"
-        ]
-
-    keys_to_try: List[str] = []
-    if date_key:
-        keys_to_try.append(date_key)
-    for k in preferred_date_keys:
-        if k not in keys_to_try:
-            keys_to_try.append(k)
-
-    for k in keys_to_try:
-        if k in data:
-            arr = data[k]
-
-            if np.issubdtype(arr.dtype, np.datetime64):
-                dt64 = arr.astype("datetime64[D]")
-                return np.array([pd.Timestamp(x).date() for x in dt64], dtype=object)
-
-            if arr.dtype.kind in ("U", "S", "O"):
-                s = pd.Series(arr.astype(str))
-                dt_parsed = pd.to_datetime(s, errors="coerce")
-                if dt_parsed.notna().mean() > 0.80:
-                    return np.array([d.date() if pd.notna(d) else None for d in dt_parsed], dtype=object)
-
-            try:
-                s = pd.Series(arr)
-                dt_parsed = pd.to_datetime(s, errors="coerce")
-                if dt_parsed.notna().mean() > 0.80:
-                    return np.array([d.date() if pd.notna(d) else None for d in dt_parsed], dtype=object)
-            except Exception:
-                pass
-
-    if file_key in data:
-        files = data[file_key]
-        if len(files) != n:
-            raise ValueError(
-                f"Found {file_key!r} but length {len(files)} != n={n}. Provide a usable date_key instead."
-            )
-
-        out = np.empty(n, dtype=object)
-        n_ok = 0
-        for i, f in enumerate(files):
-            d = _parse_date_from_string(str(f))
-            out[i] = d
-            if d is not None:
-                n_ok += 1
-
-        if n_ok / max(1, n) < 0.80:
-            raise ValueError(
-                f"Could not parse dates reliably from {file_key!r}: only {n_ok}/{n} parsed. "
-                f"Provide a date_key in the NPZ."
-            )
-        return out
-
-    raise KeyError("Could not infer dates: no usable date key found and file_key not present.")
-
-
-def split_pre_post_masks(
-    point_dates: np.ndarray,
-    treatment_date: date,
-    include_treatment_day_in_post: bool = True,
-) -> Tuple[np.ndarray, np.ndarray]:
-    if include_treatment_day_in_post:
-        pre = np.array([(d is not None) and (d < treatment_date) for d in point_dates], dtype=bool)
-        post = np.array([(d is not None) and (d >= treatment_date) for d in point_dates], dtype=bool)
-    else:
-        pre = np.array([(d is not None) and (d <= treatment_date) for d in point_dates], dtype=bool)
-        post = np.array([(d is not None) and (d > treatment_date) for d in point_dates], dtype=bool)
-    return pre, post
-
-
-def _compute_knn_logs(
-    X: np.ndarray,
-    k_max: int,
-    eps: float = 1e-12,
-    n_jobs: int = 1,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Compute kNN distances up to k_max (excluding self)."""
-    X = _safe_2d(X)
-    n = X.shape[0]
-    if n < 3:
-        raise ValueError(f"Need at least 3 points; got n={n}")
-    if k_max > n - 1:
-        raise ValueError(f"k_max={k_max} but n={n}; need k_max <= n-1")
-
-    nn = _make_nn(n_neighbors=k_max + 1, n_jobs=int(n_jobs))
-    nn.fit(X)
-    distances, _ = nn.kneighbors(X)
-
-    T = distances[:, 1:]
-    logT = np.log(np.maximum(T, eps))
-    cumsum_logT = np.cumsum(logT, axis=1)
-    return T, logT, cumsum_logT
-
-
-def levina_bickel_fixed_k(
-    X: np.ndarray,
-    k: int = 15,
-    point_agg: str = "median",
-    eps: float = 1e-12,
-    n_jobs: int = 1,
-) -> Tuple[float, int]:
-    """LB intrinsic dimension using a single fixed-k estimator.
-
-    Returns: (m_hat, k_used)
+def parse_datetime_from_filename(file_path: str | Path, *, year_default: int = 2024) -> Optional[_dt.datetime]:
     """
-    X = _safe_2d(X)
-    n = X.shape[0]
-    if n < 3:
-        raise ValueError(f"Need >=3 points; got n={n}")
+    Parses filenames like:
+      USA5288_45383.35215933_4_1_9_46_55_segment_1.npz
 
-    k_used = min(int(k), n - 1)
-    if k_used < 2:
-        raise ValueError(f"k_used={k_used} < 2; cluster too small")
+    Strategy:
+      1) If parts[1] looks like Excel serial days -> use that (keeps sub-day time)
+      2) Else use parts[2:7] as month/day/hour/min/sec with year_default,
+         unless a 4-digit year token exists.
+    """
+    base = Path(file_path).name
+    parts = base.split("_")
 
-    _, logT, cumsum_logT = _compute_knn_logs(X, k_max=k_used, eps=eps, n_jobs=n_jobs)
+    if len(parts) >= 2:
+        dt = _parse_excel_serial_days(parts[1])
+        if dt is not None:
+            return dt
 
-    # sum_{j=1}^{k-1} log(T_k/T_j) = (k-1)*log(T_k) - sum_{j=1}^{k-1} log(T_j)
-    logT_k = logT[:, k_used - 1]
-    sum_logT_j = cumsum_logT[:, k_used - 2]
-    log_sums = (k_used - 1) * logT_k - sum_logT_j
+    # override year if a 4-digit year is present
+    year = year_default
+    for p in parts:
+        if p.isdigit() and len(p) == 4:
+            y = int(p)
+            if 1990 <= y <= 2100:
+                year = y
+                break
 
-    valid = np.isfinite(log_sums) & (log_sums > 0)
-    m_k = np.full(n, np.nan, dtype=float)
-    m_k[valid] = (k_used - 1) / log_sums[valid]
+    try:
+        month, day, hour, minute, second = map(int, parts[2:7])
+        return _dt.datetime(year, month, day, hour, minute, second)
+    except Exception:
+        return None
 
-    m_hat = float(_nan_agg(m_k, point_agg))
-    return m_hat, k_used
+
+def _treatment_dt_from_any(value: Any) -> Optional[_dt.datetime]:
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return None
+    if isinstance(value, _dt.datetime):
+        return value
+    if isinstance(value, _dt.date):
+        return _dt.datetime.combine(value, _dt.time(0, 0, 0))
+    # pandas Timestamp
+    try:
+        if isinstance(value, pd.Timestamp):
+            return value.to_pydatetime()
+    except Exception:
+        pass
+    # string
+    try:
+        s = str(value)
+        # accept YYYY-MM-DD or full ISO
+        return _dt.datetime.fromisoformat(s)
+    except Exception:
+        return None
 
 
-# ============================================================
-# Metadata + grouping
-# ============================================================
-def load_metadata_treatment_and_hit_type(
-    metadata_xlsx: str | Path,
-    sheet_name: str = "metadata_with_hit_type",
-    animal_col: str = "Animal ID",
-    date_col: str = "Treatment date",
-    hit_col: str = "Lesion hit type",
-) -> pd.DataFrame:
-    df = pd.read_excel(metadata_xlsx, sheet_name=sheet_name)
-    for c in (animal_col, date_col, hit_col):
-        if c not in df.columns:
-            raise KeyError(f"Missing column {c!r} in {sheet_name!r}. Columns present: {list(df.columns)}")
+# -----------------------------
+# Metadata loading
+# -----------------------------
+def _normalize_hit_type(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", s.lower())
 
-    out = df[[animal_col, date_col, hit_col]].dropna(subset=[animal_col, date_col]).drop_duplicates().copy()
-    out[date_col] = pd.to_datetime(out[date_col]).dt.date
-    out[animal_col] = out[animal_col].astype(str)
-    # If multiple rows per animal, take the first non-null
-    out = out.groupby(animal_col, as_index=False).first()
+
+import re
+
+
+def _map_hit_type_to_group(hit_type: str) -> str:
+    """
+    Map raw hit types to the 3 groups you want.
+    """
+    if hit_type is None:
+        return "unknown"
+    norm = _normalize_hit_type(str(hit_type))
+
+    if "sham" in norm:
+        return "sham saline injection"
+
+    if "singlehit" in norm:
+        return "Area X visible (single hit)"
+
+    # combined group
+    if ("medial" in norm and "lateral" in norm) or ("ml" in norm and "visible" in norm):
+        return "Combined (visible ML + not visible)"
+    if "notvisible" in norm or ("large" in norm and "notvisible" in norm):
+        return "Combined (visible ML + not visible)"
+
+    # fallback: keep original for debugging
+    return str(hit_type)
+
+
+def build_animal_metadata_map(metadata_xlsx: Path, metadata_sheet: str, *, verbose: bool = False) -> Dict[str, Dict[str, Any]]:
+    """
+    Returns {animal_id: {"treatment_date": datetime|None, "hit_type": str|None, "group": str}}
+    """
+    xlsx = Path(metadata_xlsx)
+    if not xlsx.exists():
+        raise FileNotFoundError(f"metadata_xlsx not found: {xlsx}")
+
+    # read the requested sheet (usually hit type summary)
+    df_main = pd.read_excel(xlsx, sheet_name=metadata_sheet)
+
+    # try to find animal id col
+    animal_col = None
+    for c in df_main.columns:
+        if str(c).strip().lower() in ("animal id", "animal_id", "animalid", "bird", "bird id"):
+            animal_col = c
+            break
+    if animal_col is None:
+        # fallback: first col
+        animal_col = df_main.columns[0]
+
+    # hit type column (prefer 'Lesion hit type' over e.g. 'Medial Area X hit type')
+    hit_col = None
+    cols = list(df_main.columns)
+
+    def _cl(x: object) -> str:
+        return str(x).strip().lower()
+
+    # 1) exact match(s)
+    for c in cols:
+        if _cl(c) == "lesion hit type":
+            hit_col = c
+            break
+
+    # 2) contains both 'lesion' and 'hit type'
+    if hit_col is None:
+        for c in cols:
+            cl = _cl(c)
+            if ("lesion" in cl) and ("hit type" in cl):
+                hit_col = c
+                break
+
+    # 3) any 'hit type' column, but avoid 'medial' if possible
+    if hit_col is None:
+        candidates = [c for c in cols if "hit type" in _cl(c)]
+        if candidates:
+            non_medial = [c for c in candidates if "medial" not in _cl(c)]
+            hit_col = (non_medial[0] if non_medial else candidates[0])
+
+    if verbose:
+        print(f"[meta] hit_type column: {hit_col!r}")
+
+    # treatment date might be present here, but often it's in "metadata"
+    treat_col = None
+    for c in df_main.columns:
+        if "treatment date" in str(c).lower():
+            treat_col = c
+            break
+
+    # always also try metadata sheet for treatment dates (more reliable)
+    df_meta = None
+    try:
+        df_meta = pd.read_excel(xlsx, sheet_name="metadata")
+    except Exception:
+        df_meta = None
+
+    meta_animal_col = None
+    meta_treat_col = None
+    if df_meta is not None:
+        for c in df_meta.columns:
+            if str(c).strip().lower() in ("animal id", "animal_id", "animalid", "bird", "bird id"):
+                meta_animal_col = c
+                break
+        for c in df_meta.columns:
+            if "treatment date" in str(c).lower():
+                meta_treat_col = c
+                break
+
+    out: Dict[str, Dict[str, Any]] = {}
+
+    if verbose:
+        print(f"[meta] metadata_sheet={metadata_sheet!r}  animal_id_col={animal_col!r}  hit_type_col={hit_col!r}")
+        print(f"[meta] metadata sheet 'metadata'  animal_id_col={meta_animal_col!r}  treatment_date_col={meta_treat_col!r}")
+
+    # build hit type mapping from df_main
+    for _, row in df_main.iterrows():
+        aid = str(row.get(animal_col, "")).strip()
+        if not aid:
+            continue
+
+        hit = None
+        if hit_col is not None:
+            hit = row.get(hit_col, None)
+
+        td = None
+        if treat_col is not None:
+            td = row.get(treat_col, None)
+
+        out[aid] = {
+            "hit_type": None if (hit is None or (isinstance(hit, float) and np.isnan(hit))) else str(hit),
+            "treatment_date": _treatment_dt_from_any(td),
+        }
+
+    # overlay treatment dates from metadata sheet if missing
+    if df_meta is not None and meta_animal_col is not None and meta_treat_col is not None:
+        # take first non-null per animal (metadata has multiple rows per animal)
+        for aid, sub in df_meta.groupby(df_meta[meta_animal_col].astype(str).str.strip()):
+            if not aid:
+                continue
+            td_series = sub[meta_treat_col].dropna()
+            td_val = td_series.iloc[0] if len(td_series) else None
+            td_dt = _treatment_dt_from_any(td_val)
+            if aid not in out:
+                out[aid] = {"hit_type": None, "treatment_date": td_dt}
+            else:
+                if out[aid].get("treatment_date") is None and td_dt is not None:
+                    out[aid]["treatment_date"] = td_dt
+
+    # add group label
+    for aid, meta in out.items():
+        meta["group"] = _map_hit_type_to_group(meta.get("hit_type", None))
+
     return out
 
 
-def map_hit_type_to_group(hit_type: str) -> str:
-    if not isinstance(hit_type, str):
-        return "Unknown"
-    s = hit_type.lower()
+# -----------------------------
+# Intrinsic dimension (Levina–Bickel)
+# -----------------------------
+def levina_bickel_id(
+    X: np.ndarray,
+    *,
+    k: int = 15,
+    n_jobs: int = 1,
+    point_agg: str = "mean",
+    seed: int = 0,
+) -> float:
+    """
+    Compute Levina–Bickel MLE intrinsic dimension estimate for points X.
 
-    if "sham" in s:
-        return "sham saline injection"
-    if "single hit" in s:
-        return "Area X visible (single hit)"
-    if ("medial+lateral" in s) or ("medial + lateral" in s) or ("not visible" in s) or ("large lesion" in s):
-        return "Combined (visible ML + not visible)"
-    return "Other"
+    Returns NaN if it cannot compute (too few points, degenerate distances).
+    """
+    n = int(X.shape[0])
+    if n <= k:
+        return float("nan")
 
+    # nearest neighbors (k+1 to include self at distance 0)
+    nn = NearestNeighbors(n_neighbors=k + 1, algorithm="auto", metric="euclidean", n_jobs=n_jobs)
+    nn.fit(X)
+    dists, _ = nn.kneighbors(X, return_distance=True)  # (n, k+1)
+    # drop self
+    D = dists[:, 1:]  # (n, k)
 
-def animal_id_from_npz_path(npz_path: Path, metadata_animals: Optional[set] = None) -> str:
-    stem = npz_path.stem
-    if metadata_animals and stem in metadata_animals:
-        return stem
-    tok = stem.split("_")[0]
-    if metadata_animals and tok in metadata_animals:
-        return tok
-    return stem
+    eps = 1e-12
+    rk = D[:, -1] + eps
+    # avoid log(0) for duplicated points
+    denom = D[:, :-1] + eps
+    logs = np.log((rk[:, None]) / denom)  # (n, k-1)
+    s = np.sum(logs, axis=1)
 
+    with np.errstate(divide="ignore", invalid="ignore"):
+        m = (k - 1) / s
 
-def cluster_mode_syllable(
-    cluster_ids: np.ndarray,
-    syllable_labels: np.ndarray,
-    cluster_id: int,
-    ignore_values: Tuple[int, ...] = (-1,),
-) -> Optional[int]:
-    mask = (cluster_ids == cluster_id)
-    if not np.any(mask):
-        return None
-    vals = np.asarray(syllable_labels[mask])
-    if vals.size == 0:
-        return None
-    if ignore_values:
-        vals = vals[~np.isin(vals.astype(int), np.array(ignore_values, dtype=int))]
-    if vals.size == 0:
-        return None
-    uniq, counts = np.unique(vals.astype(int), return_counts=True)
-    return int(uniq[np.argmax(counts)])
+    m = m[np.isfinite(m)]
+    if m.size == 0:
+        return float("nan")
 
-
-def build_variance_tier_map_by_animal(
-    stats_csv: str | Path,
-    animal_col: str = "Animal ID",
-    syll_col: str = "Syllable",
-    group_col: str = "Group",
-    group_value: str = "Post",
-    variance_col: str = "Pre_Variance_ms2",
-    high_quantile: float = 0.70,  # top 30% => >= 70th percentile
-) -> Dict[str, Dict[int, str]]:
-    """Return {animal_id: {syllable_int: "high"|"low"}}."""
-    df = pd.read_csv(stats_csv)
-    for c in (animal_col, syll_col, group_col, variance_col):
-        if c not in df.columns:
-            raise KeyError(f"Missing column {c!r} in stats CSV. Columns present: {list(df.columns)}")
-
-    df = df[df[group_col] == group_value].copy()
-    df = df.dropna(subset=[animal_col, syll_col, variance_col])
-    df[animal_col] = df[animal_col].astype(str)
-    df[syll_col] = pd.to_numeric(df[syll_col], errors="coerce")
-    df[variance_col] = pd.to_numeric(df[variance_col], errors="coerce")
-    df = df.dropna(subset=[syll_col, variance_col])
-    df[syll_col] = df[syll_col].astype(int)
-
-    tier_by_animal: Dict[str, Dict[int, str]] = {}
-
-    for animal_id, g in df.groupby(animal_col):
-        if g.empty:
-            continue
-        thresh = float(g[variance_col].quantile(high_quantile))
-        sub_map: Dict[int, str] = {}
-        for _, row in g.iterrows():
-            syll = int(row[syll_col])
-            v = float(row[variance_col])
-            sub_map[syll] = "high" if v >= thresh else "low"
-        tier_by_animal[str(animal_id)] = sub_map
-
-    return tier_by_animal
+    if point_agg == "median":
+        return float(np.median(m))
+    return float(np.mean(m))
 
 
-# ============================================================
-# Pre/Post analysis per NPZ
-# ============================================================
-@dataclass
-class PrePostConfig:
-    array_key: str = "predictions"
-    cluster_key: str = "hdbscan_labels"
-    syllable_key: str = "ground_truth_labels"
-    file_key: str = "file"
-    date_key: Optional[str] = None
-
-    include_noise: bool = False
-    use_vocalization_only: bool = True
-    vocalization_key: str = "vocalization"
-
-    include_treatment_day_in_post: bool = True
-    min_points_per_period: int = 50
-
-    # LB params
-    k: int = 15
-    point_agg: str = "median"
-    eps: float = 1e-12
-
-    # NN compute param; 0 means "auto based on computer_power profile"
-    n_jobs: int = 0
-
-    # Optional speed cap (subsample per cluster per period)
-    max_points_per_cluster_period: Optional[int] = None
-    subsample_seed: int = 0
+# -----------------------------
+# NPZ processing
+# -----------------------------
+def _choose_defaults(computer_power: str) -> Dict[str, Any]:
+    cpu = os.cpu_count() or 8
+    if computer_power == "pro":
+        return {
+            "workers": max(1, min(8, cpu - 1)),
+            "n_jobs": max(1, min(8, cpu)),
+            "cap": 20000,
+        }
+    # laptop
+    return {
+        "workers": 1,
+        "n_jobs": 2,
+        "cap": 5000,
+    }
 
 
-def compute_pre_post_for_npz(
-    npz_path: str | Path,
-    treatment_date: date,
-    hit_type_raw: str,
-    hit_group: str,
-    animal_id: str,
-    cfg: PrePostConfig,
-    variance_tiers_for_animal: Optional[Dict[int, str]] = None,
-) -> List[Dict[str, Any]]:
-    npz_path = Path(npz_path)
-    rows: List[Dict[str, Any]] = []
+def _find_npz_files(root_dir: Path, recursive: bool) -> List[Path]:
+    pat = "**/*.npz" if recursive else "*.npz"
+    files = [p for p in root_dir.glob(pat) if p.is_file()]
+    # ignore small segment npzs if user points at a directory with both (optional)
+    # keep only "top-level bird npz" where filename equals folder name or starts with USA
+    return sorted(files)
 
-    data = np.load(npz_path, allow_pickle=True)
 
-    if cfg.array_key not in data:
-        raise KeyError(f"Missing array_key {cfg.array_key!r} in {npz_path.name}")
-    if cfg.cluster_key not in data:
-        raise KeyError(f"Missing cluster_key {cfg.cluster_key!r} in {npz_path.name}")
+def _load_npz_keys(npz_path: Path, keys: Iterable[str]) -> Dict[str, Any]:
+    d = np.load(npz_path, allow_pickle=True)
+    out = {}
+    for k in keys:
+        if k in d:
+            out[k] = d[k]
+        else:
+            out[k] = None
+    return out
 
-    X = _safe_2d(data[cfg.array_key])
-    # Keep float32 to reduce memory pressure for large NPZs (does not change neighbor ordering)
-    if X.dtype != np.float32:
-        X = X.astype(np.float32, copy=False)
 
-    cluster_ids = np.asarray(data[cfg.cluster_key])
-    n = X.shape[0]
-    if cluster_ids.shape[0] != n:
-        raise ValueError(f"X has n={n} but clusters has n={cluster_ids.shape[0]}")
-
-    keep_mask = np.ones(n, dtype=bool)
-    if cfg.use_vocalization_only and (cfg.vocalization_key in data):
-        voc = np.asarray(data[cfg.vocalization_key]).astype(int)
-        if voc.shape[0] == n:
-            keep_mask &= (voc == 1)
-
-    point_dates = infer_point_dates_from_npz(
-        data=data, n=n, date_key=cfg.date_key, file_key=cfg.file_key
-    )
-    pre_mask, post_mask = split_pre_post_masks(
-        point_dates=point_dates,
-        treatment_date=treatment_date,
-        include_treatment_day_in_post=cfg.include_treatment_day_in_post,
-    )
-    pre_mask &= keep_mask
-    post_mask &= keep_mask
-
-    syllable_labels = None
-    if cfg.syllable_key in data:
-        tmp = np.asarray(data[cfg.syllable_key])
-        if tmp.shape[0] == n:
-            syllable_labels = tmp
-
-    unique_clusters = np.unique(cluster_ids)
-    if not cfg.include_noise:
-        unique_clusters = unique_clusters[unique_clusters != -1]
-
-    rng = np.random.RandomState(cfg.subsample_seed)
-
-    # Effective NN jobs: if user left n_jobs=0, treat as 1 (profile injects real value earlier)
-    nn_jobs = int(cfg.n_jobs) if int(cfg.n_jobs) != 0 else 1
-
-    for cid in unique_clusters:
-        cid = int(cid)
-        c_mask = (cluster_ids == cid)
-
-        idx_pre = np.where(c_mask & pre_mask)[0]
-        idx_post = np.where(c_mask & post_mask)[0]
-        n_pre = int(idx_pre.size)
-        n_post = int(idx_post.size)
-
-        syll = None
-        if syllable_labels is not None:
-            syll = cluster_mode_syllable(cluster_ids, syllable_labels, cid, ignore_values=(-1,))
-
-        var_tier = "unknown"
-        if (variance_tiers_for_animal is not None) and (syll is not None):
-            var_tier = variance_tiers_for_animal.get(int(syll), "unknown")
-
-        if (n_pre < cfg.min_points_per_period) or (n_post < cfg.min_points_per_period):
-            rows.append({
-                "npz_path": str(npz_path),
-                "animal_id": animal_id,
-                "cluster_id": cid,
-                "n_pre": n_pre,
-                "n_post": n_post,
-                "k": int(cfg.k),
-                "m_pre": "",
-                "m_post": "",
-                "delta_m": "",
-                "hit_type_raw": hit_type_raw,
-                "hit_group": hit_group,
-                "syllable_label": "" if syll is None else int(syll),
-                "variance_tier": var_tier,
-                "error": f"skipped: insufficient points (min={cfg.min_points_per_period})",
-            })
-            continue
-
-        # Optional subsampling cap (speed)
-        if cfg.max_points_per_cluster_period is not None:
-            cap = int(cfg.max_points_per_cluster_period)
-            if n_pre > cap:
-                idx_pre = rng.choice(idx_pre, size=cap, replace=False)
-                n_pre = int(idx_pre.size)
-            if n_post > cap:
-                idx_post = rng.choice(idx_post, size=cap, replace=False)
-                n_post = int(idx_post.size)
-
+def _build_file_datetime_map(
+    file_map_obj: Any,
+    *,
+    year_default: int,
+    verbose: bool = False,
+) -> Dict[int, _dt.datetime]:
+    """
+    Returns {file_index:int -> datetime} for those that successfully parse.
+    """
+    # file_map is often a 0-d object array holding a dict
+    fm = file_map_obj
+    if isinstance(fm, np.ndarray) and fm.shape == ():
         try:
-            m_pre, _ = levina_bickel_fixed_k(
-                X[idx_pre],
-                k=int(cfg.k),
-                point_agg=str(cfg.point_agg),
-                eps=float(cfg.eps),
-                n_jobs=nn_jobs,
-            )
-            m_post, _ = levina_bickel_fixed_k(
-                X[idx_post],
-                k=int(cfg.k),
-                point_agg=str(cfg.point_agg),
-                eps=float(cfg.eps),
-                n_jobs=nn_jobs,
-            )
+            fm = fm.item()
+        except Exception:
+            pass
 
-            rows.append({
-                "npz_path": str(npz_path),
-                "animal_id": animal_id,
-                "cluster_id": cid,
-                "n_pre": n_pre,
-                "n_post": n_post,
-                "k": int(cfg.k),
-                "m_pre": float(m_pre),
-                "m_post": float(m_post),
-                "delta_m": float(m_post - m_pre),
-                "hit_type_raw": hit_type_raw,
-                "hit_group": hit_group,
-                "syllable_label": "" if syll is None else int(syll),
-                "variance_tier": var_tier,
-                "error": "",
-            })
+    mapping: Dict[int, Any] = {}
+    if isinstance(fm, dict):
+        mapping = {int(k): v for k, v in fm.items()}
+    elif isinstance(fm, (list, tuple)):
+        mapping = {int(i): v for i, v in enumerate(fm)}
+    else:
+        raise ValueError(f"Unexpected file_map structure: {type(fm)}")
 
-        except Exception as e:
-            rows.append({
-                "npz_path": str(npz_path),
-                "animal_id": animal_id,
-                "cluster_id": cid,
-                "n_pre": n_pre,
-                "n_post": n_post,
-                "k": int(cfg.k),
-                "m_pre": "",
-                "m_post": "",
-                "delta_m": "",
-                "hit_type_raw": hit_type_raw,
-                "hit_group": hit_group,
-                "syllable_label": "" if syll is None else int(syll),
-                "variance_tier": var_tier,
-                "error": f"{type(e).__name__}: {e}",
-            })
+    dt_map: Dict[int, _dt.datetime] = {}
+    for idx, v in mapping.items():
+        fp = _unwrap_file_map_value(v)
+        dt = parse_datetime_from_filename(fp, year_default=year_default)
+        if dt is not None:
+            dt_map[int(idx)] = dt
 
+    if verbose:
+        ok = len(dt_map)
+        total = len(mapping)
+        print(f"[dates] file_indices+file_map: parsed {ok}/{total} indices ({(100*ok/max(1,total)):.1f}%)")
+        if ok < total:
+            # show a few failures
+            bad = []
+            for idx, v in list(mapping.items())[:50]:
+                fp = _unwrap_file_map_value(v)
+                if int(idx) not in dt_map:
+                    bad.append(fp)
+            if bad:
+                print("[dates] examples that FAILED parsing (first 10):")
+                for b in bad[:10]:
+                    print("   ", b)
+
+    return dt_map
+
+
+def _split_pre_post_masks(
+    file_indices: np.ndarray,
+    file_dt_map: Dict[int, _dt.datetime],
+    treatment_date: _dt.datetime,
+    *,
+    exclude_treatment_day_from_post: bool,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Returns (pre_mask, post_mask) over points.
+    Uses file_index -> datetime, then broadcasts to points via integer indexing.
+    """
+    fi = file_indices.astype(int)
+    max_idx = int(fi.max()) if fi.size else 0
+    file_dt_arr = np.array([None] * (max_idx + 1), dtype=object)
+    for idx, dt in file_dt_map.items():
+        if 0 <= idx <= max_idx:
+            file_dt_arr[idx] = dt
+
+    # points with missing dt will be excluded
+    point_dt = file_dt_arr[fi]  # object array (N,)
+
+    # define boundaries
+    t0 = _dt.datetime.combine(treatment_date.date(), _dt.time(0, 0, 0))
+    t1 = _dt.datetime.combine(treatment_date.date(), _dt.time(23, 59, 59, 999999))
+
+    pre = np.array([(d is not None and d < t0) for d in point_dt], dtype=bool)
+
+    if exclude_treatment_day_from_post:
+        post = np.array([(d is not None and d > t1) for d in point_dt], dtype=bool)
+    else:
+        post = np.array([(d is not None and d >= t0) for d in point_dt], dtype=bool)
+
+    return pre, post
+
+
+def process_one_npz(npz_path: Path, meta: Dict[str, Any], cfg: PrePostConfig) -> List[Dict[str, Any]]:
+    """
+    Process a single NPZ and return rows for the output CSV.
+    """
+    t_start = time.time()
+
+    animal_id = _infer_animal_id(npz_path)
+    hit_type = cfg.override_hit_type if cfg.override_hit_type is not None else meta.get("hit_type", None)
+    group = _map_hit_type_to_group(hit_type) if hit_type is not None else meta.get("group", "unknown")
+
+    # treatment date
+    td = meta.get("treatment_date", None)
+    if cfg.override_treatment_date:
+        td = _treatment_dt_from_any(cfg.override_treatment_date)
+    if td is None:
+        print(f"[skip] {animal_id}: missing treatment date (metadata + override).")
+        return []
+
+    # load arrays
+    needed = [cfg.array_key, cfg.cluster_key, cfg.file_key, "file_map"]
+    if cfg.vocalization_only:
+        needed.append(cfg.vocalization_key)
+
+    arrs = _load_npz_keys(npz_path, needed)
+    X = arrs[cfg.array_key]
+    clusters = arrs[cfg.cluster_key]
+    file_indices = arrs[cfg.file_key]
+    file_map_obj = arrs["file_map"]
+
+    if X is None or clusters is None or file_indices is None or file_map_obj is None:
+        print(f"[skip] {animal_id}: NPZ missing one of required keys: {needed}")
+        return []
+
+    if not isinstance(X, np.ndarray) or X.ndim != 2:
+        print(f"[skip] {animal_id}: array_key {cfg.array_key} is not 2D array.")
+        return []
+
+    N = int(X.shape[0])
+    if clusters.shape[0] != N or file_indices.shape[0] != N:
+        print(f"[skip] {animal_id}: mismatched array lengths.")
+        return []
+
+    # optional vocalization mask
+    base_mask = np.ones(N, dtype=bool)
+    if cfg.vocalization_only and arrs.get(cfg.vocalization_key, None) is not None:
+        voc = arrs[cfg.vocalization_key]
+        try:
+            base_mask &= (voc.astype(int) == 1)
+        except Exception:
+            pass
+
+    # parse datetimes from file_map
+    year_default = td.year if isinstance(td, _dt.datetime) else 2024
+    file_dt_map = _build_file_datetime_map(file_map_obj, year_default=year_default, verbose=cfg.verbose_dates)
+
+    pre_mask, post_mask = _split_pre_post_masks(
+        file_indices=file_indices,
+        file_dt_map=file_dt_map,
+        treatment_date=td,
+        exclude_treatment_day_from_post=cfg.exclude_treatment_day_from_post,
+    )
+
+    pre_mask &= base_mask
+    post_mask &= base_mask
+
+    if cfg.verbose_dates:
+        print(f"[split] {animal_id}: pre points={int(pre_mask.sum()):,}  post points={int(post_mask.sum()):,}  (treatment={td.date()})")
+
+    # determine labels to iterate
+    labels = np.unique(clusters.astype(int))
+    if not cfg.include_noise:
+        labels = labels[labels != -1]
+
+    # cap logic
+    rng = np.random.default_rng(0)
+    cap = cfg.max_points_per_cluster_period
+
+    rows: List[Dict[str, Any]] = []
+    for lab in labels:
+        lab = int(lab)
+
+        idx_pre = np.where(pre_mask & (clusters.astype(int) == lab))[0]
+        idx_post = np.where(post_mask & (clusters.astype(int) == lab))[0]
+
+        if idx_pre.size < max(cfg.min_points_per_period, cfg.k + 1):
+            continue
+        if idx_post.size < max(cfg.min_points_per_period, cfg.k + 1):
+            continue
+
+        # subsample
+        if cap is not None:
+            if idx_pre.size > cap:
+                idx_pre = rng.choice(idx_pre, size=cap, replace=False)
+            if idx_post.size > cap:
+                idx_post = rng.choice(idx_post, size=cap, replace=False)
+
+        X_pre = X[idx_pre]
+        X_post = X[idx_post]
+
+        d_pre = levina_bickel_id(X_pre, k=cfg.k, n_jobs=cfg.n_jobs, point_agg=cfg.point_agg)
+        d_post = levina_bickel_id(X_post, k=cfg.k, n_jobs=cfg.n_jobs, point_agg=cfg.point_agg)
+
+        if not (np.isfinite(d_pre) and np.isfinite(d_post)):
+            continue
+
+        rows.append({
+            "animal_id": animal_id,
+            "npz_path": str(npz_path),
+            "hit_type": hit_type if hit_type is not None else "",
+            "group": group,
+            "treatment_date": td.date().isoformat(),
+            "cluster_label": lab,
+            "k": cfg.k,
+            "n_pre": int(idx_pre.size),
+            "n_post": int(idx_post.size),
+            "pre_dim": float(d_pre),
+            "post_dim": float(d_post),
+            "delta_dim": float(d_post - d_pre),
+        })
+
+    dt = time.time() - t_start
+    print(f"[pre/post] done: {npz_path.name} in {dt:.2f} s  (clusters={len(rows)})")
     return rows
 
 
-# ============================================================
+# -----------------------------
 # Plotting
-# ============================================================
-def plot_delta_by_hit_type(
-    df: pd.DataFrame,
-    out_png: str | Path,
-    title: str = "Δ intrinsic dimension (post − pre) by lesion hit type",
-    hit_order: Optional[List[str]] = None,
-) -> None:
-    out_png = Path(out_png)
-    out_png.parent.mkdir(parents=True, exist_ok=True)
+# -----------------------------
+_GROUP_ORDER = [
+    "sham saline injection",
+    "Area X visible (single hit)",
+    "Combined (visible ML + not visible)",
+]
 
-    if hit_order is None:
-        hit_order = [
-            "sham saline injection",
-            "Area X visible (single hit)",
-            "Combined (visible ML + not visible)",
-        ]
 
-    dd = df.copy()
-    dd["delta_m"] = pd.to_numeric(dd["delta_m"], errors="coerce")
-    dd = dd.dropna(subset=["delta_m"])
-    dd = dd[dd["hit_group"].isin(hit_order)]
+def _scatter_pre_post_by_group(df: pd.DataFrame, out_png: Path, title: str) -> None:
+    fig, axes = plt.subplots(1, 3, figsize=(14, 5), sharex=True, sharey=True)
+    fig.suptitle(title, y=0.98)
 
-    fig, ax = plt.subplots(figsize=(9, 5))
+    have_any = False
+    for ax, grp in zip(axes, _GROUP_ORDER):
+        sub = df[df["group"] == grp]
+        ax.set_title(grp)
+        ax.set_xlabel("Pre dimension")
+        if ax is axes[0]:
+            ax.set_ylabel("Post dimension")
+        ax.grid(True, alpha=0.3)
+        ax.plot([0, 1], [0, 1], linestyle="--")  # will autoscale after scatter
+
+        if len(sub) == 0:
+            ax.text(0.5, 0.5, "No points", ha="center", va="center", transform=ax.transAxes)
+            continue
+
+        have_any = True
+        ax.scatter(sub["pre_dim"], sub["post_dim"], s=14, alpha=0.7)
+
+    if have_any:
+        # autoscale nicely based on data range
+        allv = pd.concat([df["pre_dim"], df["post_dim"]], axis=0).values
+        lo = float(np.nanmin(allv))
+        hi = float(np.nanmax(allv))
+        if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
+            pad = 0.05 * (hi - lo)
+            for ax in axes:
+                ax.set_xlim(lo - pad, hi + pad)
+                ax.set_ylim(lo - pad, hi + pad)
+
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=200)
+    plt.close(fig)
+
+
+def _box_delta_by_group(df: pd.DataFrame, out_png: Path, title: str) -> None:
+    fig, ax = plt.subplots(1, 1, figsize=(10, 5))
+    ax.set_title(title)
+    ax.set_ylabel("Δ intrinsic dimension (post − pre)")
+    ax.grid(True, axis="y", alpha=0.3)
 
     data = []
     labels = []
-    for hit in hit_order:
-        v = dd[dd["hit_group"] == hit]["delta_m"].values.astype(float)
-        data.append(v)
-        labels.append(f"{hit}\n(n={v.size})")
+    for grp in _GROUP_ORDER:
+        sub = df[df["group"] == grp]
+        if len(sub) == 0:
+            data.append([])
+        else:
+            data.append(sub["delta_dim"].values)
+        labels.append(f"{grp}\n(n={len(sub)})")
 
-    bp = ax.boxplot(data, labels=labels, patch_artist=True)
-    for patch in bp["boxes"]:
-        patch.set_alpha(0.5)
-
-    for i, v in enumerate(data, start=1):
-        if v.size:
-            ax.scatter(_jitter(i, v.size, seed=100 + i), v, s=18, alpha=0.7)
-
-    ax.axhline(0.0, linestyle="--", linewidth=1)
-    ax.set_ylabel("Δ dimension")
-    ax.set_title(title)
-    ax.grid(True, alpha=0.25)
-    fig.tight_layout()
-    fig.savefig(out_png, dpi=150)
-    plt.close(fig)
-    print(f"Saved plot: {out_png}")
-
-
-def plot_pre_vs_post_scatter_by_hit_type(
-    df: pd.DataFrame,
-    out_png: str | Path,
-    title: str = "Pre vs Post intrinsic dimension by lesion hit type",
-    hit_order: Optional[List[str]] = None,
-) -> None:
-    out_png = Path(out_png)
-    out_png.parent.mkdir(parents=True, exist_ok=True)
-
-    if hit_order is None:
-        hit_order = [
-            "sham saline injection",
-            "Area X visible (single hit)",
-            "Combined (visible ML + not visible)",
-        ]
-
-    dd = df.copy()
-    dd["m_pre"] = pd.to_numeric(dd["m_pre"], errors="coerce")
-    dd["m_post"] = pd.to_numeric(dd["m_post"], errors="coerce")
-    dd = dd.dropna(subset=["m_pre", "m_post"])
-    dd = dd[dd["hit_group"].isin(hit_order)]
-
-    fig, axes = plt.subplots(1, len(hit_order), figsize=(15, 4.8), sharex=True, sharey=True)
-    if len(hit_order) == 1:
-        axes = [axes]
-
-    all_vals = np.concatenate([dd["m_pre"].values, dd["m_post"].values]).astype(float)
-    if all_vals.size:
-        lo = float(np.nanmin(all_vals))
-        hi = float(np.nanmax(all_vals))
-        pad = 0.05 * (hi - lo + 1e-9)
-        lims = (lo - pad, hi + pad)
+    if all(len(x) == 0 for x in data):
+        ax.text(0.5, 0.5, "No valid cluster estimates to plot.", ha="center", va="center", transform=ax.transAxes)
     else:
-        lims = (0, 1)
+        bp = ax.boxplot(data, tick_labels=labels, patch_artist=True)
+        ax.axhline(0, linestyle="--", linewidth=1)
 
-    for ax, hit in zip(axes, hit_order):
-        sub = dd[dd["hit_group"] == hit]
-        ax.scatter(sub["m_pre"], sub["m_post"], s=26, alpha=0.8)
-        ax.plot(lims, lims, linestyle="--", linewidth=1)
-        ax.set_title(hit)
-        ax.set_xlabel("Pre dimension")
-        ax.set_xlim(lims)
-        ax.set_ylim(lims)
-        ax.grid(True, alpha=0.3)
-
-    axes[0].set_ylabel("Post dimension")
-    fig.suptitle(title)
-    fig.tight_layout(rect=[0, 0.0, 1, 0.93])
-    fig.savefig(out_png, dpi=150)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=200)
     plt.close(fig)
-    print(f"Saved plot: {out_png}")
 
 
-def plot_delta_by_hit_and_variance(
-    df: pd.DataFrame,
-    out_png: str | Path,
-    title: str = "Δ intrinsic dimension (post − pre) by lesion hit type and variance tier",
-    hit_order: Optional[List[str]] = None,
-    tier_order: Optional[List[str]] = None,
-) -> None:
-    out_png = Path(out_png)
-    out_png.parent.mkdir(parents=True, exist_ok=True)
+# -----------------------------
+# Driver
+# -----------------------------
+def run_root_directory_pre_post_treatment(cfg: PrePostConfig) -> Dict[str, str]:
+    defaults = _choose_defaults(cfg.computer_power)
 
-    if hit_order is None:
-        hit_order = [
-            "sham saline injection",
-            "Area X visible (single hit)",
-            "Combined (visible ML + not visible)",
-        ]
-    if tier_order is None:
-        tier_order = ["high", "low"]
+    workers = cfg.workers if cfg.workers and cfg.workers > 0 else defaults["workers"]
+    n_jobs = cfg.n_jobs if cfg.n_jobs and cfg.n_jobs > 0 else defaults["n_jobs"]
+    cap = cfg.max_points_per_cluster_period if cfg.max_points_per_cluster_period is not None else defaults["cap"]
 
-    dd = df.copy()
-    dd["delta_m"] = pd.to_numeric(dd["delta_m"], errors="coerce")
-    dd = dd.dropna(subset=["delta_m"])
-    dd = dd[dd["variance_tier"].isin(tier_order)]
-    dd = dd[dd["hit_group"].isin(hit_order)]
+    # avoid oversubscription: if multiple processes, reduce threads
+    if workers > 1 and n_jobs > 1:
+        n_jobs = max(1, int(math.floor(n_jobs / workers)))
 
-    if dd.empty:
-        print("Variance-tier plot: no rows with variance tiers; skipping.")
-        return
+    # update an effective cfg (dataclass is frozen, so recreate)
+    cfg_eff = PrePostConfig(**{**cfg.__dict__, "workers": workers, "n_jobs": n_jobs, "max_points_per_cluster_period": cap})
 
-    fig, axes = plt.subplots(len(hit_order), 1, figsize=(9, 10), sharex=True)
-    if len(hit_order) == 1:
-        axes = [axes]
+    root_dir = cfg_eff.root_dir
+    out_dir = cfg_eff.out_dir if cfg_eff.out_dir is not None else (root_dir / f"lb_pre_post_dimensionality_k{cfg_eff.k}")
+    _safe_mkdir(out_dir)
 
-    for ax, hit in zip(axes, hit_order):
-        sub = dd[dd["hit_group"] == hit]
-        data = []
-        ns = []
-        for tier in tier_order:
-            v = sub[sub["variance_tier"] == tier]["delta_m"].values.astype(float)
-            data.append(v)
-            ns.append(v.size)
+    # locate NPZs
+    npz_files = _find_npz_files(root_dir, cfg_eff.recursive)
+    if len(npz_files) == 0:
+        print(f"[warn] No NPZ files found under: {root_dir}")
+    # load metadata
+    animal_meta = build_animal_metadata_map(cfg_eff.metadata_xlsx, cfg_eff.metadata_sheet, verbose=cfg_eff.verbose_dates)
 
-        bp = ax.boxplot(data, labels=[f"{t}\n(n={n})" for t, n in zip(tier_order, ns)], patch_artist=True)
-        for patch in bp["boxes"]:
-            patch.set_alpha(0.5)
+    # decide which NPZs to process
+    tasks: List[Tuple[Path, Dict[str, Any]]] = []
+    for p in npz_files:
+        aid = _infer_animal_id(p)
+        meta = animal_meta.get(aid, {"hit_type": None, "treatment_date": None, "group": "unknown"})
+        # if treatment date missing and no override, skip later in process_one_npz (but count here)
+        tasks.append((p, meta))
 
-        for i, v in enumerate(data, start=1):
-            if v.size:
-                ax.scatter(_jitter(i, v.size, seed=42 + i), v, s=18, alpha=0.7)
+    print(f"[pre/post] NPZ files found: {len(npz_files)}  (workers={cfg_eff.workers}, n_jobs={cfg_eff.n_jobs}, cap={cfg_eff.max_points_per_cluster_period})")
 
-        ax.axhline(0.0, linestyle="--", linewidth=1)
-        ax.set_title(hit)
-        ax.set_ylabel("Δ dimension")
-
-    fig.suptitle(title)
-    fig.tight_layout(rect=[0, 0, 1, 0.97])
-    fig.savefig(out_png, dpi=150)
-    plt.close(fig)
-    print(f"Saved plot: {out_png}")
-
-
-# ============================================================
-# Parallel NPZ processing
-# ============================================================
-def _prepost_worker(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Worker entrypoint (must be top-level for multiprocessing pickling)."""
-    npz_path = payload["npz_path"]
-    animal_id = payload["animal_id"]
-    treatment_date = payload["treatment_date"]
-    hit_type_raw = payload["hit_type_raw"]
-    hit_group = payload["hit_group"]
-    cfg: PrePostConfig = payload["cfg"]
-    tiers = payload.get("variance_tiers_for_animal", None)
-
-    try:
-        return compute_pre_post_for_npz(
-            npz_path=npz_path,
-            treatment_date=treatment_date,
-            hit_type_raw=hit_type_raw,
-            hit_group=hit_group,
-            animal_id=animal_id,
-            cfg=cfg,
-            variance_tiers_for_animal=tiers,
-        )
-    except Exception as e:
-        return [{
-            "npz_path": str(npz_path),
-            "animal_id": str(animal_id),
-            "cluster_id": "",
-            "n_pre": "",
-            "n_post": "",
-            "k": int(cfg.k),
-            "m_pre": "",
-            "m_post": "",
-            "delta_m": "",
-            "hit_type_raw": str(hit_type_raw),
-            "hit_group": str(hit_group),
-            "syllable_label": "",
-            "variance_tier": "unknown",
-            "error": f"{type(e).__name__}: {e}",
-        }]
-
-
-# ============================================================
-# Root-directory wrapper
-# ============================================================
-def run_root_directory_pre_post_treatment(
-    root_dir: str | Path,
-    metadata_xlsx: str | Path,
-    out_dir: str | Path | None = None,
-    recursive: bool = True,
-    metadata_sheet: str = "metadata_with_hit_type",
-    stats_csv: Optional[str | Path] = None,
-    variance_high_quantile: float = 0.70,
-    stats_group_value: str = "Post",
-    stats_variance_col: str = "Pre_Variance_ms2",
-    cfg: Optional[PrePostConfig] = None,
-    computer_power: str = "auto",
-    workers: Optional[int] = None,
-) -> Dict[str, str]:
-    """Run the full pre/post analysis over all NPZ files under root_dir."""
-    root_dir = Path(root_dir)
-    if out_dir is None:
-        out_dir = root_dir / "lb_pre_post_dimensionality_k15"
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    if cfg is None:
-        cfg = PrePostConfig()
-
-    profile = _resolve_profile(computer_power=computer_power, workers=workers)
-
-    # Apply profile defaults *only if* the user hasn't set these.
-    cfg_eff = cfg
-    if int(cfg_eff.n_jobs) == 0:
-        cfg_eff = replace(cfg_eff, n_jobs=int(profile.nn_jobs))
-
-    if cfg_eff.max_points_per_cluster_period is None and profile.default_max_points_per_cluster_period is not None:
-        cfg_eff = replace(cfg_eff, max_points_per_cluster_period=int(profile.default_max_points_per_cluster_period))
-
-    md = load_metadata_treatment_and_hit_type(
-        metadata_xlsx=metadata_xlsx,
-        sheet_name=metadata_sheet,
-        animal_col="Animal ID",
-        date_col="Treatment date",
-        hit_col="Lesion hit type",
-    )
-    md["hit_group"] = md["Lesion hit type"].apply(map_hit_type_to_group)
-    md_lookup = md.set_index("Animal ID")[["Treatment date", "Lesion hit type", "hit_group"]].to_dict(orient="index")
-    metadata_animals = set(md["Animal ID"].astype(str).tolist())
-
-    tiers_by_animal: Optional[Dict[str, Dict[int, str]]] = None
-    if stats_csv is not None:
-        tiers_by_animal = build_variance_tier_map_by_animal(
-            stats_csv=stats_csv,
-            animal_col="Animal ID",
-            syll_col="Syllable",
-            group_col="Group",
-            group_value=stats_group_value,
-            variance_col=stats_variance_col,
-            high_quantile=variance_high_quantile,
-        )
-
-    npz_paths = sorted(root_dir.rglob("*.npz") if recursive else root_dir.glob("*.npz"))
-    ts = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
-
-    payloads: List[Dict[str, Any]] = []
+    t0 = time.time()
     all_rows: List[Dict[str, Any]] = []
 
-    for npz_path in npz_paths:
-        animal_id = animal_id_from_npz_path(npz_path, metadata_animals=metadata_animals)
-        if animal_id not in md_lookup:
-            all_rows.append({
-                "npz_path": str(npz_path),
-                "animal_id": animal_id,
-                "cluster_id": "",
-                "n_pre": "",
-                "n_post": "",
-                "k": int(cfg_eff.k),
-                "m_pre": "",
-                "m_post": "",
-                "delta_m": "",
-                "hit_type_raw": "",
-                "hit_group": "",
-                "syllable_label": "",
-                "variance_tier": "unknown",
-                "error": "skipped: animal_id not found in metadata excel",
-            })
-            continue
-
-        treatment_date = md_lookup[animal_id]["Treatment date"]
-        hit_type_raw = md_lookup[animal_id]["Lesion hit type"]
-        hit_group = md_lookup[animal_id]["hit_group"]
-
-        payloads.append({
-            "npz_path": str(npz_path),
-            "animal_id": animal_id,
-            "treatment_date": treatment_date,
-            "hit_type_raw": hit_type_raw,
-            "hit_group": hit_group,
-            "cfg": cfg_eff,
-            "variance_tiers_for_animal": (tiers_by_animal.get(animal_id) if tiers_by_animal else None),
-        })
-
-    print(
-        f"\n[LB pre/post] computer_power={profile.name} | max_workers={profile.max_workers} | nn_jobs={cfg_eff.n_jobs} | "
-        f"cap_per_cluster_period={cfg_eff.max_points_per_cluster_period}\n"
-    )
-
-    # Run payloads
-    if profile.max_workers <= 1 or len(payloads) <= 1:
-        for p in payloads:
-            print(f"[pre/post] {p['animal_id']} ({p['hit_group']}) file={Path(p['npz_path']).name}")
-            all_rows.extend(_prepost_worker(p))
+    if cfg_eff.workers <= 1 or len(tasks) <= 1:
+        for p, meta in tasks:
+            all_rows.extend(process_one_npz(p, meta, cfg_eff))
     else:
-        # If using multiple processes, keep NN single-threaded per process
-        cfg_eff_mp = replace(cfg_eff, n_jobs=1)
-        for p in payloads:
-            p["cfg"] = cfg_eff_mp
+        # multiprocessing across NPZs
+        from concurrent.futures import ProcessPoolExecutor, as_completed
 
-        with ProcessPoolExecutor(max_workers=profile.max_workers) as ex:
-            futs = [ex.submit(_prepost_worker, p) for p in payloads]
+        # NOTE: cfg_eff must be picklable; dataclass is fine.
+        with ProcessPoolExecutor(max_workers=cfg_eff.workers) as ex:
+            futs = [ex.submit(process_one_npz, p, meta, cfg_eff) for p, meta in tasks]
             for fut in as_completed(futs):
-                all_rows.extend(fut.result())
+                try:
+                    rows = fut.result()
+                except Exception as e:
+                    print("[error] worker failed:", repr(e))
+                    continue
+                all_rows.extend(rows)
 
-    out_csv = out_dir / f"lb_pre_post_cluster_dimensionality_k{int(cfg_eff.k)}_{ts}.csv"
-    _write_rows_csv(out_csv, all_rows)
+    total_dt = time.time() - t0
+    print(f"[pre/post] TOTAL time: {total_dt:.2f} s")
+
+    # write CSV
+    stamp = _now_stamp()
+    out_csv = out_dir / f"lb_pre_post_cluster_dimensionality_k{cfg_eff.k}_{stamp}.csv"
+    df = pd.DataFrame(all_rows)
+    df.to_csv(out_csv, index=False)
     print(f"Saved results CSV: {out_csv}")
 
-    df = pd.DataFrame(all_rows)
+    # plots
+    plot_scatter = out_dir / f"pre_vs_post_scatter_by_hit_k{cfg_eff.k}_{stamp}.png"
+    plot_delta = out_dir / f"delta_dim_by_hit_type_k{cfg_eff.k}_{stamp}.png"
 
-    plot_delta = out_dir / f"delta_dim_by_hit_type_k{int(cfg_eff.k)}_{ts}.png"
-    plot_delta_by_hit_type(df, plot_delta)
-
-    plot_scatter = out_dir / f"pre_vs_post_scatter_by_hit_k{int(cfg_eff.k)}_{ts}.png"
-    plot_pre_vs_post_scatter_by_hit_type(df, plot_scatter)
-
-    plot_delta_tier = ""
-    if stats_csv is not None:
-        plot_delta_tier_path = out_dir / f"delta_dim_by_hit_and_variance_k{int(cfg_eff.k)}_{ts}.png"
-        plot_delta_by_hit_and_variance(df, plot_delta_tier_path)
-        plot_delta_tier = str(plot_delta_tier_path)
+    if len(df) == 0:
+        # make placeholder empties (helps pipeline)
+        _scatter_pre_post_by_group(df, plot_scatter, title=f"Pre vs Post intrinsic dimension by hit type (k={cfg_eff.k})")
+        _box_delta_by_group(df, plot_delta, title=f"Δ intrinsic dimension (post − pre) by hit type (k={cfg_eff.k})")
+        print(f"Saved plot (empty): {plot_delta}")
+        print(f"Saved plot (empty): {plot_scatter}")
+    else:
+        _scatter_pre_post_by_group(df, plot_scatter, title=f"Pre vs Post intrinsic dimension by hit type (k={cfg_eff.k})")
+        _box_delta_by_group(df, plot_delta, title=f"Δ intrinsic dimension (post − pre) by hit type (k={cfg_eff.k})")
+        print(f"Saved plot: {plot_delta}")
+        print(f"Saved plot: {plot_scatter}")
 
     return {
         "results_csv": str(out_csv),
-        "plot_delta_by_hit": str(plot_delta),
-        "plot_scatter_by_hit": str(plot_scatter),
-        "plot_delta_by_hit_and_variance": plot_delta_tier,
+        "plot_delta": str(plot_delta),
+        "plot_scatter": str(plot_scatter),
         "out_dir": str(out_dir),
     }
 
 
-# ============================================================
+# -----------------------------
 # CLI
-# ============================================================
-def main() -> None:
+# -----------------------------
+def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Pre vs post-treatment Levina–Bickel intrinsic dimension per cluster (fixed k)."
+        prog="Levina_Bickel_pre_vs_post_treatment.py",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--root-dir", type=str, required=True)
-    p.add_argument("--metadata-xlsx", type=str, required=True)
-    p.add_argument("--out-dir", type=str, default=None)
-    p.add_argument("--recursive", action="store_true")
+    p.add_argument("--root-dir", required=True, type=str, help="Directory containing NPZ(s) (bird folder or parent).")
+    p.add_argument("--metadata-xlsx", required=True, type=str, help="Excel metadata with treatment dates and hit types.")
+    p.add_argument("--metadata-sheet", default="animal_hit_type_summary", type=str,
+                   help="Sheet to read hit types from (treatment dates may be pulled from 'metadata' sheet if missing here).")
+    p.add_argument("--out-dir", default=None, type=str, help="Output directory (default: <root-dir>/lb_pre_post_dimensionality_k<k>/).")
+    p.add_argument("--recursive", action="store_true", help="Recursively search for NPZs under --root-dir.")
 
-    p.add_argument("--metadata-sheet", type=str, default="metadata_with_hit_type")
+    p.add_argument("--array-key", default="predictions", type=str, help="Key in NPZ for high-dim data used for ID.")
+    p.add_argument("--cluster-key", default="hdbscan_labels", type=str, help="Key in NPZ for cluster labels.")
+    p.add_argument("--file-key", default="file_indices", type=str, help="Key in NPZ for file indices.")
+    p.add_argument("--include-noise", action="store_true", help="Include HDBSCAN noise label (-1).")
 
-    p.add_argument("--array-key", type=str, default="predictions")
-    p.add_argument("--cluster-key", type=str, default="hdbscan_labels")
-    p.add_argument("--syllable-key", type=str, default="ground_truth_labels")
-    p.add_argument("--file-key", type=str, default="file")
-    p.add_argument("--date-key", type=str, default=None)
+    p.add_argument("--no-vocalization-only", action="store_true",
+                   help="Do NOT restrict to vocalization==1 (if vocalization key exists).")
+    p.add_argument("--vocalization-key", default="vocalization", type=str, help="Key in NPZ for vocalization mask.")
 
-    p.add_argument("--include-noise", action="store_true")
-    p.add_argument("--no-vocalization-only", action="store_true")
-    p.add_argument("--vocalization-key", type=str, default="vocalization")
+    p.add_argument("--k", default=15, type=int, help="k for Levina–Bickel (kNN).")
+    p.add_argument("--point-agg", default="mean", choices=["mean", "median"],
+                   help="Aggregate local m_i estimates with mean or median.")
+    p.add_argument("--n-jobs", default=0, type=int, help="Threads for NearestNeighbors (0 => auto by --computer-power).")
+    p.add_argument("--workers", default=0, type=int, help="Processes across NPZ files (0 => auto by --computer-power; 1 => serial).")
+    p.add_argument("--min-points-per-period", default=200, type=int, help="Min points required in both pre and post for a cluster.")
+    p.add_argument("--exclude-treatment-day-from-post", action="store_true",
+                   help="If set, POST starts the day *after* treatment day (treatment day excluded).")
+    p.add_argument("--max-points-per-cluster-period", default=None, type=int,
+                   help="Subsample cap per cluster per period (None => auto by --computer-power).")
 
-    p.add_argument("--k", type=int, default=15)
-    p.add_argument("--point-agg", type=str, default="median", choices=["mean", "median"])
+    p.add_argument("--computer-power", default="laptop", choices=["laptop", "pro"],
+                   help="Sets defaults for workers/n_jobs/caps when not provided.")
 
-    p.add_argument("--min-points-per-period", type=int, default=50)
-    p.add_argument("--exclude-treatment-day-from-post", action="store_true")
-    p.add_argument("--max-points-per-cluster-period", type=int, default=None)
+    # debugging / override hooks
+    p.add_argument("--treatment-date", default=None, type=str,
+                   help="Override treatment date for ALL birds (YYYY-MM-DD or ISO datetime).")
+    p.add_argument("--hit-type", default=None, type=str, help="Override hit type for ALL birds (mainly for debugging).")
+    p.add_argument("--verbose-dates", action="store_true", help="Print date parsing diagnostics and pre/post counts.")
 
-    # Optional variance tiers
-    p.add_argument("--stats-csv", type=str, default=None)
-    p.add_argument("--variance-high-quantile", type=float, default=0.70)
-    p.add_argument("--stats-group-value", type=str, default="Post")
-    p.add_argument("--stats-variance-col", type=str, default="Pre_Variance_ms2")
+    return p
 
-    # Speed knobs
-    p.add_argument("--computer-power", type=str, default="auto", choices=["auto", "laptop", "studio"])
-    p.add_argument("--workers", type=int, default=None, help="Override number of parallel worker processes")
-    p.add_argument(
-        "--n-jobs",
-        type=int,
-        default=0,
-        help="NearestNeighbors n_jobs (0=auto from --computer-power; ignored when workers>1)",
-    )
 
-    args = p.parse_args()
+def main() -> None:
+    args = _build_arg_parser().parse_args()
 
     cfg = PrePostConfig(
+        root_dir=Path(args.root_dir),
+        metadata_xlsx=Path(args.metadata_xlsx),
+        metadata_sheet=args.metadata_sheet,
+        out_dir=Path(args.out_dir) if args.out_dir else None,
+        recursive=bool(args.recursive),
+
         array_key=args.array_key,
         cluster_key=args.cluster_key,
-        syllable_key=args.syllable_key,
         file_key=args.file_key,
-        date_key=args.date_key,
-        include_noise=args.include_noise,
-        use_vocalization_only=(not args.no_vocalization_only),
+
+        include_noise=bool(args.include_noise),
+        vocalization_only=not bool(args.no_vocalization_only),
         vocalization_key=args.vocalization_key,
-        include_treatment_day_in_post=(not args.exclude_treatment_day_from_post),
-        k=args.k,
-        point_agg=args.point_agg,
-        n_jobs=args.n_jobs,
-        min_points_per_period=args.min_points_per_period,
+
+        k=int(args.k),
+        point_agg=str(args.point_agg),
+        n_jobs=int(args.n_jobs),
+        workers=int(args.workers),
+
+        min_points_per_period=int(args.min_points_per_period),
+        exclude_treatment_day_from_post=bool(args.exclude_treatment_day_from_post),
         max_points_per_cluster_period=args.max_points_per_cluster_period,
+
+        computer_power=str(args.computer_power),
+
+        override_treatment_date=args.treatment_date,
+        override_hit_type=args.hit_type,
+
+        verbose_dates=bool(args.verbose_dates),
     )
 
-    paths = run_root_directory_pre_post_treatment(
-        root_dir=args.root_dir,
-        metadata_xlsx=args.metadata_xlsx,
-        out_dir=args.out_dir,
-        recursive=args.recursive,
-        metadata_sheet=args.metadata_sheet,
-        stats_csv=args.stats_csv,
-        variance_high_quantile=args.variance_high_quantile,
-        stats_group_value=args.stats_group_value,
-        stats_variance_col=args.stats_variance_col,
-        cfg=cfg,
-        computer_power=args.computer_power,
-        workers=args.workers,
-    )
-
+    paths = run_root_directory_pre_post_treatment(cfg)
     print("\nOutputs:")
     for k, v in paths.items():
-        if v:
-            print(f"  {k}: {v}")
+        print(f"  {k}: {v}")
 
 
 if __name__ == "__main__":
