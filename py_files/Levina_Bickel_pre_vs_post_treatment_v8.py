@@ -599,9 +599,12 @@ def _split_pre_post_masks(
     # points with missing dt will be excluded
     point_dt = file_dt_arr[fi]  # object array (N,)
 
+    # normalize treatment_date (accepts datetime.date or datetime.datetime)
+    td_date = treatment_date.date() if isinstance(treatment_date, _dt.datetime) else treatment_date
+
     # define boundaries
-    t0 = _dt.datetime.combine(treatment_date.date(), _dt.time(0, 0, 0))
-    t1 = _dt.datetime.combine(treatment_date.date(), _dt.time(23, 59, 59, 999999))
+    t0 = _dt.datetime.combine(td_date, _dt.time(0, 0, 0))
+    t1 = _dt.datetime.combine(td_date, _dt.time(23, 59, 59, 999999))
 
     pre = np.array([(d is not None and d < t0) for d in point_dt], dtype=bool)
 
@@ -665,7 +668,7 @@ def process_one_npz(npz_path: Path, meta: Dict[str, Any], cfg: PrePostConfig) ->
             pass
 
     # parse datetimes from file_map
-    year_default = td.year if isinstance(td, _dt.datetime) else 2024
+    year_default = td.year if td is not None else 2024
     file_dt_map = _build_file_datetime_map(file_map_obj, year_default=year_default, verbose=cfg.verbose_dates)
 
     pre_mask, post_mask = _split_pre_post_masks(
@@ -679,7 +682,7 @@ def process_one_npz(npz_path: Path, meta: Dict[str, Any], cfg: PrePostConfig) ->
     post_mask &= base_mask
 
     if cfg.verbose_dates:
-        print(f"[split] {animal_id}: pre points={int(pre_mask.sum()):,}  post points={int(post_mask.sum()):,}  (treatment={td.date()})")
+        print(f"[split] {animal_id}: pre points={int(pre_mask.sum()):,}  post points={int(post_mask.sum()):,}  (treatment={td.date() if isinstance(td, _dt.datetime) else td})")
 
     # determine labels to iterate
     labels = np.unique(clusters.astype(int))
@@ -723,7 +726,7 @@ def process_one_npz(npz_path: Path, meta: Dict[str, Any], cfg: PrePostConfig) ->
             "npz_path": str(npz_path),
             "hit_type": hit_type if hit_type is not None else "",
             "group": group,
-            "treatment_date": td.date().isoformat(),
+            "treatment_date": (td.date().isoformat() if isinstance(td, _dt.datetime) else td.isoformat()),
             "cluster_label": lab,
             "k": cfg.k,
             "n_pre": int(idx_pre.size),
@@ -1147,6 +1150,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--recursive", action="store_true", help="Search for .npz files in all subfolders of --root-dir.")
     p.add_argument("--metadata-sheet", type=str, default="animal_hit_type_summary",
                    help="Sheet name containing Animal ID + lesion hit type (default: animal_hit_type_summary).")
+    p.add_argument("--hit-type-sheet", type=str, default=None,
+                   help="Alias for --metadata-sheet (sheet with Animal ID + hit type).")
     p.add_argument("--treatment-date-sheet", type=str, default="metadata",
                    help="Sheet name to look up treatment date if not present in --metadata-sheet (default: metadata).")
     p.add_argument("--hit-type-col", type=str, default="Lesion hit type",
@@ -1216,7 +1221,7 @@ def main() -> None:
     cfg = PrePostConfig(
         root_dir=Path(args.root_dir),
         metadata_xlsx=Path(args.metadata_xlsx),
-        metadata_sheet=args.metadata_sheet,
+        metadata_sheet=(args.hit_type_sheet if args.hit_type_sheet else args.metadata_sheet),
         out_dir=Path(args.out_dir) if args.out_dir else None,
         stats_csv=Path(args.stats_csv) if args.stats_csv else None,
         hit_type_col=args.hit_type_col,

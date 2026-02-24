@@ -87,7 +87,6 @@ class PrePostConfig:
     stats_csv: Optional[Path] = None  # optional existing combined CSV to use/extend
     hit_type_col: Optional[str] = None  # optional override for hit type column in metadata sheet
     treatment_date_col: Optional[str] = None  # optional override for treatment date column in metadata sheet
-    treatment_date_sheet: Optional[str] = "metadata"
     recursive: bool = False
 
     array_key: str = "predictions"
@@ -295,193 +294,153 @@ def _find_column(
     return None
 
 
+def build_animal_metadata_map(metadata_xlsx: Path, metadata_sheet: str, *, verbose: bool = False,
+                             hit_type_col: Optional[str] = None, treatment_date_col: Optional[str] = None
+                             ) -> Dict[str, Dict[str, Any]]:
+    """Load animal_id -> metadata dict.
 
-def build_animal_metadata_map(
-    metadata_xlsx: Path,
-    metadata_sheet: str,
-    *,
-    hit_type_col: Optional[str] = None,
-    treatment_date_col: Optional[str] = None,
-    treatment_date_sheet: Optional[str] = "metadata",
-    verbose: bool = False,
-) -> Dict[str, Dict[str, Any]]:
-    """Build {animal_id -> metadata} map.
-
-    Robustly chooses the intended *Lesion hit type* column (avoids medial/lateral
-    "hit type" columns) and obtains treatment date, falling back to another
-    sheet (default: 'metadata') if needed.
+    Returns dict values with keys:
+      animal_id, treatment_date (datetime or None), hit_type, hit_type_norm, group
     """
     metadata_xlsx = Path(metadata_xlsx)
-    xls = pd.ExcelFile(metadata_xlsx)
 
-    def _norm(s: str) -> str:
-        return re.sub(r"\s+", " ", str(s)).strip().lower()
+    df_main = pd.read_excel(metadata_xlsx, sheet_name=metadata_sheet)
 
-    def _pick_id_col(cols: List[str]) -> Optional[str]:
-        for c in cols:
-            if _norm(c) == "animal id":
-                return c
-        for c in cols:
-            n = _norm(c)
-            if "animal" in n and "id" in n:
-                return c
-        return cols[0] if cols else None
+    animal_col = _find_column(df_main, preferred=["Animal ID", "animal_id"], contains_any=["animal id", "animal"])
+    if animal_col is None:
+        raise ValueError(f"Could not find Animal ID column in sheet '{metadata_sheet}'.")
 
-    def _pick_hit_type_col(cols: List[str]) -> Optional[str]:
-        if hit_type_col and hit_type_col in cols:
-            return hit_type_col
+    # Treatment date column (may be absent)
+    treat_col = treatment_date_col or _find_column(df_main, preferred=["Treatment date", "treatment_date"], contains_all=["treatment", "date"])
 
-        # Strong preference for exact "Lesion hit type"
-        for c in cols:
-            if _norm(c) == "lesion hit type":
-                return c
+    # Hit type: strongly prefer Lesion hit type
+    if hit_type_col is not None:
+        hit_col = hit_type_col
+    else:
+        hit_col = _find_column(df_main, preferred=["Lesion hit type", "lesion_hit_type"], contains_all=["lesion", "hit", "type"])
+        if hit_col is None:
+            hit_col = _find_column(df_main, preferred=[], contains_all=["hit", "type"])
 
-        # Otherwise score candidates containing 'hit' and 'type'
-        cand: List[Tuple[int, str]] = []
-        for c in cols:
-            n = _norm(c)
-            if "hit" in n and "type" in n:
-                score = 10
-                if "lesion" in n:
-                    score -= 5
-                # Penalize medial/lateral (these are not the summary hit type)
-                if "medial" in n:
-                    score += 5
-                if "lateral" in n:
-                    score += 5
-                cand.append((score, c))
-        if not cand:
-            return None
-        cand.sort(key=lambda x: x[0])
-        return cand[0][1]
-
-    def _pick_treatment_date_col(cols: List[str]) -> Optional[str]:
-        if treatment_date_col and treatment_date_col in cols:
-            return treatment_date_col
-        for c in cols:
-            n = _norm(c)
-            if n in ("treatment date", "surgery date"):
-                return c
-        cand: List[Tuple[int, str]] = []
-        for c in cols:
-            n = _norm(c)
-            if ("treatment" in n or "surgery" in n) and "date" in n:
-                score = 10
-                if "time" in n:
-                    score += 5
-                cand.append((score, c))
-        if not cand:
-            return None
-        cand.sort(key=lambda x: x[0])
-        return cand[0][1]
-
-    def _parse_excel_date(v: Any) -> Optional[datetime.date]:
-        if v is None or (isinstance(v, float) and np.isnan(v)):
-            return None
-        if isinstance(v, pd.Timestamp):
-            return v.date()
-        if isinstance(v, datetime.datetime):
-            return v.date()
-        if isinstance(v, datetime.date):
-            return v
-        if isinstance(v, str):
-            s = v.strip()
-            if not s:
-                return None
-            for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y"):
-                try:
-                    return datetime.datetime.strptime(s, fmt).date()
-                except Exception:
-                    pass
-            try:
-                return pd.to_datetime(s).date()
-            except Exception:
-                return None
-        if isinstance(v, (int, float)):
-            try:
-                return pd.to_datetime(v, unit="D", origin="1899-12-30").date()
-            except Exception:
-                return None
-        return None
-
-    # --- Read hit-type sheet ---
-    df_hit = pd.read_excel(metadata_xlsx, sheet_name=metadata_sheet)
-    hit_cols = list(df_hit.columns)
-    id_col_hit = _pick_id_col(hit_cols)
-    ht_col = _pick_hit_type_col(hit_cols)
-    td_col_hit = _pick_treatment_date_col(hit_cols)
-
-    # Treatment type (optional)
-    treatment_type_col = None
-    for c in hit_cols:
-        if "treatment type" in _norm(c):
-            treatment_type_col = c
-            break
-
-    # --- Read treatment-date sheet (fallback) ---
-    df_date = None
-    id_col_date = None
-    td_col_date = None
-    if (td_col_hit is None) and treatment_date_sheet:
-        if treatment_date_sheet in xls.sheet_names:
-            df_date = pd.read_excel(metadata_xlsx, sheet_name=treatment_date_sheet)
-            date_cols = list(df_date.columns)
-            id_col_date = _pick_id_col(date_cols)
-            td_col_date = _pick_treatment_date_col(date_cols)
-            if verbose:
-                print(f"[meta] Using treatment date from sheet '{treatment_date_sheet}': id_col={id_col_date} td_col={td_col_date}")
-        elif verbose:
-            print(f"[meta] treatment_date_sheet '{treatment_date_sheet}' not found; relying on --metadata-sheet only.")
-
-    td_lookup: Dict[str, Optional[datetime.date]] = {}
-    if df_date is not None and id_col_date and td_col_date:
-        for _, rr in df_date.iterrows():
-            aid = str(rr.get(id_col_date, "")).strip()
-            if not aid or aid.lower() == "nan":
-                continue
-            td_lookup[aid] = _parse_excel_date(rr.get(td_col_date))
-
-    if id_col_hit is None:
-        raise ValueError(f"Could not identify Animal ID column in sheet '{metadata_sheet}'")
+    # If no treatment date column, fall back to 'metadata' sheet
+    df_meta = None
+    animal_col_meta = None
+    treat_col_meta = None
+    if treat_col is None:
+        try:
+            df_meta = pd.read_excel(metadata_xlsx, sheet_name="metadata")
+            animal_col_meta = _find_column(df_meta, preferred=["Animal ID", "animal_id"], contains_any=["animal id", "animal"])
+            treat_col_meta = _find_column(df_meta, preferred=["Treatment date", "treatment_date"], contains_all=["treatment", "date"])
+        except Exception:
+            df_meta = None
 
     out: Dict[str, Dict[str, Any]] = {}
-    for _, r in df_hit.iterrows():
-        aid = str(r.get(id_col_hit, "")).strip()
-        if not aid or aid.lower() == "nan":
+
+    for _, row in df_main.iterrows():
+        animal = str(row.get(animal_col, "")).strip()
+        if not animal:
             continue
 
-        td = _parse_excel_date(r.get(td_col_hit)) if td_col_hit else None
-        if td is None:
-            td = td_lookup.get(aid)
+        td = _treatment_dt_from_any(row.get(treat_col)) if treat_col is not None else None
 
-        ht = None
-        if ht_col:
-            v = r.get(ht_col)
-            ht = None if (v is None or (isinstance(v, float) and np.isnan(v))) else str(v).strip()
+        hit = row.get(hit_col) if hit_col is not None else None
+        # Guard: if we picked a generic column with values like 'bilateral', prefer a lesion hit type if present
+        if hit_col is not None:
+            s = str(hit).strip().lower() if hit is not None else ""
+            if s in {"bilateral", "unilateral", "unknown", "nan", ""}:
+                better = _find_column(df_main, preferred=["Lesion hit type", "lesion_hit_type"], contains_all=["lesion", "hit", "type"])
+                if better is not None:
+                    hit = row.get(better, hit)
+                    hit_col = better
 
-        ttype = None
-        if treatment_type_col:
-            vv = r.get(treatment_type_col)
-            ttype = None if (vv is None or (isinstance(vv, float) and np.isnan(vv))) else str(vv).strip()
+        hit_type = str(hit) if hit is not None and str(hit).strip() != "" else None
+        hit_norm = _normalize_hit_type(hit_type) if hit_type is not None else None
+        group = _map_hit_type_to_group(hit_norm) if hit_norm is not None else "unknown"
 
-        grp = _map_hit_type_to_group(ht) if ht else None
-
-        out[aid] = {
+        out[animal] = {
+            "animal_id": animal,
             "treatment_date": td,
-            "hit_type": ht,
-            "group": grp,
-            "treatment_type": ttype,
+            "hit_type": hit_type,
+            "hit_type_norm": hit_norm,
+            "group": group,
         }
+
+    if df_meta is not None and animal_col_meta is not None and treat_col_meta is not None:
+        for _, row in df_meta.iterrows():
+            animal = str(row.get(animal_col_meta, "")).strip()
+            if not animal:
+                continue
+            td = _treatment_dt_from_any(row.get(treat_col_meta))
+            if animal not in out:
+                out[animal] = {"animal_id": animal}
+            if out[animal].get("treatment_date") is None:
+                out[animal]["treatment_date"] = td
 
     if verbose:
         n_td = sum(1 for v in out.values() if v.get("treatment_date") is not None)
-        n_ht = sum(1 for v in out.values() if v.get("hit_type") not in (None, ""))
-        print(f"[meta] Loaded {len(out)} animals from '{metadata_sheet}': with treatment_date={n_td}, with hit_type={n_ht}")
-        if ht_col:
-            print(f"[meta] hit_type_col='{ht_col}'")
-        if td_col_hit:
-            print(f"[meta] treatment_date_col in hit sheet='{td_col_hit}'")
+        print(f"[meta] loaded {len(out)} animals; treatment dates available for {n_td}")
     return out
+
+def levina_bickel_id(
+    X: np.ndarray,
+    *,
+    k: int = 15,
+    n_jobs: int = 1,
+    point_agg: str = "mean",
+    seed: int = 0,
+) -> float:
+    """
+    Compute Levina–Bickel MLE intrinsic dimension estimate for points X.
+
+    Returns NaN if it cannot compute (too few points, degenerate distances).
+    """
+    n = int(X.shape[0])
+    if n <= k:
+        return float("nan")
+
+    # nearest neighbors (k+1 to include self at distance 0)
+    nn = NearestNeighbors(n_neighbors=k + 1, algorithm="auto", metric="euclidean", n_jobs=n_jobs)
+    nn.fit(X)
+    dists, _ = nn.kneighbors(X, return_distance=True)  # (n, k+1)
+    # drop self
+    D = dists[:, 1:]  # (n, k)
+
+    eps = 1e-12
+    rk = D[:, -1] + eps
+    # avoid log(0) for duplicated points
+    denom = D[:, :-1] + eps
+    logs = np.log((rk[:, None]) / denom)  # (n, k-1)
+    s = np.sum(logs, axis=1)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        m = (k - 1) / s
+
+    m = m[np.isfinite(m)]
+    if m.size == 0:
+        return float("nan")
+
+    if point_agg == "median":
+        return float(np.median(m))
+    return float(np.mean(m))
+
+
+# -----------------------------
+# NPZ processing
+# -----------------------------
+def _choose_defaults(computer_power: str) -> Dict[str, Any]:
+    cpu = os.cpu_count() or 8
+    if computer_power == "pro":
+        return {
+            "workers": max(1, min(8, cpu - 1)),
+            "n_jobs": max(1, min(8, cpu)),
+            "cap": 20000,
+        }
+    # laptop
+    return {
+        "workers": 1,
+        "n_jobs": 2,
+        "cap": 5000,
+    }
+
 
 def _find_npz_files(root_dir: Path, recursive: bool) -> List[Path]:
     """Find candidate bird-level NPZ files.
@@ -746,21 +705,6 @@ _GROUP_ORDER = [
     "Area X visible (single hit)",
     "Combined (visible ML + not visible)",
 ]
-
-
-def _infer_animal_id(npz_path: Path, animal_meta: Optional[Dict[str, Dict[str, Any]]] = None) -> str:
-    """Infer animal_id from an NPZ path (folder name preferred; fall back to stem)."""
-    cand = npz_path.parent.name if npz_path.parent and npz_path.parent.name else npz_path.stem
-    if animal_meta is not None:
-        if cand not in animal_meta and npz_path.stem in animal_meta:
-            cand = npz_path.stem
-    return cand
-
-
-def _run_one_npz_worker(p_str: str, meta: Dict[str, Any], cfg: "PrePostConfig") -> List[Dict[str, Any]]:
-    """Top-level worker wrapper so ProcessPool can pickle it on macOS/Windows."""
-    return process_one_npz(Path(p_str), meta, cfg)
-
 
 
 def _scatter_pre_post_by_group(df: pd.DataFrame, out_png: Path, title: str) -> None:
@@ -1075,50 +1019,26 @@ def run_root_directory_pre_post_treatment(cfg: PrePostConfig, *, force_recompute
         all_rows.extend(existing_df.to_dict(orient="records"))
 
     t0 = time.time()
-    all_rows: List[Dict[str, Any]] = []
 
-    # If we loaded an existing combined CSV, keep those rows and only compute missing NPZs.
-    if existing_df is not None and not existing_df.empty:
-        all_rows.extend(existing_df.to_dict(orient="records"))
-
-    def _meta_for_path(p: Path) -> Dict[str, Any]:
-        animal_id = _infer_animal_id(p, animal_meta)
-        base = {
-            "animal_id": animal_id,
-            "hit_type": "unknown",
-            "group": "unknown",
-            "treatment_date": None,
-        }
-        m = animal_meta.get(animal_id)
-        if isinstance(m, dict):
-            base.update(m)
-        return base
+    def _run_one(p: Path) -> List[Dict[str, Any]]:
+        animal_id = _infer_animal_id(p)
+        meta = animal_meta.get(animal_id, {"animal_id": animal_id, "treatment_date": None, "hit_type": None, "hit_type_norm": None, "group": "unknown"})
+        return process_one_npz(p, meta, cfg_eff)
 
     if workers <= 1 or len(todo) <= 1:
         for p in todo:
-            meta = _meta_for_path(p)
-            try:
-                rows = process_one_npz(p, meta, cfg_eff)
-                all_rows.extend(rows)
-            except Exception as e:
-                print(f"[error] {p}: {e}")
+            all_rows.extend(_run_one(p))
     else:
-        # Use a TOP-LEVEL worker function (macOS/Windows use 'spawn' -> local/nested fns can't be pickled)
         import concurrent.futures as _fut
         with _fut.ProcessPoolExecutor(max_workers=workers) as ex:
-            fut_map: Dict[Any, Path] = {}
-            for p in todo:
-                meta = _meta_for_path(p)
-                fut = ex.submit(_run_one_npz_worker, str(p), meta, cfg_eff)
-                fut_map[fut] = p
-
-            for fut in _fut.as_completed(fut_map):
-                p = fut_map[fut]
+            futs = {ex.submit(_run_one, p): p for p in todo}
+            for fu in _fut.as_completed(futs):
+                p = futs[fu]
                 try:
-                    rows = fut.result()
-                    all_rows.extend(rows)
+                    all_rows.extend(fu.result())
                 except Exception as e:
                     print(f"[error] {p}: {e}")
+
     df = pd.DataFrame(all_rows)
     if len(df) == 0:
         df = pd.DataFrame(columns=[
@@ -1138,74 +1058,45 @@ def run_root_directory_pre_post_treatment(cfg: PrePostConfig, *, force_recompute
     return plot_paths
 
 def _build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Levina–Bickel intrinsic dimensionality: pre vs post treatment (cluster-wise).")
+    p = argparse.ArgumentParser(
+        prog="Levina_Bickel_pre_vs_post_treatment.py",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("--root-dir", required=True, type=str, help="Directory containing NPZ(s) (bird folder or parent).")
+    p.add_argument("--metadata-xlsx", required=True, type=str, help="Excel metadata with treatment dates and hit types.")
+    p.add_argument("--metadata-sheet", default="animal_hit_type_summary", type=str,
+                   help="Sheet to read hit types from (treatment dates may be pulled from 'metadata' sheet if missing here).")
+    p.add_argument("--out-dir", default=None, type=str, help="Output directory (default: <root-dir>/lb_pre_post_dimensionality_k<k>/).")
+    p.add_argument("--recursive", action="store_true", help="Recursively search for NPZs under --root-dir.")
 
-    p.add_argument("--root-dir", required=True, type=str, help="Root directory containing .npz files (or animal subfolders).")
-    p.add_argument("--metadata-xlsx", required=True, type=str, help="Excel metadata file with treatment dates + hit types.")
-    p.add_argument("--out-dir", type=str, default=None, help="Output directory (default: <root-dir>/lb_pre_post_dimensionality_k{K}).")
+    p.add_argument("--array-key", default="predictions", type=str, help="Key in NPZ for high-dim data used for ID.")
+    p.add_argument("--cluster-key", default="hdbscan_labels", type=str, help="Key in NPZ for cluster labels.")
+    p.add_argument("--file-key", default="file_indices", type=str, help="Key in NPZ for file indices.")
+    p.add_argument("--include-noise", action="store_true", help="Include HDBSCAN noise label (-1).")
 
-    p.add_argument("--recursive", action="store_true", help="Search for .npz files in all subfolders of --root-dir.")
-    p.add_argument("--metadata-sheet", type=str, default="animal_hit_type_summary",
-                   help="Sheet name containing Animal ID + lesion hit type (default: animal_hit_type_summary).")
-    p.add_argument("--treatment-date-sheet", type=str, default="metadata",
-                   help="Sheet name to look up treatment date if not present in --metadata-sheet (default: metadata).")
-    p.add_argument("--hit-type-col", type=str, default="Lesion hit type",
-                   help="Column name in metadata for lesion hit type (default: 'Lesion hit type').")
-    p.add_argument("--treatment-date-col", type=str, default="Treatment date",
-                   help="Column name in metadata for treatment/surgery date (default: 'Treatment date').")
-
-    p.add_argument("--array-key", type=str, default="predictions", help="NPZ key for feature vectors (default: predictions).")
-    p.add_argument("--cluster-key", type=str, default="hdbscan_labels", help="NPZ key for cluster labels (default: hdbscan_labels).")
-    p.add_argument("--syllable-key", type=str, default="ground_truth_labels",
-                   help="Optional NPZ key for syllable labels (default: ground_truth_labels).")
-    p.add_argument("--file-key", type=str, default="file_indices", help="NPZ key mapping points->file index (default: file_indices).")
-    p.add_argument("--date-key", type=str, default="file_map",
-                   help="NPZ key that holds file_map for parsing file datetimes (default: file_map).")
-
-    p.add_argument("--include-noise", action="store_true", help="Include noise cluster (-1).")
     p.add_argument("--no-vocalization-only", action="store_true",
-                   help="If set, do NOT filter to vocalization-only (i.e., include non-vocalization bins).")
-    p.add_argument("--vocalization-key", type=str, default="vocalization",
-                   help="NPZ key for vocalization mask (default: vocalization).")
+                   help="Do NOT restrict to vocalization==1 (if vocalization key exists).")
+    p.add_argument("--vocalization-key", default="vocalization", type=str, help="Key in NPZ for vocalization mask.")
 
-    p.add_argument("--k", type=int, default=15, help="k for Levina–Bickel estimator (default: 15).")
-    p.add_argument("--point-agg", type=str, choices=["mean", "median"], default="median",
-                   help="How to aggregate pointwise dim estimates into one value per cluster-period (default: median).")
-    p.add_argument("--n-jobs", type=int, default=0, help="Threads for NearestNeighbors (0 => auto by computer-power).")
-    p.add_argument("--min-points-per-period", type=int, default=200,
-                   help="Minimum points required in PRE and POST for a cluster to be included (default: 200).")
+    p.add_argument("--k", default=15, type=int, help="k for Levina–Bickel (kNN).")
+    p.add_argument("--point-agg", default="mean", choices=["mean", "median"],
+                   help="Aggregate local m_i estimates with mean or median.")
+    p.add_argument("--n-jobs", default=0, type=int, help="Threads for NearestNeighbors (0 => auto by --computer-power).")
+    p.add_argument("--workers", default=0, type=int, help="Processes across NPZ files (0 => auto by --computer-power; 1 => serial).")
+    p.add_argument("--min-points-per-period", default=200, type=int, help="Min points required in both pre and post for a cluster.")
     p.add_argument("--exclude-treatment-day-from-post", action="store_true",
-                   help="Exclude points from the treatment day in POST period.")
-    p.add_argument("--max-points-per-cluster-period", type=int, default=None,
-                   help="Subsample cap per cluster per period (None => auto by computer-power).")
+                   help="If set, POST starts the day *after* treatment day (treatment day excluded).")
+    p.add_argument("--max-points-per-cluster-period", default=None, type=int,
+                   help="Subsample cap per cluster per period (None => auto by --computer-power).")
 
-    p.add_argument("--stats-csv", type=str, default=None,
-                   help="Optional: path for the combined output CSV (default: <out-dir>/lb_pre_post_cluster_dimensionality_k{K}.csv).")
+    p.add_argument("--computer-power", default="laptop", choices=["laptop", "pro"],
+                   help="Sets defaults for workers/n_jobs/caps when not provided.")
 
-    p.add_argument("--variance-high-quantile", type=float, default=0.7,
-                   help="(Optional) high-variance cutoff quantile for phrase-duration stats comparisons (default: 0.7).")
-    p.add_argument("--stats-group-value", type=str, default=None,
-                   help="(Optional) group label in stats CSV to filter on (e.g., a hit type).")
-    p.add_argument("--stats-variance-col", type=str, default="variance_tier",
-                   help="(Optional) variance tier column in stats CSV (default: variance_tier).")
-
-    p.add_argument("--computer-power", type=str, default="laptop", choices=["laptop", "pro"],
-                   help="Sets default workers/n_jobs/caps when not provided.")
-    p.add_argument("--workers", type=int, default=0,
-                   help="Processes across NPZ files (0 => auto by computer-power; 1 => serial).")
-
-    p.add_argument("--resume", action="store_true",
-                   help="If combined CSV exists, compute only missing NPZs and append; otherwise just plot the existing CSV.")
-    p.add_argument("--force-recompute", dest="force_recompute", action="store_true",
-                   help="Ignore existing combined CSV and recompute everything.")
-
-    p.add_argument("--treatment-date", type=str, default=None,
-                   help="Override treatment date (YYYY-MM-DD) for ALL animals (rare).")
-    p.add_argument("--hit-type", type=str, default=None,
-                   help="Override hit type (string) for ALL animals (rare).")
-
-    p.add_argument("--verbose-dates", action="store_true", help="Print date-parsing coverage diagnostics.")
-    p.add_argument("--no-show", action="store_true", help="Do not display plots interactively.")
+    # debugging / override hooks
+    p.add_argument("--treatment-date", default=None, type=str,
+                   help="Override treatment date for ALL birds (YYYY-MM-DD or ISO datetime).")
+    p.add_argument("--hit-type", default=None, type=str, help="Override hit type for ALL birds (mainly for debugging).")
+    p.add_argument("--verbose-dates", action="store_true", help="Print date parsing diagnostics and pre/post counts.")
 
     return p
 
@@ -1221,7 +1112,6 @@ def main() -> None:
         stats_csv=Path(args.stats_csv) if args.stats_csv else None,
         hit_type_col=args.hit_type_col,
         treatment_date_col=args.treatment_date_col,
-        treatment_date_sheet=args.treatment_date_sheet,
         recursive=bool(args.recursive),
 
         array_key=args.array_key,
@@ -1249,7 +1139,7 @@ def main() -> None:
         verbose_dates=bool(args.verbose_dates),
     )
 
-    paths = run_root_directory_pre_post_treatment(cfg, force_recompute=args.force_recompute, resume=args.resume)
+    paths = run_root_directory_pre_post_treatment(cfg, force_recompute=args.force_recompute, resume=(not args.no_resume))
     print("\nOutputs:")
     for k, v in paths.items():
         print(f"  {k}: {v}")
