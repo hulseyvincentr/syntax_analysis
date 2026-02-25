@@ -68,3 +68,4 @@ __pycache__/
 *.csv
 *.parquet
 *.npz
+data_inputs/
