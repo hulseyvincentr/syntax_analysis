@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Levina_Bickel_pre_vs_post_treatment.py
+Levina_Bickel_pre_vs_post_treatment_balanced_early_late.py
 
 Compute Levina–Bickel intrinsic dimensionality estimates PRE vs POST treatment
 from "bird seasonality" style NPZs (with file_indices + file_map).
@@ -45,7 +45,7 @@ Outputs
 
 Example
 -------
-python Levina_Bickel_pre_vs_post_treatment.py \
+python Levina_Bickel_pre_vs_post_treatment_balanced_early_late.py \
   --root-dir "/Volumes/my_own_SSD/updated_AreaX_outputs" \
   --metadata-xlsx "/Volumes/my_own_SSD/updated_AreaX_outputs/Area_X_lesion_metadata_with_hit_types.xlsx" \
   --metadata-sheet "animal_hit_type_summary" \
@@ -111,6 +111,14 @@ class PrePostConfig:
     min_points_per_period: int = 200  # min points required in pre and post for a cluster
     exclude_treatment_day_from_post: bool = False
     max_points_per_cluster_period: Optional[int] = None  # subsample cap per (cluster, period)
+
+    # NEW: balance sample sizes within each comparison by subsampling both sides to min(nA, nB)
+    balance_pair_samples: bool = True
+    random_seed: int = 0
+
+    # NEW: early/late splits within PRE and within POST (based on file datetime)
+    split_early_late: bool = True
+    early_late_split_method: str = "file_median"  # file_median or file_half
 
     computer_power: str = "laptop"  # laptop or pro
 
@@ -256,13 +264,13 @@ def _map_hit_type_to_group(hit_type: str) -> str:
         return "sham saline injection"
 
     if "singlehit" in norm:
-        return "Area X visible (single hit)"
+        return "Lateral hit only"
 
     # combined group
     if ("medial" in norm and "lateral" in norm) or ("ml" in norm and "visible" in norm):
-        return "Combined (visible ML + not visible)"
+        return "Medial Lateral hit, combined with large lesion"
     if "notvisible" in norm or ("large" in norm and "notvisible" in norm):
-        return "Combined (visible ML + not visible)"
+        return "Medial Lateral hit, combined with large lesion"
 
     # fallback: keep original for debugging
     return str(hit_type)
@@ -562,6 +570,85 @@ def _split_pre_post_masks(
 
     return pre, post
 
+def _balanced_subsample_pair(
+    idx_a: np.ndarray,
+    idx_b: np.ndarray,
+    *,
+    rng: np.random.Generator,
+    cap: Optional[int] = None,
+) -> Tuple[np.ndarray, np.ndarray, int, int, int]:
+    """Balance sample sizes without replacement.
+
+    Target size = min(len(idx_a), len(idx_b), cap(if provided)).
+    Returns: (idx_a_sub, idx_b_sub, n_target, n_a_raw, n_b_raw)
+    """
+    n_a_raw = int(idx_a.size)
+    n_b_raw = int(idx_b.size)
+    n_target = min(n_a_raw, n_b_raw)
+    if cap is not None:
+        n_target = min(n_target, int(cap))
+
+    if n_target <= 0:
+        return idx_a[:0], idx_b[:0], 0, n_a_raw, n_b_raw
+
+    if idx_a.size > n_target:
+        idx_a = rng.choice(idx_a, size=n_target, replace=False)
+    if idx_b.size > n_target:
+        idx_b = rng.choice(idx_b, size=n_target, replace=False)
+
+    return idx_a, idx_b, int(n_target), n_a_raw, n_b_raw
+
+
+def _split_early_late_masks_by_file(
+    file_indices: np.ndarray,
+    file_dt_map: Dict[int, _dt.datetime],
+    period_mask: np.ndarray,
+    *,
+    method: str = "file_median",
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Split a period mask into early/late by file datetime (point-level masks).
+
+    method:
+      - "file_median": early = files with dt <= median(dt), late = dt > median(dt)
+      - "file_half":   early = first half of files sorted by dt, late = second half
+
+    If there are <2 dated files in the period, returns (period_mask, all-False).
+    """
+    fi = file_indices.astype(int)
+    files = np.unique(fi[period_mask])
+
+    file_dts: List[Tuple[int, _dt.datetime]] = []
+    for f in files:
+        dt = file_dt_map.get(int(f), None)
+        if dt is not None:
+            file_dts.append((int(f), dt))
+
+    if len(file_dts) < 2:
+        return period_mask.copy(), np.zeros_like(period_mask, dtype=bool)
+
+    file_dts.sort(key=lambda t: t[1])
+
+    if method == "file_half":
+        mid = len(file_dts) // 2
+        early_files = {f for f, _ in file_dts[:mid]}
+        late_files = {f for f, _ in file_dts[mid:]}
+    else:
+        ts = np.array([dt.timestamp() for _, dt in file_dts], dtype=float)
+        med = float(np.median(ts))
+        early_files = {f for (f, dt) in file_dts if dt.timestamp() <= med}
+        late_files = {f for (f, dt) in file_dts if dt.timestamp() > med}
+
+        # fallback if ties put everything in early
+        if len(late_files) == 0:
+            mid = len(file_dts) // 2
+            early_files = {f for f, _ in file_dts[:mid]}
+            late_files = {f for f, _ in file_dts[mid:]}
+
+    early_mask = period_mask & np.isin(fi, np.fromiter(early_files, dtype=int))
+    late_mask = period_mask & np.isin(fi, np.fromiter(late_files, dtype=int))
+    return early_mask, late_mask
+
+
 
 def process_one_npz(npz_path: Path, meta: Dict[str, Any], cfg: PrePostConfig) -> List[Dict[str, Any]]:
     """
@@ -637,54 +724,151 @@ def process_one_npz(npz_path: Path, meta: Dict[str, Any], cfg: PrePostConfig) ->
         labels = labels[labels != -1]
 
     # cap logic
-    rng = np.random.default_rng(0)
+    rng = np.random.default_rng(int(cfg.random_seed))
     cap = cfg.max_points_per_cluster_period
 
-    rows: List[Dict[str, Any]] = []
-    for lab in labels:
-        lab = int(lab)
+    # Optional early/late splits (point-level masks)
+    pre_early_mask = pre_late_mask = None
+    post_early_mask = post_late_mask = None
+    if cfg.split_early_late:
+        pre_early_mask, pre_late_mask = _split_early_late_masks_by_file(
+            file_indices=file_indices,
+            file_dt_map=file_dt_map,
+            period_mask=pre_mask,
+            method=cfg.early_late_split_method,
+        )
+        post_early_mask, post_late_mask = _split_early_late_masks_by_file(
+            file_indices=file_indices,
+            file_dt_map=file_dt_map,
+            period_mask=post_mask,
+            method=cfg.early_late_split_method,
+        )
 
-        idx_pre = np.where(pre_mask & (clusters.astype(int) == lab))[0]
-        idx_post = np.where(post_mask & (clusters.astype(int) == lab))[0]
+    need = max(cfg.min_points_per_period, cfg.k + 1)
 
-        if idx_pre.size < max(cfg.min_points_per_period, cfg.k + 1):
-            continue
-        if idx_post.size < max(cfg.min_points_per_period, cfg.k + 1):
-            continue
+    def _compute_pair_row(
+        *,
+        lab: int,
+        mask_a: np.ndarray,
+        mask_b: np.ndarray,
+        period_a: str,
+        period_b: str,
+        comparison: str,
+    ) -> Optional[Dict[str, Any]]:
+        idx_a = np.where(mask_a & (clusters.astype(int) == lab))[0]
+        idx_b = np.where(mask_b & (clusters.astype(int) == lab))[0]
 
-        # subsample
-        if cap is not None:
-            if idx_pre.size > cap:
-                idx_pre = rng.choice(idx_pre, size=cap, replace=False)
-            if idx_post.size > cap:
-                idx_post = rng.choice(idx_post, size=cap, replace=False)
+        if idx_a.size < need or idx_b.size < need:
+            return None
 
-        X_pre = X[idx_pre]
-        X_post = X[idx_post]
+        # balance + cap
+        if cfg.balance_pair_samples:
+            idx_a, idx_b, n_target, n_a_raw, n_b_raw = _balanced_subsample_pair(idx_a, idx_b, rng=rng, cap=cap)
+            if n_target < need:
+                return None
+        else:
+            n_a_raw, n_b_raw = int(idx_a.size), int(idx_b.size)
+            if cap is not None:
+                if idx_a.size > cap:
+                    idx_a = rng.choice(idx_a, size=cap, replace=False)
+                if idx_b.size > cap:
+                    idx_b = rng.choice(idx_b, size=cap, replace=False)
 
-        d_pre = levina_bickel_id(X_pre, k=cfg.k, n_jobs=cfg.n_jobs, point_agg=cfg.point_agg)
-        d_post = levina_bickel_id(X_post, k=cfg.k, n_jobs=cfg.n_jobs, point_agg=cfg.point_agg)
+        X_a = X[idx_a]
+        X_b = X[idx_b]
 
-        if not (np.isfinite(d_pre) and np.isfinite(d_post)):
-            continue
+        d_a = levina_bickel_id(X_a, k=cfg.k, n_jobs=cfg.n_jobs, point_agg=cfg.point_agg)
+        d_b = levina_bickel_id(X_b, k=cfg.k, n_jobs=cfg.n_jobs, point_agg=cfg.point_agg)
 
-        rows.append({
+        if not (np.isfinite(d_a) and np.isfinite(d_b)):
+            return None
+
+        row: Dict[str, Any] = {
             "animal_id": animal_id,
             "npz_path": str(npz_path),
             "hit_type": hit_type if hit_type is not None else "",
             "group": group,
             "treatment_date": td.date().isoformat(),
             "cluster_label": lab,
+            "comparison": comparison,
+            "period_a": period_a,
+            "period_b": period_b,
             "k": cfg.k,
-            "n_pre": int(idx_pre.size),
-            "n_post": int(idx_post.size),
-            "pre_dim": float(d_pre),
-            "post_dim": float(d_post),
-            "delta_dim": float(d_post - d_pre),
-        })
+            "n_a_raw": int(n_a_raw),
+            "n_b_raw": int(n_b_raw),
+            "n_a": int(idx_a.size),
+            "n_b": int(idx_b.size),
+            "a_dim": float(d_a),
+            "b_dim": float(d_b),
+            "delta_dim": float(d_b - d_a),
+        }
+
+        # Backwards-compatible columns for the main pre_vs_post comparison
+        if comparison == "pre_vs_post":
+            row.update({
+                "n_pre": int(idx_a.size),
+                "n_post": int(idx_b.size),
+                "pre_dim": float(d_a),
+                "post_dim": float(d_b),
+            })
+
+        return row
+
+    rows: List[Dict[str, Any]] = []
+    for lab in labels:
+        lab = int(lab)
+
+        r = _compute_pair_row(
+            lab=lab,
+            mask_a=pre_mask,
+            mask_b=post_mask,
+            period_a="pre",
+            period_b="post",
+            comparison="pre_vs_post",
+        )
+        if r is not None:
+            rows.append(r)
+
+        if cfg.split_early_late and pre_early_mask is not None and pre_late_mask is not None:
+            r = _compute_pair_row(
+                lab=lab,
+                mask_a=pre_early_mask,
+                mask_b=pre_late_mask,
+                period_a="pre_early",
+                period_b="pre_late",
+                comparison="pre_early_vs_late",
+            )
+            if r is not None:
+                rows.append(r)
+
+        if cfg.split_early_late and post_early_mask is not None and post_late_mask is not None:
+            r = _compute_pair_row(
+                lab=lab,
+                mask_a=post_early_mask,
+                mask_b=post_late_mask,
+                period_a="post_early",
+                period_b="post_late",
+                comparison="post_early_vs_late",
+            )
+            if r is not None:
+                rows.append(r)
+
+        # NEW: transition comparison across lesion boundary using late PRE vs early POST
+        if cfg.split_early_late and pre_late_mask is not None and post_early_mask is not None:
+            r = _compute_pair_row(
+                lab=lab,
+                mask_a=pre_late_mask,
+                mask_b=post_early_mask,
+                period_a="pre_late",
+                period_b="post_early",
+                comparison="late_pre_vs_early_post",
+            )
+            if r is not None:
+                rows.append(r)
+
 
     dt = time.time() - t_start
-    print(f"[pre/post] done: {npz_path.name} in {dt:.2f} s  (clusters={len(rows)})")
+    print(f"[pre/post] done: {npz_path.name} in {dt:.2f} s  (rows={len(rows)})")
     return rows
 
 
@@ -693,22 +877,37 @@ def process_one_npz(npz_path: Path, meta: Dict[str, Any], cfg: PrePostConfig) ->
 # -----------------------------
 _GROUP_ORDER = [
     "sham saline injection",
-    "Area X visible (single hit)",
-    "Combined (visible ML + not visible)",
+    "Lateral hit only",
+    "Medial Lateral hit, combined with large lesion",
 ]
 
 
-def _scatter_pre_post_by_group(df: pd.DataFrame, out_png: Path, title: str) -> None:
+def _pretty_group_name(grp: str) -> str:
+    """Human-friendly label wrapping for plot titles/ticks."""
+    if grp == "Medial Lateral hit, combined with large lesion":
+        return "Medial Lateral hit,\ncombined with large lesion"
+    return grp
+
+def _scatter_pair_by_group(
+    df: pd.DataFrame,
+    out_png: Path,
+    title: str,
+    *,
+    x_col: str,
+    y_col: str,
+    x_label: str,
+    y_label: str,
+) -> None:
     fig, axes = plt.subplots(1, 3, figsize=(14, 5), sharex=True, sharey=True)
     fig.suptitle(title, y=0.98)
 
     have_any = False
     for ax, grp in zip(axes, _GROUP_ORDER):
         sub = df[df["group"] == grp]
-        ax.set_title(grp)
-        ax.set_xlabel("Pre dimension")
+        ax.set_title(_pretty_group_name(grp))
+        ax.set_xlabel(x_label)
         if ax is axes[0]:
-            ax.set_ylabel("Post dimension")
+            ax.set_ylabel(y_label)
         ax.grid(True, alpha=0.3)
         ax.plot([0, 1], [0, 1], linestyle="--")  # will autoscale after scatter
 
@@ -717,18 +916,19 @@ def _scatter_pre_post_by_group(df: pd.DataFrame, out_png: Path, title: str) -> N
             continue
 
         have_any = True
-        ax.scatter(sub["pre_dim"], sub["post_dim"], s=14, alpha=0.7)
+        ax.scatter(sub[x_col], sub[y_col], s=14, alpha=0.7)
 
     if have_any:
-        # autoscale nicely based on data range
-        allv = pd.concat([df["pre_dim"], df["post_dim"]], axis=0).values
-        lo = float(np.nanmin(allv))
-        hi = float(np.nanmax(allv))
-        if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
-            pad = 0.05 * (hi - lo)
-            for ax in axes:
-                ax.set_xlim(lo - pad, hi + pad)
-                ax.set_ylim(lo - pad, hi + pad)
+        allv = pd.concat([df[x_col], df[y_col]], axis=0).to_numpy(dtype=float)
+        allv = allv[np.isfinite(allv)]
+        if allv.size:
+            lo = float(np.nanmin(allv))
+            hi = float(np.nanmax(allv))
+            if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
+                pad = 0.05 * (hi - lo)
+                for ax in axes:
+                    ax.set_xlim(lo - pad, hi + pad)
+                    ax.set_ylim(lo - pad, hi + pad)
 
     fig.tight_layout()
     fig.savefig(out_png, dpi=200)
@@ -782,6 +982,7 @@ def _box_delta_by_group(
     out_png: Path,
     title: str,
     out_stats_txt: Optional[Path] = None,
+    ylabel: str = "Δ intrinsic dimension (B − A)",
     alpha: float = 0.05,
     correction: str = "holm",
 ) -> None:
@@ -797,7 +998,7 @@ def _box_delta_by_group(
     """
     fig, ax = plt.subplots(1, 1, figsize=(10, 5))
     ax.set_title(title)
-    ax.set_ylabel("Δ intrinsic dimension (post − pre)")
+    ax.set_ylabel(ylabel)
     ax.grid(True, axis="y", alpha=0.3)
 
     data: List[np.ndarray] = []
@@ -810,7 +1011,7 @@ def _box_delta_by_group(
         vals = vals[np.isfinite(vals)]
         grp_vals[grp] = vals
         data.append(vals)
-        labels.append(f"{grp}\n(n={len(vals)})")
+        labels.append(f"{_pretty_group_name(grp)}\n(n={len(vals)})")
 
     stats_lines: List[str] = []
     stats_lines.append(f"{title}")
@@ -978,9 +1179,274 @@ def _box_delta_by_group(
     fig.savefig(out_png, dpi=200)
     plt.close(fig)
 
+
+def _paired_pre_drift_vs_post_drift_birdlevel(
+    df_bird: pd.DataFrame,
+    out_png: Path,
+    title: str,
+    out_stats_txt: Optional[Path] = None,
+    ylabel: str = "Δ intrinsic dimension (late − early)",
+) -> None:
+    """
+    Paired comparison (WITHIN BIRD) of:
+      1) pre drift  = (late pre − early pre)
+      2) post drift = (late post − early post)
+
+    Each point/line = one bird (mean across clusters within that bird and comparison).
+    Faceted by lesion-hit-type group.
+
+    Requires df_bird to contain comparisons:
+      - "pre_early_vs_late"  with delta_dim = late_pre - early_pre
+      - "post_early_vs_late" with delta_dim = late_post - early_post
+    """
+    if "comparison" not in df_bird.columns:
+        return
+
+    pre = df_bird[df_bird["comparison"] == "pre_early_vs_late"][["animal_id", "group", "delta_dim"]].copy()
+    post = df_bird[df_bird["comparison"] == "post_early_vs_late"][["animal_id", "group", "delta_dim"]].copy()
+    pre = pre.rename(columns={"delta_dim": "delta_pre"})
+    post = post.rename(columns={"delta_dim": "delta_post"})
+
+    merged = pd.merge(pre, post, on=["animal_id", "group"], how="inner")
+    if len(merged) == 0:
+        return
+
+    # stats text
+    stats_lines: List[str] = []
+    stats_lines.append(title)
+    stats_lines.append("Paired within-bird comparison: delta_post vs delta_pre")
+    stats_lines.append("delta_pre  = (late pre − early pre)")
+    stats_lines.append("delta_post = (late post − early post)")
+    stats_lines.append("")
+
+    fig, axes = plt.subplots(1, 3, figsize=(14, 5), sharey=True)
+    fig.suptitle(title, y=0.98)
+
+    all_vals = np.concatenate([
+        merged["delta_pre"].to_numpy(dtype=float),
+        merged["delta_post"].to_numpy(dtype=float),
+    ])
+    all_vals = all_vals[np.isfinite(all_vals)]
+    if all_vals.size == 0:
+        return
+    lo = float(np.nanmin(all_vals))
+    hi = float(np.nanmax(all_vals))
+    if hi <= lo:
+        hi = lo + 1.0
+    pad = 0.1 * (hi - lo)
+
+    x_pre = 1.0
+    x_post = 2.0
+
+    for ax, grp in zip(axes, _GROUP_ORDER):
+        sub = merged[merged["group"] == grp].copy()
+        sub = sub[np.isfinite(sub["delta_pre"].to_numpy(dtype=float)) & np.isfinite(sub["delta_post"].to_numpy(dtype=float))]
+
+        ax.set_title(_pretty_group_name(grp))
+        ax.set_xticks([x_pre, x_post])
+        ax.set_xticklabels(["pre-lesion", "post-lesion"])
+        ax.tick_params(axis="x", labelsize=10)
+        ax.grid(True, alpha=0.3)
+        ax.axhline(0.0, linestyle="--", linewidth=1)
+
+        if ax is axes[0]:
+            ax.set_ylabel(ylabel)
+
+        if len(sub) == 0:
+            ax.text(0.5, 0.5, "No birds", ha="center", va="center", transform=ax.transAxes)
+            continue
+
+        y_pre = sub["delta_pre"].to_numpy(dtype=float)
+        y_post = sub["delta_post"].to_numpy(dtype=float)
+
+        # boxplots (bird-level distributions)
+        bp = ax.boxplot(
+            [y_pre, y_post],
+            positions=[x_pre, x_post],
+            widths=0.5,
+            patch_artist=True,
+            showfliers=True,
+        )
+        for patch in bp["boxes"]:
+            patch.set_alpha(0.6)
+
+        # paired lines/points (one per bird)
+        # small deterministic jitter so overlapping points are visible
+        n = len(sub)
+        jitter = (np.linspace(-0.06, 0.06, n) if n > 1 else np.array([0.0]))
+        for j, (yp, yq) in enumerate(zip(y_pre, y_post)):
+            ax.plot([x_pre + jitter[j], x_post + jitter[j]], [yp, yq], alpha=0.6, linewidth=1)
+            ax.scatter([x_pre + jitter[j], x_post + jitter[j]], [yp, yq], s=18, alpha=0.85)
+
+        # paired test within group (post drift vs pre drift)
+        p_val = float("nan")
+        if _HAVE_SCIPY and len(y_pre) >= 3:
+            try:
+                # Wilcoxon signed-rank on paired differences
+                d = y_post - y_pre
+                # If all diffs are zero, wilcoxon can fail; guard it.
+                if np.any(np.abs(d) > 0):
+                    w = _scipy_stats.wilcoxon(d, zero_method="wilcox", alternative="two-sided")
+                    p_val = float(w.pvalue)
+            except Exception:
+                p_val = float("nan")
+
+        stats_lines.append(f"{grp}: n_birds={len(y_pre)}  mean_pre={float(np.mean(y_pre)):.6g}  mean_post={float(np.mean(y_post)):.6g}  mean_diff(post-pre)={float(np.mean(y_post - y_pre)):.6g}  paired_p={p_val:.6g}")
+
+        # annotate p-value on the plot (simple text)
+        if np.isfinite(p_val):
+            label = f"{_p_to_stars(p_val)} (p={p_val:.3g})"
+        else:
+            label = "paired test n/a"
+        ax.text(0.5, 0.95, label, ha="center", va="top", transform=ax.transAxes)
+
+        ax.set_ylim(lo - pad, hi + pad)
+
+    if out_stats_txt is not None:
+        out_stats_txt.write_text("\n".join(stats_lines) + "\n")
+
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=200)
+    plt.close(fig)
+
+
 # -----------------------------
 # Driver
 # -----------------------------
+
+
+
+def _box_delta_by_group_birdlevel(
+    df: pd.DataFrame,
+    out_png: Path,
+    title: str,
+    out_stats_txt: Optional[Path] = None,
+    ylabel: str = "Δ intrinsic dimension (B − A)",
+    alpha: float = 0.05,
+    correction: str = "holm",
+) -> None:
+    """
+    Bird-level boxplot of Δ split by lesion-hit-type group.
+
+    Each point is ONE bird (Δ is the bird-mean across clusters for a given comparison).
+    This avoids pseudo-replication from treating multiple clusters within a bird as independent.
+    """
+    fig, ax = plt.subplots(1, 1, figsize=(10, 5))
+    ax.set_title(title)
+    ax.set_ylabel(ylabel)
+    ax.grid(True, axis="y", alpha=0.3)
+
+    data: List[np.ndarray] = []
+    tick_labels: List[str] = []
+    grp_vals: Dict[str, np.ndarray] = {}
+
+    for grp in _GROUP_ORDER:
+        sub = df[df["group"] == grp]
+        vals = sub["delta_dim"].to_numpy(dtype=float) if len(sub) else np.array([], dtype=float)
+        vals = vals[np.isfinite(vals)]
+        grp_vals[grp] = vals
+        data.append(vals)
+        tick_labels.append(f"{_pretty_group_name(grp)}\n(n={len(vals)} birds)")
+
+    stats_lines: List[str] = []
+    stats_lines.append(f"{title}")
+    stats_lines.append(f"Generated: {_dt.datetime.now().isoformat(timespec='seconds')}")
+    stats_lines.append("")
+    stats_lines.append("=== Bird-level (each point = 1 bird) ===")
+    for grp in _GROUP_ORDER:
+        v = grp_vals[grp]
+        if len(v) == 0:
+            stats_lines.append(f"{grp}: n=0")
+        else:
+            stats_lines.append(f"{grp}: n={len(v)}  mean={float(np.mean(v)):.6g}  median={float(np.median(v)):.6g}")
+
+    if all(len(x) == 0 for x in data):
+        ax.text(0.5, 0.5, "No valid bird estimates to plot.", ha="center", va="center", transform=ax.transAxes)
+        if out_stats_txt is not None:
+            out_stats_txt.write_text("\n".join(stats_lines) + "\n\n(No data)\n")
+        fig.tight_layout()
+        fig.savefig(out_png, dpi=200)
+        plt.close(fig)
+        return
+
+    ax.boxplot(data, tick_labels=tick_labels, patch_artist=True)
+    ax.axhline(0, linestyle="--", linewidth=1)
+
+    if not _HAVE_SCIPY:
+        stats_lines.append("")
+        stats_lines.append("SciPy not available: skipping significance tests.")
+    else:
+        valid = [(i, grp, v) for i, (grp, v) in enumerate(grp_vals.items(), start=1) if len(v) >= 2]
+        if len(valid) < 2:
+            stats_lines.append("")
+            stats_lines.append("Not enough data for tests (need >=2 groups with n>=2).")
+        else:
+            try:
+                H, p_omni = _scipy_stats.kruskal(*[v for _, _, v in valid])
+                stats_lines.append("")
+                stats_lines.append(f"Kruskal–Wallis across groups: H={float(H):.6g}, p={float(p_omni):.6g}")
+            except Exception as e:
+                stats_lines.append("")
+                stats_lines.append(f"Kruskal–Wallis failed: {e}")
+
+            from itertools import combinations
+            pairs = list(combinations(valid, 2))
+            raw_ps: List[float] = []
+            results = []
+            for (i1, g1, v1), (i2, g2, v2) in pairs:
+                try:
+                    mwu = _scipy_stats.mannwhitneyu(v1, v2, alternative="two-sided")
+                    p = float(mwu.pvalue)
+                    u = float(mwu.statistic)
+                    rbc = _rank_biserial_from_u(u, len(v1), len(v2))
+                except Exception:
+                    p = float("nan")
+                    u = float("nan")
+                    rbc = float("nan")
+                raw_ps.append(p)
+                results.append((i1, g1, len(v1), i2, g2, len(v2), u, p, rbc))
+
+            m = len(raw_ps)
+            if correction.lower().startswith("bonf"):
+                adj_ps = [min(1.0, (p * m)) if np.isfinite(p) else float("nan") for p in raw_ps]
+                corr_name = "Bonferroni"
+            else:
+                adj_ps = _holm_adjust([p if np.isfinite(p) else 1.0 for p in raw_ps])
+                adj_ps = [float("nan") if not np.isfinite(p) else float(a) for p, a in zip(raw_ps, adj_ps)]
+                corr_name = "Holm"
+
+            stats_lines.append("")
+            stats_lines.append(f"Pairwise Mann–Whitney U (two-sided), {corr_name}-corrected:")
+            for (i1, g1, n1, i2, g2, n2, u, p, rbc), p_adj in zip(results, adj_ps):
+                stats_lines.append(
+                    f"  {g1} (n={n1}) vs {g2} (n={n2}): U={u:.6g}, p={p:.6g}, p_adj={p_adj:.6g}, rank-biserial={rbc:.4f}"
+                )
+
+            all_vals = np.concatenate([x for x in data if len(x)], axis=0)
+            y_max = float(np.nanmax(all_vals))
+            y_min = float(np.nanmin(all_vals))
+            y_rng = y_max - y_min
+            if not np.isfinite(y_rng) or y_rng <= 0:
+                y_rng = 1.0
+            base = y_max + 0.05 * y_rng
+            step = 0.08 * y_rng
+            h = 0.02 * y_rng
+
+            for k, ((i1, g1, n1, i2, g2, n2, u, p, rbc), p_adj) in enumerate(zip(results, adj_ps)):
+                if not np.isfinite(p_adj):
+                    continue
+                label = f"{_p_to_stars(p_adj)} (p={p_adj:.3g})" if p_adj < 0.1 else f"{_p_to_stars(p_adj)}"
+                _annotate_sig(ax, i1, i2, base + k * step, h, label)
+
+            ax.set_ylim(top=base + max(1, len(results)) * step + 0.1 * y_rng)
+
+    if out_stats_txt is not None:
+        out_stats_txt.write_text("\n".join(stats_lines) + "\n")
+
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=200)
+    plt.close(fig)
+
 def run_root_directory_pre_post_treatment(cfg: PrePostConfig) -> Dict[str, str]:
     defaults = _choose_defaults(cfg.computer_power)
 
@@ -996,7 +1462,7 @@ def run_root_directory_pre_post_treatment(cfg: PrePostConfig) -> Dict[str, str]:
     cfg_eff = PrePostConfig(**{**cfg.__dict__, "workers": workers, "n_jobs": n_jobs, "max_points_per_cluster_period": cap})
 
     root_dir = cfg_eff.root_dir
-    out_dir = cfg_eff.out_dir if cfg_eff.out_dir is not None else (root_dir / f"lb_pre_post_dimensionality_k{cfg_eff.k}")
+    out_dir = cfg_eff.out_dir if cfg_eff.out_dir is not None else (root_dir / f"lb_balanced_early_late_dimensionality_k{cfg_eff.k}")
     _safe_mkdir(out_dir)
 
     # locate NPZs
@@ -1042,33 +1508,154 @@ def run_root_directory_pre_post_treatment(cfg: PrePostConfig) -> Dict[str, str]:
 
     # write CSV
     stamp = _now_stamp()
-    out_csv = out_dir / f"lb_pre_post_cluster_dimensionality_k{cfg_eff.k}_{stamp}.csv"
+    out_csv = out_dir / f"lb_balanced_early_late_cluster_dimensionality_k{cfg_eff.k}_{stamp}.csv"
     df = pd.DataFrame(all_rows)
     df.to_csv(out_csv, index=False)
     print(f"Saved results CSV: {out_csv}")
 
-    # plots
-    plot_scatter = out_dir / f"pre_vs_post_scatter_by_hit_k{cfg_eff.k}_{stamp}.png"
-    plot_delta = out_dir / f"delta_dim_by_hit_type_k{cfg_eff.k}_{stamp}.png"
-    stats_txt = out_dir / f"delta_dim_by_hit_type_stats_k{cfg_eff.k}_{stamp}.txt"
+    # plots (per comparison)
+    paths: Dict[str, str] = {}
 
     if len(df) == 0:
         # make placeholder empties (helps pipeline)
-        _scatter_pre_post_by_group(df, plot_scatter, title=f"Pre vs Post intrinsic dimension by hit type (k={cfg_eff.k})")
-        _box_delta_by_group(df, plot_delta, title=f"Δ intrinsic dimension (post − pre) by hit type (k={cfg_eff.k})", out_stats_txt=stats_txt)
+        plot_scatter = out_dir / f"pre_vs_post_scatter_by_hit_k{cfg_eff.k}_{stamp}.png"
+        plot_delta = out_dir / f"pre_vs_post_delta_by_hit_type_k{cfg_eff.k}_{stamp}.png"
+        stats_txt = out_dir / f"pre_vs_post_delta_stats_k{cfg_eff.k}_{stamp}.txt"
+
+        _scatter_pair_by_group(
+            df,
+            plot_scatter,
+            title=f"Pre vs Post intrinsic dimension by hit type (k={cfg_eff.k})",
+            x_col="pre_dim" if "pre_dim" in df.columns else "a_dim",
+            y_col="post_dim" if "post_dim" in df.columns else "b_dim",
+            x_label="Pre dimension",
+            y_label="Post dimension",
+        )
+        _box_delta_by_group(
+            df,
+            plot_delta,
+            title=f"Δ intrinsic dimension (post − pre) by hit type (k={cfg_eff.k})",
+            out_stats_txt=stats_txt,
+            ylabel="Δ intrinsic dimension (post − pre)",
+        )
+        paths.update({
+            "pre_vs_post_plot_delta": str(plot_delta),
+            "pre_vs_post_plot_scatter": str(plot_scatter),
+            "pre_vs_post_delta_stats": str(stats_txt),
+        })
         print(f"Saved plot (empty): {plot_delta}")
         print(f"Saved plot (empty): {plot_scatter}")
     else:
-        _scatter_pre_post_by_group(df, plot_scatter, title=f"Pre vs Post intrinsic dimension by hit type (k={cfg_eff.k})")
-        _box_delta_by_group(df, plot_delta, title=f"Δ intrinsic dimension (post − pre) by hit type (k={cfg_eff.k})", out_stats_txt=stats_txt)
-        print(f"Saved plot: {plot_delta}")
-        print(f"Saved plot: {plot_scatter}")
+        # Bird-level summary: collapse cluster rows to one row per bird per comparison
+        # (each point = mean across clusters within that bird)
+        df_bird = (
+            df.groupby(["comparison", "animal_id", "group", "hit_type", "treatment_date"], as_index=False)
+              .agg(
+                  a_dim=("a_dim", "mean"),
+                  b_dim=("b_dim", "mean"),
+                  delta_dim=("delta_dim", "mean"),
+                  n_clusters=("cluster_label", "nunique"),
+              )
+        )
+
+        def _plot_one(
+            comp: str,
+            x_label: str,
+            y_label: str,
+            delta_ylabel: str,
+        ) -> None:
+            sub = df[df["comparison"] == comp] if "comparison" in df.columns else df
+            if len(sub) == 0:
+                return
+
+            plot_scatter = out_dir / f"{comp}_scatter_by_hit_k{cfg_eff.k}_{stamp}.png"
+            plot_delta = out_dir / f"{comp}_delta_by_hit_type_k{cfg_eff.k}_{stamp}.png"
+            stats_txt = out_dir / f"{comp}_delta_stats_k{cfg_eff.k}_{stamp}.txt"
+
+            _scatter_pair_by_group(
+                sub,
+                plot_scatter,
+                title=f"{comp} intrinsic dimension by hit type (k={cfg_eff.k})",
+                x_col="a_dim",
+                y_col="b_dim",
+                x_label=x_label,
+                y_label=y_label,
+            )
+            _box_delta_by_group(
+                sub,
+                plot_delta,
+                title=f"{delta_ylabel} by hit type (k={cfg_eff.k})",
+                out_stats_txt=stats_txt,
+                ylabel=delta_ylabel,
+            )
+
+            paths.update({
+                f"{comp}_plot_delta": str(plot_delta),
+                f"{comp}_plot_scatter": str(plot_scatter),
+                f"{comp}_delta_stats": str(stats_txt),
+            })
+            print(f"Saved plot: {plot_delta}")
+            print(f"Saved plot: {plot_scatter}")
+
+            # Bird-level plots (each point = 1 bird; mean across clusters)
+            sub_bird = df_bird[df_bird["comparison"] == comp]
+            if len(sub_bird) > 0:
+                plot_scatter_bird = out_dir / f"{comp}_scatter_by_hit_birdlevel_k{cfg_eff.k}_{stamp}.png"
+                plot_delta_bird = out_dir / f"{comp}_delta_by_hit_type_birdlevel_k{cfg_eff.k}_{stamp}.png"
+                stats_txt_bird = out_dir / f"{comp}_delta_stats_birdlevel_k{cfg_eff.k}_{stamp}.txt"
+
+                _scatter_pair_by_group(
+                    sub_bird,
+                    plot_scatter_bird,
+                    title=f"{comp} intrinsic dimension by hit type (bird means; k={cfg_eff.k})",
+                    x_col="a_dim",
+                    y_col="b_dim",
+                    x_label=x_label,
+                    y_label=y_label,
+                )
+                _box_delta_by_group_birdlevel(
+                    sub_bird,
+                    plot_delta_bird,
+                    title=f"{delta_ylabel} by hit type (bird means; k={cfg_eff.k})",
+                    out_stats_txt=stats_txt_bird,
+                    ylabel=delta_ylabel,
+                )
+
+                paths.update({
+                    f"{comp}_plot_delta_birdlevel": str(plot_delta_bird),
+                    f"{comp}_plot_scatter_birdlevel": str(plot_scatter_bird),
+                    f"{comp}_delta_stats_birdlevel": str(stats_txt_bird),
+                })
+                print(f"Saved bird-level plot: {plot_delta_bird}")
+                print(f"Saved bird-level plot: {plot_scatter_bird}")
+
+        _plot_one("pre_vs_post", "Pre dimension", "Post dimension", "Δ intrinsic dimension (post − pre)")
+        _plot_one("pre_early_vs_late", "Early pre dimension", "Late pre dimension", "Δ intrinsic dimension (late pre − early pre)")
+        _plot_one("post_early_vs_late", "Early post dimension", "Late post dimension", "Δ intrinsic dimension (late post − early post)")
+        _plot_one("late_pre_vs_early_post", "Late pre dimension", "Early post dimension", "Δ intrinsic dimension (early post − late pre)")
+
+        # NEW: Paired within-bird comparison of drift (pre vs post)
+        paired_png = out_dir / f"paired_pre_drift_vs_post_drift_by_hit_birdlevel_k{cfg_eff.k}_{stamp}.png"
+        paired_txt = out_dir / f"paired_pre_drift_vs_post_drift_stats_birdlevel_k{cfg_eff.k}_{stamp}.txt"
+        _paired_pre_drift_vs_post_drift_birdlevel(
+            df_bird,
+            paired_png,
+            title=f"Paired drift comparison within birds by hit type (k={cfg_eff.k})",
+            out_stats_txt=paired_txt,
+            ylabel="Δ intrinsic dimension (late − early)",
+        )
+        paths.update({
+            "paired_pre_drift_vs_post_drift_plot_birdlevel": str(paired_png),
+            "paired_pre_drift_vs_post_drift_stats_birdlevel": str(paired_txt),
+        })
+        print(f"Saved bird-level paired drift plot: {paired_png}")
+
+
+
 
     return {
         "results_csv": str(out_csv),
-        "plot_delta": str(plot_delta),
-        "plot_scatter": str(plot_scatter),
-        "delta_stats": str(stats_txt),
+        **paths,
         "out_dir": str(out_dir),
     }
 
@@ -1078,14 +1665,14 @@ def run_root_directory_pre_post_treatment(cfg: PrePostConfig) -> Dict[str, str]:
 # -----------------------------
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="Levina_Bickel_pre_vs_post_treatment.py",
+        prog="Levina_Bickel_pre_vs_post_treatment_balanced_early_late.py",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--root-dir", required=True, type=str, help="Directory containing NPZ(s) (bird folder or parent).")
     p.add_argument("--metadata-xlsx", required=True, type=str, help="Excel metadata with treatment dates and hit types.")
     p.add_argument("--metadata-sheet", default="animal_hit_type_summary", type=str,
                    help="Sheet to read hit types from (treatment dates may be pulled from 'metadata' sheet if missing here).")
-    p.add_argument("--out-dir", default=None, type=str, help="Output directory (default: <root-dir>/lb_pre_post_dimensionality_k<k>/).")
+    p.add_argument("--out-dir", default=None, type=str, help="Output directory (default: <root-dir>/lb_balanced_early_late_dimensionality_k<k>/).")
     p.add_argument("--recursive", action="store_true", help="Recursively search for NPZs under --root-dir.")
 
     p.add_argument("--array-key", default="predictions", type=str, help="Key in NPZ for high-dim data used for ID.")
@@ -1107,6 +1694,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="If set, POST starts the day *after* treatment day (treatment day excluded).")
     p.add_argument("--max-points-per-cluster-period", default=None, type=int,
                    help="Subsample cap per cluster per period (None => auto by --computer-power).")
+
+    p.add_argument("--no-balance-pairs", action="store_true",
+                   help="Do NOT balance sample sizes to min(nA, nB) within each comparison.")
+    p.add_argument("--no-split-early-late", action="store_true",
+                   help="Do NOT compute early/late comparisons within PRE and within POST.")
+    p.add_argument("--early-late-split-method", default="file_median", choices=["file_median", "file_half"],
+                   help="How to split early vs late within a period (by file datetime).")
+    p.add_argument("--random-seed", default=0, type=int, help="Random seed for subsampling/balancing.")
 
     p.add_argument("--computer-power", default="laptop", choices=["laptop", "pro"],
                    help="Sets defaults for workers/n_jobs/caps when not provided.")
