@@ -2,9 +2,10 @@
 # -*- coding: utf-8 -*-
 """
 umap_pre_post_early_late_cluster_variance_bc.py
-%run /Users/mirandahulsey-vincent/Documents/allPythonCode/syntax_analysis/py_files/umap_pre_post_early_late_cluster_variance_bc.py --npz-path "/Volumes/my_own_SSD/updated_AreaX_outputs/USA5443/USA5443.npz" --metadata-xlsx "/Volumes/my_own_SSD/updated_AreaX_outputs/Area_X_lesion_metadata_with_hit_types.xlsx" --out-dir "/Volumes/my_own_SSD/updated_AreaX_outputs/USA5443/umap_pre_post_early_late_cluster_variance_bc" --array-key "predictions" --cluster-key "hdbscan_labels" --file-key "file_indices" --min-points-per-period 200 --max-points-per-period 20000 --plot-max-points-per-period 5000 --n-neighbors 30 --min-dist 0.1 --metric "euclidean" --bc-bins 100 --seed -1
 
-Version A + cluster variance / mean-shift summary.
+%run /Users/mirandahulsey-vincent/Documents/allPythonCode/syntax_analysis/py_files/umap_pre_post_early_late_cluster_variance_bc.py --npz-path "/Volumes/my_own_SSD/updated_AreaX_outputs/USA5443/USA5443.npz" --metadata-xlsx "/Volumes/my_own_SSD/updated_AreaX_outputs/Area_X_lesion_metadata_with_hit_types.xlsx" --out-dir "/Volumes/my_own_SSD/updated_AreaX_outputs/USA5443/umap_pre_post_early_late_cluster_variance_bc_cluster7" --array-key "predictions" --cluster-key "hdbscan_labels" --file-key "file_indices" --cluster-id 7 --min-points-per-period 200 --max-points-per-period 20000 --plot-max-points-per-period 5000 --n-neighbors 30 --min-dist 0.1 --metric "euclidean" --bc-bins 100 --overlap-density-bins 180 --overlap-density-gamma 0.55 --seed -1
+
+Version A + cluster variance / mean-shift summary + RGB density overlap panels.
 
 For ONE bird NPZ:
   1) Load high-dimensional features (default: predictions) + HDBSCAN clusters + file_indices + file_map
@@ -21,7 +22,11 @@ For ONE bird NPZ:
            * bc_pre_early_vs_late
            * bc_post_early_vs_late
            * bc_pre_vs_post
-       - compute pre/post centroid shift and spread change in the ORIGINAL latent space:
+       - compute pre/post centroid and spread metrics in the ORIGINAL latent space:
+           * pre_centroid_norm_raw
+           * post_centroid_norm_raw
+           * pre_centroid_dist_to_cluster_global_raw
+           * post_centroid_dist_to_cluster_global_raw
            * centroid_shift_raw
            * pre_rms_radius_raw
            * post_rms_radius_raw
@@ -29,19 +34,41 @@ For ONE bird NPZ:
            * pre_trace_cov_raw
            * post_trace_cov_raw
            * post_over_pre_trace_cov
-       - mark whether the cluster:
-           * appeared after treatment
-           * disappeared after treatment
-           * is present both pre and post
-           * is present but too sparse for some BCs
        - make one 2x3 figure:
            row 1 = pre early / pre late / pre overlap
            row 2 = post early / post late / post overlap
+       - make a SECOND 2x3 figure with equal-sized groups:
+           * sample the same number of points from
+             pre early / pre late / post early / post late
+           * n is the smallest raw group size among the four groups
+       - compute a FULL second set of equal-group metrics:
+           * pre_centroid_norm_raw_equal_groups
+           * post_centroid_norm_raw_equal_groups
+           * pre_centroid_dist_to_cluster_global_raw_equal_groups
+           * post_centroid_dist_to_cluster_global_raw_equal_groups
+           * centroid_shift_raw_equal_groups
+           * pre_rms_radius_raw_equal_groups
+           * post_rms_radius_raw_equal_groups
+           * post_over_pre_rms_radius_equal_groups
+           * pre_trace_cov_raw_equal_groups
+           * post_trace_cov_raw_equal_groups
+           * post_over_pre_trace_cov_equal_groups
+           * bc_pre_early_vs_late_equal_groups
+           * bc_post_early_vs_late_equal_groups
+           * bc_pre_vs_post_equal_groups
+
+Plotting style:
+  - Single-condition panels are scatter plots
+  - Overlap panels are RGB density maps
+  - EARLY = purple
+  - LATE = green
+  - shared density = white
 
 Outputs:
   out_dir/
     clusters/
       <prefix>_cluster<id>_pre_post_early_late_umap.png
+      <prefix>_cluster<id>_pre_post_early_late_umap_equal_groups.png
     <prefix>_cluster_variance_bc_summary.csv
 """
 
@@ -110,6 +137,9 @@ class UMAPEarlyLateConfig:
     out_prefix: Optional[str] = None
     dpi: int = 200
     bc_bins: int = 100
+
+    overlap_density_bins: int = 180
+    overlap_density_gamma: float = 0.55
 
 
 _EXCEL_ORIGIN = _dt.datetime(1899, 12, 30)
@@ -423,45 +453,114 @@ def _style_overlap_axis(ax: plt.Axes) -> None:
     ax.tick_params(colors="white")
     ax.xaxis.label.set_color("white")
     ax.yaxis.label.set_color("white")
+    ax.grid(False)
 
 
-def _plot_row(
+def _compute_xy_limits(xy_a: np.ndarray, xy_b: np.ndarray, pad_frac: float = 0.05) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+    xy_all = np.vstack([xy_a, xy_b])
+    mins = np.min(xy_all, axis=0)
+    maxs = np.max(xy_all, axis=0)
+    pad = pad_frac * (maxs - mins + 1e-9)
+    xlim = (float(mins[0] - pad[0]), float(maxs[0] + pad[0]))
+    ylim = (float(mins[1] - pad[1]), float(maxs[1] + pad[1]))
+    return xlim, ylim
+
+
+def _draw_rgb_density_overlap(
+    ax: plt.Axes,
+    early_xy: np.ndarray,
+    late_xy: np.ndarray,
+    *,
+    xlim: Tuple[float, float],
+    ylim: Tuple[float, float],
+    bins: int,
+    gamma: float,
+    title: str,
+) -> None:
+    H_e, xedges, yedges = np.histogram2d(
+        early_xy[:, 0], early_xy[:, 1], bins=bins, range=[xlim, ylim]
+    )
+    H_l, _, _ = np.histogram2d(
+        late_xy[:, 0], late_xy[:, 1], bins=bins, range=[xlim, ylim]
+    )
+
+    if H_e.max() > 0:
+        H_e = H_e / H_e.max()
+    if H_l.max() > 0:
+        H_l = H_l / H_l.max()
+
+    H_e = H_e ** gamma
+    H_l = H_l ** gamma
+
+    rgb = np.zeros((bins, bins, 3), dtype=float)
+    rgb[..., 0] = H_e
+    rgb[..., 2] = H_e
+    rgb[..., 1] = H_l
+    rgb = np.clip(rgb, 0, 1)
+
+    ax.imshow(
+        np.transpose(rgb, (1, 0, 2)),
+        origin="lower",
+        extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
+        aspect="auto",
+        interpolation="bilinear",
+    )
+    _style_overlap_axis(ax)
+    ax.set_title(title, color="white", pad=8)
+    ax.set_xlabel("UMAP Dimension 1")
+    ax.set_ylabel("UMAP Dimension 2")
+
+
+def _plot_row_rgb_overlap(
     axes_row,
     *,
-    xy: np.ndarray,
-    is_late: np.ndarray,
+    xy_early: np.ndarray,
+    xy_late: np.ndarray,
     period_name: str,
     early_range: str,
     late_range: str,
     n_early: int,
     n_late: int,
     bc: float,
-    early_color: str,
-    late_color: str,
+    overlap_bins: int,
+    overlap_gamma: float,
 ) -> None:
-    early_xy = xy[~is_late]
-    late_xy = xy[is_late]
+    early_scatter = "#8B2BD6"
+    late_scatter = "#5ACD5A"
+
+    xlim, ylim = _compute_xy_limits(xy_early, xy_late, pad_frac=0.05)
 
     ax = axes_row[0]
-    ax.set_title(f"{period_name} early\n{early_range}\nN={n_early}")
-    ax.scatter(early_xy[:, 0], early_xy[:, 1], s=8, alpha=0.45, c=early_color, edgecolors="none")
+    ax.scatter(xy_early[:, 0], xy_early[:, 1], s=11, alpha=0.55, c=early_scatter, edgecolors="none")
+    ax.set_title(f"{period_name} early\n{early_range}\nN={n_early}", color=early_scatter, pad=8)
     ax.set_xlabel("UMAP Dimension 1")
     ax.set_ylabel("UMAP Dimension 2")
     ax.grid(False)
+    ax.set_xlim(*xlim)
+    ax.set_ylim(*ylim)
 
     ax = axes_row[1]
-    ax.set_title(f"{period_name} late\n{late_range}\nN={n_late}")
-    ax.scatter(late_xy[:, 0], late_xy[:, 1], s=8, alpha=0.45, c=late_color, edgecolors="none")
+    ax.scatter(xy_late[:, 0], xy_late[:, 1], s=11, alpha=0.55, c=late_scatter, edgecolors="none")
+    ax.set_title(f"{period_name} late\n{late_range}\nN={n_late}", color=late_scatter, pad=8)
     ax.set_xlabel("UMAP Dimension 1")
+    ax.set_ylabel("UMAP Dimension 2")
     ax.grid(False)
+    ax.set_xlim(*xlim)
+    ax.set_ylim(*ylim)
 
     ax = axes_row[2]
-    ax.set_title(f"{period_name} overlap\nBC={bc:.3f}")
-    _style_overlap_axis(ax)
-    ax.set_xlabel("UMAP Dimension 1")
-    ax.scatter(early_xy[:, 0], early_xy[:, 1], s=8, alpha=0.45, c=early_color, edgecolors="none")
-    ax.scatter(late_xy[:, 0], late_xy[:, 1], s=8, alpha=0.45, c=late_color, edgecolors="none")
-    ax.grid(False)
+    _draw_rgb_density_overlap(
+        ax,
+        xy_early,
+        xy_late,
+        xlim=xlim,
+        ylim=ylim,
+        bins=overlap_bins,
+        gamma=overlap_gamma,
+        title=f"{period_name} overlap\nBC={bc:.3f}",
+    )
+    ax.set_xlim(*xlim)
+    ax.set_ylim(*ylim)
 
 
 def _mark_row_skipped(axes_row, message: str, *, ylabel: str) -> None:
@@ -483,12 +582,6 @@ def _safe_ratio(num: float, den: float) -> float:
 
 
 def _centroid_and_spread_metrics(Xg: np.ndarray) -> Tuple[np.ndarray, float, float]:
-    """
-    Returns:
-      mu: centroid vector
-      rms_radius: sqrt(mean(||x-mu||^2))
-      trace_cov: trace of covariance matrix
-    """
     if Xg.ndim != 2 or Xg.shape[0] == 0:
         return np.array([], dtype=float), float("nan"), float("nan")
 
@@ -595,17 +688,11 @@ def run_one_bird(cfg: UMAPEarlyLateConfig) -> Path:
     rng = np.random.default_rng() if int(cfg.random_seed) < 0 else np.random.default_rng(int(cfg.random_seed))
     min_need = int(cfg.min_points_per_period)
 
-    pre_early_color = "#7B2CBF"
-    pre_late_color = "#C77DFF"
-    post_early_color = "#1B9E4B"
-    post_late_color = "#A8E6A3"
-
     summary_rows: List[Dict[str, Any]] = []
 
     for lab in unique_labels:
         lab = int(lab)
 
-        # All points for this cluster (used to fit ONE shared UMAP)
         idx_cluster_all = np.where((clusters == lab) & base_mask)[0]
         if idx_cluster_all.size == 0:
             continue
@@ -614,10 +701,8 @@ def run_one_bird(cfg: UMAPEarlyLateConfig) -> Path:
         reducer = _make_umap_reducer(umap, cfg)
         xy_cluster = reducer.fit_transform(X_cluster)
 
-        # Map original point index -> cluster-local UMAP row
         pos_map = {int(idx): i for i, idx in enumerate(idx_cluster_all)}
 
-        # Raw group indices
         idx_pre_early_all = np.where(pre_early_mask & (clusters == lab))[0]
         idx_pre_late_all = np.where(pre_late_mask & (clusters == lab))[0]
         idx_post_early_all = np.where(post_early_mask & (clusters == lab))[0]
@@ -636,7 +721,14 @@ def run_one_bird(cfg: UMAPEarlyLateConfig) -> Path:
         post_present_any = n_post_total_raw > 0
         cluster_change = _cluster_change_label(pre_present_any, post_present_any)
 
-        # Raw latent-space metrics for pre vs post
+        # Raw/all-data metrics
+        cluster_centroid_raw = np.mean(X_cluster, axis=0)
+
+        pre_centroid_norm_raw = float("nan")
+        post_centroid_norm_raw = float("nan")
+        pre_centroid_dist_to_cluster_global_raw = float("nan")
+        post_centroid_dist_to_cluster_global_raw = float("nan")
+
         centroid_shift_raw = float("nan")
         pre_rms_radius_raw = float("nan")
         post_rms_radius_raw = float("nan")
@@ -647,11 +739,17 @@ def run_one_bird(cfg: UMAPEarlyLateConfig) -> Path:
 
         if pre_present_any:
             mu_pre_raw, pre_rms_radius_raw, pre_trace_cov_raw = _centroid_and_spread_metrics(X[idx_pre_all])
+            if mu_pre_raw.size > 0:
+                pre_centroid_norm_raw = float(np.linalg.norm(mu_pre_raw))
+                pre_centroid_dist_to_cluster_global_raw = float(np.linalg.norm(mu_pre_raw - cluster_centroid_raw))
         else:
             mu_pre_raw = np.array([], dtype=float)
 
         if post_present_any:
             mu_post_raw, post_rms_radius_raw, post_trace_cov_raw = _centroid_and_spread_metrics(X[idx_post_all])
+            if mu_post_raw.size > 0:
+                post_centroid_norm_raw = float(np.linalg.norm(mu_post_raw))
+                post_centroid_dist_to_cluster_global_raw = float(np.linalg.norm(mu_post_raw - cluster_centroid_raw))
         else:
             mu_post_raw = np.array([], dtype=float)
 
@@ -660,7 +758,23 @@ def run_one_bird(cfg: UMAPEarlyLateConfig) -> Path:
             post_over_pre_rms_radius = _safe_ratio(post_rms_radius_raw, pre_rms_radius_raw)
             post_over_pre_trace_cov = _safe_ratio(post_trace_cov_raw, pre_trace_cov_raw)
 
-        # PRE early/late BC after UMAP fit
+        # Equal-group placeholders
+        pre_centroid_norm_raw_equal_groups = float("nan")
+        post_centroid_norm_raw_equal_groups = float("nan")
+        pre_centroid_dist_to_cluster_global_raw_equal_groups = float("nan")
+        post_centroid_dist_to_cluster_global_raw_equal_groups = float("nan")
+
+        centroid_shift_raw_equal_groups = float("nan")
+        pre_rms_radius_raw_equal_groups = float("nan")
+        post_rms_radius_raw_equal_groups = float("nan")
+        post_over_pre_rms_radius_equal_groups = float("nan")
+        pre_trace_cov_raw_equal_groups = float("nan")
+        post_trace_cov_raw_equal_groups = float("nan")
+        post_over_pre_trace_cov_equal_groups = float("nan")
+
+        bc_pre_vs_post_equal_groups = float("nan")
+
+        # PRE early/late BC
         pre_bc_status = "ok"
         bc_pre = float("nan")
         idx_pre_early_plot = np.array([], dtype=int)
@@ -677,6 +791,12 @@ def run_one_bird(cfg: UMAPEarlyLateConfig) -> Path:
             if n_pre_used < min_need:
                 pre_bc_status = "skipped_after_balance"
             else:
+                xy_pre_early_bal = xy_cluster[[pos_map[int(i)] for i in idx_pre_early_bal]]
+                xy_pre_late_bal = xy_cluster[[pos_map[int(i)] for i in idx_pre_late_bal]]
+                bc_pre = bhattacharyya_coefficient_2d_hist(
+                    xy_pre_early_bal, xy_pre_late_bal, bins=int(cfg.bc_bins)
+                )
+
                 idx_pre_early_plot = idx_pre_early_bal
                 idx_pre_late_plot = idx_pre_late_bal
                 n_pre_plot = int(n_pre_used)
@@ -685,13 +805,7 @@ def run_one_bird(cfg: UMAPEarlyLateConfig) -> Path:
                         idx_pre_early_bal, idx_pre_late_bal, rng=rng, cap=cfg.max_points_per_period_for_plot
                     )
 
-                xy_pre_early = xy_cluster[[pos_map[int(i)] for i in idx_pre_early_plot]]
-                xy_pre_late = xy_cluster[[pos_map[int(i)] for i in idx_pre_late_plot]]
-                bc_pre = bhattacharyya_coefficient_2d_hist(
-                    xy_pre_early, xy_pre_late, bins=int(cfg.bc_bins)
-                )
-
-        # POST early/late BC after UMAP fit
+        # POST early/late BC
         post_bc_status = "ok"
         bc_post = float("nan")
         idx_post_early_plot = np.array([], dtype=int)
@@ -708,6 +822,12 @@ def run_one_bird(cfg: UMAPEarlyLateConfig) -> Path:
             if n_post_used < min_need:
                 post_bc_status = "skipped_after_balance"
             else:
+                xy_post_early_bal = xy_cluster[[pos_map[int(i)] for i in idx_post_early_bal]]
+                xy_post_late_bal = xy_cluster[[pos_map[int(i)] for i in idx_post_late_bal]]
+                bc_post = bhattacharyya_coefficient_2d_hist(
+                    xy_post_early_bal, xy_post_late_bal, bins=int(cfg.bc_bins)
+                )
+
                 idx_post_early_plot = idx_post_early_bal
                 idx_post_late_plot = idx_post_late_bal
                 n_post_plot = int(n_post_used)
@@ -716,13 +836,7 @@ def run_one_bird(cfg: UMAPEarlyLateConfig) -> Path:
                         idx_post_early_bal, idx_post_late_bal, rng=rng, cap=cfg.max_points_per_period_for_plot
                     )
 
-                xy_post_early = xy_cluster[[pos_map[int(i)] for i in idx_post_early_plot]]
-                xy_post_late = xy_cluster[[pos_map[int(i)] for i in idx_post_late_plot]]
-                bc_post = bhattacharyya_coefficient_2d_hist(
-                    xy_post_early, xy_post_late, bins=int(cfg.bc_bins)
-                )
-
-        # Direct balanced pre vs post BC after UMAP fit
+        # Direct balanced pre vs post BC
         pre_post_bc_status = "ok"
         bc_pre_vs_post = float("nan")
         n_pre_post_used = 0
@@ -742,58 +856,44 @@ def run_one_bird(cfg: UMAPEarlyLateConfig) -> Path:
                     xy_pre_bal, xy_post_bal, bins=int(cfg.bc_bins)
                 )
 
-        # Make figure if either row is usable
+        # Original figure set
         if pre_bc_status == "ok" or post_bc_status == "ok":
-            fig, axes = plt.subplots(2, 3, figsize=(15.5, 9.5), sharex=True, sharey=True)
+            fig, axes = plt.subplots(2, 3, figsize=(15.5, 9.5), sharex=False, sharey=False)
 
-            # PRE row
             if pre_bc_status == "ok":
-                xy_pre_early = xy_cluster[[pos_map[int(i)] for i in idx_pre_early_plot]]
-                xy_pre_late = xy_cluster[[pos_map[int(i)] for i in idx_pre_late_plot]]
-                xy_pre_plot = np.vstack([xy_pre_early, xy_pre_late])
-                is_pre_late_plot = np.array(
-                    [False] * len(xy_pre_early) + [True] * len(xy_pre_late),
-                    dtype=bool,
-                )
-
-                _plot_row(
+                xy_pre_early_plot = xy_cluster[[pos_map[int(i)] for i in idx_pre_early_plot]]
+                xy_pre_late_plot = xy_cluster[[pos_map[int(i)] for i in idx_pre_late_plot]]
+                _plot_row_rgb_overlap(
                     axes[0],
-                    xy=xy_pre_plot,
-                    is_late=is_pre_late_plot,
+                    xy_early=xy_pre_early_plot,
+                    xy_late=xy_pre_late_plot,
                     period_name="Pre-lesion",
                     early_range=_format_date_range(_dates_for_indices(idx_pre_early_all, file_indices, file_dt_map)),
                     late_range=_format_date_range(_dates_for_indices(idx_pre_late_all, file_indices, file_dt_map)),
                     n_early=int(idx_pre_early_plot.size),
                     n_late=int(idx_pre_late_plot.size),
                     bc=float(bc_pre),
-                    early_color=pre_early_color,
-                    late_color=pre_late_color,
+                    overlap_bins=int(cfg.overlap_density_bins),
+                    overlap_gamma=float(cfg.overlap_density_gamma),
                 )
             else:
                 _mark_row_skipped(axes[0], f"Pre-lesion {pre_bc_status}", ylabel="UMAP Dimension 2")
 
-            # POST row
             if post_bc_status == "ok":
-                xy_post_early = xy_cluster[[pos_map[int(i)] for i in idx_post_early_plot]]
-                xy_post_late = xy_cluster[[pos_map[int(i)] for i in idx_post_late_plot]]
-                xy_post_plot = np.vstack([xy_post_early, xy_post_late])
-                is_post_late_plot = np.array(
-                    [False] * len(xy_post_early) + [True] * len(xy_post_late),
-                    dtype=bool,
-                )
-
-                _plot_row(
+                xy_post_early_plot = xy_cluster[[pos_map[int(i)] for i in idx_post_early_plot]]
+                xy_post_late_plot = xy_cluster[[pos_map[int(i)] for i in idx_post_late_plot]]
+                _plot_row_rgb_overlap(
                     axes[1],
-                    xy=xy_post_plot,
-                    is_late=is_post_late_plot,
+                    xy_early=xy_post_early_plot,
+                    xy_late=xy_post_late_plot,
                     period_name="Post-lesion",
                     early_range=_format_date_range(_dates_for_indices(idx_post_early_all, file_indices, file_dt_map)),
                     late_range=_format_date_range(_dates_for_indices(idx_post_late_all, file_indices, file_dt_map)),
                     n_early=int(idx_post_early_plot.size),
                     n_late=int(idx_post_late_plot.size),
                     bc=float(bc_post),
-                    early_color=post_early_color,
-                    late_color=post_late_color,
+                    overlap_bins=int(cfg.overlap_density_bins),
+                    overlap_gamma=float(cfg.overlap_density_gamma),
                 )
             else:
                 _mark_row_skipped(axes[1], f"Post-lesion {post_bc_status}", ylabel="UMAP Dimension 2")
@@ -816,6 +916,122 @@ def run_one_bird(cfg: UMAPEarlyLateConfig) -> Path:
             plt.close(fig)
         else:
             out_png = Path("")
+
+        # Equal-sized four-group figure set + equal-group metrics
+        equal_group_plot_status = "ok"
+        n_equal_group_plot = min(n_pre_early_raw, n_pre_late_raw, n_post_early_raw, n_post_late_raw)
+        bc_pre_equal_groups = float("nan")
+        bc_post_equal_groups = float("nan")
+        bc_pre_vs_post_equal_groups = float("nan")
+        out_png_equal_groups = Path("")
+
+        if n_equal_group_plot <= 0:
+            equal_group_plot_status = "skipped_missing_group"
+        else:
+            idx_pre_early_eq = rng.choice(idx_pre_early_all, size=n_equal_group_plot, replace=False)
+            idx_pre_late_eq = rng.choice(idx_pre_late_all, size=n_equal_group_plot, replace=False)
+            idx_post_early_eq = rng.choice(idx_post_early_all, size=n_equal_group_plot, replace=False)
+            idx_post_late_eq = rng.choice(idx_post_late_all, size=n_equal_group_plot, replace=False)
+
+            xy_pre_early_eq = xy_cluster[[pos_map[int(i)] for i in idx_pre_early_eq]]
+            xy_pre_late_eq = xy_cluster[[pos_map[int(i)] for i in idx_pre_late_eq]]
+            xy_post_early_eq = xy_cluster[[pos_map[int(i)] for i in idx_post_early_eq]]
+            xy_post_late_eq = xy_cluster[[pos_map[int(i)] for i in idx_post_late_eq]]
+
+            bc_pre_equal_groups = bhattacharyya_coefficient_2d_hist(
+                xy_pre_early_eq, xy_pre_late_eq, bins=int(cfg.bc_bins)
+            )
+            bc_post_equal_groups = bhattacharyya_coefficient_2d_hist(
+                xy_post_early_eq, xy_post_late_eq, bins=int(cfg.bc_bins)
+            )
+
+            idx_pre_eq_all = np.concatenate([idx_pre_early_eq, idx_pre_late_eq])
+            idx_post_eq_all = np.concatenate([idx_post_early_eq, idx_post_late_eq])
+            idx_equal_all = np.concatenate([idx_pre_eq_all, idx_post_eq_all])
+
+            X_pre_eq = X[idx_pre_eq_all]
+            X_post_eq = X[idx_post_eq_all]
+            X_equal_all = X[idx_equal_all]
+
+            cluster_centroid_equal_groups_raw = np.mean(X_equal_all, axis=0)
+
+            mu_pre_eq, pre_rms_radius_raw_equal_groups, pre_trace_cov_raw_equal_groups = _centroid_and_spread_metrics(X_pre_eq)
+            mu_post_eq, post_rms_radius_raw_equal_groups, post_trace_cov_raw_equal_groups = _centroid_and_spread_metrics(X_post_eq)
+
+            if mu_pre_eq.size > 0:
+                pre_centroid_norm_raw_equal_groups = float(np.linalg.norm(mu_pre_eq))
+                pre_centroid_dist_to_cluster_global_raw_equal_groups = float(
+                    np.linalg.norm(mu_pre_eq - cluster_centroid_equal_groups_raw)
+                )
+
+            if mu_post_eq.size > 0:
+                post_centroid_norm_raw_equal_groups = float(np.linalg.norm(mu_post_eq))
+                post_centroid_dist_to_cluster_global_raw_equal_groups = float(
+                    np.linalg.norm(mu_post_eq - cluster_centroid_equal_groups_raw)
+                )
+
+            if mu_pre_eq.size > 0 and mu_post_eq.size > 0:
+                centroid_shift_raw_equal_groups = float(np.linalg.norm(mu_post_eq - mu_pre_eq))
+                post_over_pre_rms_radius_equal_groups = _safe_ratio(
+                    post_rms_radius_raw_equal_groups, pre_rms_radius_raw_equal_groups
+                )
+                post_over_pre_trace_cov_equal_groups = _safe_ratio(
+                    post_trace_cov_raw_equal_groups, pre_trace_cov_raw_equal_groups
+                )
+
+            xy_pre_eq_all = xy_cluster[[pos_map[int(i)] for i in idx_pre_eq_all]]
+            xy_post_eq_all = xy_cluster[[pos_map[int(i)] for i in idx_post_eq_all]]
+
+            bc_pre_vs_post_equal_groups = bhattacharyya_coefficient_2d_hist(
+                xy_pre_eq_all, xy_post_eq_all, bins=int(cfg.bc_bins)
+            )
+
+            fig_eq, axes_eq = plt.subplots(2, 3, figsize=(15.5, 9.5), sharex=False, sharey=False)
+
+            _plot_row_rgb_overlap(
+                axes_eq[0],
+                xy_early=xy_pre_early_eq,
+                xy_late=xy_pre_late_eq,
+                period_name="Pre-lesion",
+                early_range=_format_date_range(_dates_for_indices(idx_pre_early_all, file_indices, file_dt_map)),
+                late_range=_format_date_range(_dates_for_indices(idx_pre_late_all, file_indices, file_dt_map)),
+                n_early=int(n_equal_group_plot),
+                n_late=int(n_equal_group_plot),
+                bc=float(bc_pre_equal_groups),
+                overlap_bins=int(cfg.overlap_density_bins),
+                overlap_gamma=float(cfg.overlap_density_gamma),
+            )
+
+            _plot_row_rgb_overlap(
+                axes_eq[1],
+                xy_early=xy_post_early_eq,
+                xy_late=xy_post_late_eq,
+                period_name="Post-lesion",
+                early_range=_format_date_range(_dates_for_indices(idx_post_early_all, file_indices, file_dt_map)),
+                late_range=_format_date_range(_dates_for_indices(idx_post_late_all, file_indices, file_dt_map)),
+                n_early=int(n_equal_group_plot),
+                n_late=int(n_equal_group_plot),
+                bc=float(bc_post_equal_groups),
+                overlap_bins=int(cfg.overlap_density_bins),
+                overlap_gamma=float(cfg.overlap_density_gamma),
+            )
+
+            fig_eq.suptitle(
+                f"{animal_id} cluster {lab} early/late UMAPs (equal-sized four-group plot)\n"
+                f"n_each={n_equal_group_plot} | pre BC={bc_pre_equal_groups:.3f} | "
+                f"post BC={bc_post_equal_groups:.3f} | pre/post BC={bc_pre_vs_post_equal_groups:.3f} | "
+                f"change={cluster_change}\n"
+                f"centroid shift(raw eq)={centroid_shift_raw_equal_groups if np.isfinite(centroid_shift_raw_equal_groups) else np.nan:.3g} | "
+                f"post/pre rms eq={post_over_pre_rms_radius_equal_groups if np.isfinite(post_over_pre_rms_radius_equal_groups) else np.nan:.3g} | "
+                f"post/pre trace(cov) eq={post_over_pre_trace_cov_equal_groups if np.isfinite(post_over_pre_trace_cov_equal_groups) else np.nan:.3g} | "
+                f"treatment={treatment_dt.date().isoformat()}",
+                y=1.03,
+            )
+
+            fig_eq.tight_layout()
+            out_png_equal_groups = clusters_dir / f"{prefix}_cluster{lab}_pre_post_early_late_umap_equal_groups.png"
+            fig_eq.savefig(out_png_equal_groups, dpi=int(cfg.dpi), bbox_inches="tight")
+            plt.close(fig_eq)
 
         summary_rows.append({
             "cluster": lab,
@@ -846,6 +1062,11 @@ def run_one_bird(cfg: UMAPEarlyLateConfig) -> Path:
             "bc_post_early_vs_late": float(bc_post),
             "bc_pre_vs_post": float(bc_pre_vs_post),
 
+            "pre_centroid_norm_raw": float(pre_centroid_norm_raw),
+            "post_centroid_norm_raw": float(post_centroid_norm_raw),
+            "pre_centroid_dist_to_cluster_global_raw": float(pre_centroid_dist_to_cluster_global_raw),
+            "post_centroid_dist_to_cluster_global_raw": float(post_centroid_dist_to_cluster_global_raw),
+
             "centroid_shift_raw": float(centroid_shift_raw),
             "pre_rms_radius_raw": float(pre_rms_radius_raw),
             "post_rms_radius_raw": float(post_rms_radius_raw),
@@ -854,7 +1075,27 @@ def run_one_bird(cfg: UMAPEarlyLateConfig) -> Path:
             "post_trace_cov_raw": float(post_trace_cov_raw),
             "post_over_pre_trace_cov": float(post_over_pre_trace_cov),
 
+            "pre_centroid_norm_raw_equal_groups": float(pre_centroid_norm_raw_equal_groups),
+            "post_centroid_norm_raw_equal_groups": float(post_centroid_norm_raw_equal_groups),
+            "pre_centroid_dist_to_cluster_global_raw_equal_groups": float(pre_centroid_dist_to_cluster_global_raw_equal_groups),
+            "post_centroid_dist_to_cluster_global_raw_equal_groups": float(post_centroid_dist_to_cluster_global_raw_equal_groups),
+
+            "centroid_shift_raw_equal_groups": float(centroid_shift_raw_equal_groups),
+            "pre_rms_radius_raw_equal_groups": float(pre_rms_radius_raw_equal_groups),
+            "post_rms_radius_raw_equal_groups": float(post_rms_radius_raw_equal_groups),
+            "post_over_pre_rms_radius_equal_groups": float(post_over_pre_rms_radius_equal_groups),
+            "pre_trace_cov_raw_equal_groups": float(pre_trace_cov_raw_equal_groups),
+            "post_trace_cov_raw_equal_groups": float(post_trace_cov_raw_equal_groups),
+            "post_over_pre_trace_cov_equal_groups": float(post_over_pre_trace_cov_equal_groups),
+
+            "equal_group_plot_status": equal_group_plot_status,
+            "n_equal_group_plot": int(n_equal_group_plot),
+            "bc_pre_early_vs_late_equal_groups": float(bc_pre_equal_groups),
+            "bc_post_early_vs_late_equal_groups": float(bc_post_equal_groups),
+            "bc_pre_vs_post_equal_groups": float(bc_pre_vs_post_equal_groups),
+
             "out_png": str(out_png),
+            "out_png_equal_groups": str(out_png_equal_groups),
         })
 
         print(
@@ -863,8 +1104,11 @@ def run_one_bird(cfg: UMAPEarlyLateConfig) -> Path:
             f"pre_BC={bc_pre if np.isfinite(bc_pre) else np.nan:.3f} "
             f"post_BC={bc_post if np.isfinite(bc_post) else np.nan:.3f} "
             f"pre_post_BC={bc_pre_vs_post if np.isfinite(bc_pre_vs_post) else np.nan:.3f} | "
+            f"equal_group_n={n_equal_group_plot} | "
             f"centroid_shift_raw={centroid_shift_raw if np.isfinite(centroid_shift_raw) else np.nan:.3g} | "
-            f"post/pre_rms={post_over_pre_rms_radius if np.isfinite(post_over_pre_rms_radius) else np.nan:.3g}"
+            f"centroid_shift_raw_eq={centroid_shift_raw_equal_groups if np.isfinite(centroid_shift_raw_equal_groups) else np.nan:.3g} | "
+            f"post/pre_rms={post_over_pre_rms_radius if np.isfinite(post_over_pre_rms_radius) else np.nan:.3g} | "
+            f"post/pre_rms_eq={post_over_pre_rms_radius_equal_groups if np.isfinite(post_over_pre_rms_radius_equal_groups) else np.nan:.3g}"
         )
 
     summary_csv = out_dir / f"{prefix}_cluster_variance_bc_summary.csv"
@@ -904,6 +1148,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--out-prefix", default=None, type=str)
     p.add_argument("--dpi", default=200, type=int)
     p.add_argument("--bc-bins", default=100, type=int)
+    p.add_argument("--overlap-density-bins", default=180, type=int)
+    p.add_argument("--overlap-density-gamma", default=0.55, type=float)
     return p
 
 
@@ -940,6 +1186,9 @@ def main() -> None:
         out_prefix=args.out_prefix,
         dpi=int(args.dpi),
         bc_bins=int(args.bc_bins),
+
+        overlap_density_bins=int(args.overlap_density_bins),
+        overlap_density_gamma=float(args.overlap_density_gamma),
     )
 
     run_one_bird(cfg)
