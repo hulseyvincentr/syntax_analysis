@@ -36,13 +36,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Sequence
 import argparse
 import datetime as _dt
 import os
 import re
 import time
-import warnings
 from zipfile import BadZipFile
 
 import numpy as np
@@ -144,7 +143,6 @@ def _parse_excel_serial_days(token: str) -> Optional[_dt.datetime]:
         return None
 
 
-
 def _add_variance_tier_column(
     df: pd.DataFrame,
     variance_csv: Path,
@@ -171,14 +169,19 @@ def _add_variance_tier_column(
       2) Else use mean "Variance_ms2" over rows where Group contains "Pre" (case-insensitive)
       3) Else use mean "Variance_ms2" over all rows
     """
+    if df.empty:
+        out = df.copy()
+        out["variance_tier"] = pd.Series(dtype="object")
+        return out
+
     top_pct = float(top_pct)
     if top_pct <= 0 or top_pct >= 100:
         raise ValueError(f"--variance-top-pct must be between 0 and 100 (got {top_pct})")
 
     v = pd.read_csv(variance_csv)
 
-    # Column detection (robust-ish to minor header differences)
     cols = {c.strip(): c for c in v.columns}
+
     def _pick(cands: Sequence[str]) -> Optional[str]:
         for c in cands:
             if c in cols:
@@ -205,7 +208,6 @@ def _add_variance_tier_column(
             "variance CSV must include a variance column (e.g., 'Pre_Variance_ms2' and/or 'Variance_ms2')."
         )
 
-    # Build a per-(bird, syllable) variance value
     idx_cols = [col_animal, col_syll]
 
     # 1) Pre_Variance_ms2 (often present only on one row per syllable)
@@ -672,7 +674,6 @@ _COMP_ORDER = [
 ]
 
 
-
 def _p_to_stars(p: float) -> str:
     if not np.isfinite(p):
         return "n/a"
@@ -719,8 +720,6 @@ def _mannwhitney_safe(a: np.ndarray, b: np.ndarray, alternative: str = "two-side
         return 1.0
 
 
-
-
 def _holm_bonferroni(pvals: Iterable[float]) -> np.ndarray:
     """Holm-Bonferroni step-down correction.
 
@@ -759,6 +758,7 @@ def _holm_bonferroni(pvals: Iterable[float]) -> np.ndarray:
     adj[order] = adj_sorted
     return adj
 
+
 def _add_sig_bracket(ax: plt.Axes, x1: float, x2: float, y: float, h: float, text: str) -> None:
     # Draw a simple bracket from x1 to x2 at height y with label above.
     ax.plot([x1, x1, x2, x2], [y, y + h, y + h, y], lw=1.5, color="black", clip_on=False)
@@ -778,6 +778,7 @@ def _boxplot_bc_by_group(
     *,
     show_stats: bool = True,
     stats_mode: str = "all_pairs",  # "all_pairs" or "vs_first"
+    title_y: float | None = None,
 ) -> None:
     """Group-level boxplot with optional pairwise stats annotations."""
     fig, ax = plt.subplots(figsize=(10, 4.5))
@@ -793,7 +794,7 @@ def _boxplot_bc_by_group(
     except TypeError:
         bp = ax.boxplot(data, labels=groups, showfliers=True)
 
-    ax.set_title(title, pad=18)
+    ax.set_title(title, pad=18, y=title_y) if title_y is not None else ax.set_title(title, pad=18)
     ax.set_ylabel(ylabel)
     ax.grid(False)
 
@@ -844,7 +845,8 @@ def _boxplot_bc_by_group(
         base = ymax + max(0.05, 0.06 * y_span)
         h = max(0.025, 0.03 * y_span)
         step = max(0.08, 0.10 * y_span)
-# Sort by span then stack
+
+        # Sort by span then stack
         spans = [(abs(j - i), k) for k, (i, j, *_rest) in enumerate(pairs)]
         spans.sort()
         for level, (_span, k) in enumerate(spans):
@@ -865,6 +867,7 @@ def _boxplot_bc_by_group(
     fig.subplots_adjust(bottom=0.25)
     fig.savefig(out_png, dpi=200, bbox_inches="tight", pad_inches=0.2)
     plt.close(fig)
+
 
 def _write_group_stats(df: pd.DataFrame, out_txt: Path, title: str) -> None:
     lines: List[str] = []
@@ -1183,7 +1186,7 @@ def run_root_directory(cfg: PrePostBCConfig) -> Dict[str, str]:
     stamp = _now_stamp()
     out_csv = out_dir / f"bhattacharyya_comparisons_{cfg_eff.array_key}_{cfg_eff.cov_type}_{stamp}.csv"
     df = pd.DataFrame(all_rows)
-    if cfg_eff.variance_csv is not None:
+    if cfg_eff.variance_csv is not None and len(df) > 0:
         df = _add_variance_tier_column(df, cfg_eff.variance_csv, cfg_eff.variance_top_pct)
 
     df.to_csv(out_csv, index=False)
@@ -1218,11 +1221,32 @@ def run_root_directory(cfg: PrePostBCConfig) -> Dict[str, str]:
                 if len(sub) == 0:
                     continue
                 png = tier_dir / f"{comp_key}_bc_by_hit_type_{cfg_eff.array_key}_{cfg_eff.cov_type}_{stamp}.png"
-                _boxplot_bc_by_group(sub, png, title=f"BC by hit type: {comp_title} ({tier_descr})")
+                # Prepare group-wise arrays for plotting (match _boxplot_bc_by_group signature).
+                groups = []
+                data = []
+                for g in _GROUP_ORDER:
+                    arr = sub.loc[sub["group"] == g, "bhattacharyya_coeff"].dropna().to_numpy()
+                    if arr.size:
+                        groups.append(f"{g}\n(n={arr.size})")
+                        data.append(arr)
+                if len(data) >= 2:
+                    _boxplot_bc_by_group(
+                        title=f"BC by hit type: {comp_title} ({tier_descr})",
+                        ylabel="Bhattacharyya coefficient (BC)",
+                        groups=groups,
+                        data=data,
+                        out_png=png,
+                        show_stats=True,
+                        stats_mode="all_pairs",
+                        title_y=1.08,
+                    )
+                else:
+                    print(f"[skip plot] {comp_key} ({tier_label}) not enough groups with data")
 
             paired_png = tier_dir / f"paired_drift_BC_pre_vs_post_by_hit_birdlevel_{cfg_eff.array_key}_{cfg_eff.cov_type}_{stamp}.png"
             paired_txt = tier_dir / f"paired_drift_BC_pre_vs_post_by_hit_birdlevel_{cfg_eff.array_key}_{cfg_eff.cov_type}_{stamp}.txt"
             _paired_drift_plot_birdlevel(df_plot, paired_png, paired_txt, title=f"Paired drift BC comparison within birds by hit type ({tier_descr})")
+
     return {"results_csv": str(out_csv), "out_dir": str(out_dir)}
 
 

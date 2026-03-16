@@ -18,6 +18,9 @@ Extends your original bhattacharyya_pre_vs_post_cluster.py by adding:
      - Bird-level paired plot comparing within-pre drift vs within-post drift:
            BC(pre early vs late)  vs  BC(post early vs late)
        with x-axis labels "pre-lesion" and "post-lesion".
+     - Per-bird cluster-level paired plots using ALL syllables:
+           For each bird, plot paired BC values for each cluster
+           comparing pre_early_vs_late vs post_early_vs_late.
 
 BC is computed under a multivariate Gaussian approximation:
   - Fit N(mu_A, Sigma_A) and N(mu_B, Sigma_B)
@@ -36,18 +39,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Sequence
 import argparse
 import datetime as _dt
 import os
 import re
 import time
-import warnings
 from zipfile import BadZipFile
 
 import numpy as np
 import pandas as pd
-
 import matplotlib.pyplot as plt
 
 try:
@@ -144,7 +145,6 @@ def _parse_excel_serial_days(token: str) -> Optional[_dt.datetime]:
         return None
 
 
-
 def _add_variance_tier_column(
     df: pd.DataFrame,
     variance_csv: Path,
@@ -160,30 +160,28 @@ def _add_variance_tier_column(
     "Low"  = the remaining syllables with variance values (per bird).
     "Unknown" = syllables not found in the variance CSV for that bird.
 
-    The variance CSV is expected to contain (at minimum) columns like:
-      - "Animal ID" (bird id)
-      - "Syllable"  (syllable label / cluster id)
-      - "Pre_Variance_ms2" and/or "Variance_ms2"
-      - optionally "Group" (to identify pre rows; used as fallback if Pre_Variance_ms2 is missing)
-
     Heuristic for variance value per (bird, syllable):
       1) Use first non-null "Pre_Variance_ms2" if available
       2) Else use mean "Variance_ms2" over rows where Group contains "Pre" (case-insensitive)
       3) Else use mean "Variance_ms2" over all rows
     """
+    if df.empty:
+        out = df.copy()
+        out["variance_tier"] = pd.Series(dtype="object")
+        return out
+
     top_pct = float(top_pct)
     if top_pct <= 0 or top_pct >= 100:
         raise ValueError(f"--variance-top-pct must be between 0 and 100 (got {top_pct})")
 
     v = pd.read_csv(variance_csv)
 
-    # Column detection (robust-ish to minor header differences)
     cols = {c.strip(): c for c in v.columns}
+
     def _pick(cands: Sequence[str]) -> Optional[str]:
         for c in cands:
             if c in cols:
                 return cols[c]
-        # case-insensitive fallback
         low = {c.lower(): c for c in v.columns}
         for c in cands:
             if c.lower() in low:
@@ -205,20 +203,17 @@ def _add_variance_tier_column(
             "variance CSV must include a variance column (e.g., 'Pre_Variance_ms2' and/or 'Variance_ms2')."
         )
 
-    # Build a per-(bird, syllable) variance value
     idx_cols = [col_animal, col_syll]
 
-    # 1) Pre_Variance_ms2 (often present only on one row per syllable)
     if col_prevar is not None:
         s_pre = (
             v.dropna(subset=[col_prevar])
-             .groupby(idx_cols, dropna=False)[col_prevar]
-             .first()
+            .groupby(idx_cols, dropna=False)[col_prevar]
+            .first()
         )
     else:
         s_pre = pd.Series(dtype=float)
 
-    # 2) Mean Variance_ms2 over pre rows (fallback if Pre_Variance missing)
     if col_var is not None:
         if col_group is not None:
             pre_mask = v[col_group].astype(str).str.contains("pre", case=False, na=False)
@@ -230,13 +225,11 @@ def _add_variance_tier_column(
         else:
             s_pre_mean = pd.Series(dtype=float)
 
-        # 3) Mean Variance_ms2 over all rows (last fallback)
         s_all_mean = v.groupby(idx_cols, dropna=False)[col_var].mean()
     else:
         s_pre_mean = pd.Series(dtype=float)
         s_all_mean = pd.Series(dtype=float)
 
-    # Combine with precedence: Pre_Variance -> Pre mean -> All mean
     s_val = s_pre
     if not s_pre_mean.empty:
         s_val = s_val.combine_first(s_pre_mean)
@@ -246,12 +239,10 @@ def _add_variance_tier_column(
 
     vmap = s_val.reset_index().rename(columns={col_animal: "animal_id", col_syll: "cluster_label"})
     vmap["animal_id"] = vmap["animal_id"].astype(str)
-    # cluster labels should match df cluster_label dtype (usually int). Coerce safely.
     vmap["cluster_label"] = pd.to_numeric(vmap["cluster_label"], errors="coerce")
     vmap = vmap.dropna(subset=["cluster_label"]).copy()
     vmap["cluster_label"] = vmap["cluster_label"].astype(int)
 
-    # Threshold per bird = 100 - top_pct percentile
     q = 100.0 - top_pct
 
     def _pct(s: pd.Series) -> float:
@@ -268,22 +259,20 @@ def _add_variance_tier_column(
         "low",
     )
 
-    # Merge tier onto df
     out = df.copy()
     out[df_animal_col] = out[df_animal_col].astype(str)
-    # Ensure cluster label numeric for merge
     out[df_syllable_col] = pd.to_numeric(out[df_syllable_col], errors="coerce")
 
+    vmap2 = vmap.rename(columns={"animal_id": "__var_animal_id", "cluster_label": "__var_cluster_label"})
     out = out.merge(
-        vmap[["animal_id", "cluster_label", "variance_tier"]],
+        vmap2[["__var_animal_id", "__var_cluster_label", "variance_tier"]],
         how="left",
         left_on=[df_animal_col, df_syllable_col],
-        right_on=["animal_id", "cluster_label"],
+        right_on=["__var_animal_id", "__var_cluster_label"],
     )
-    out = out.drop(columns=["animal_id", "cluster_label"], errors="ignore")
+    out = out.drop(columns=["__var_animal_id", "__var_cluster_label"], errors="ignore")
     out["variance_tier"] = out["variance_tier"].fillna("unknown")
 
-    # Small console summary
     try:
         counts = out["variance_tier"].value_counts(dropna=False).to_dict()
         print(f"[variance tiers] top_pct={top_pct:.1f}% -> counts: {counts}")
@@ -579,8 +568,6 @@ def _cov_est(X: np.ndarray, cov_type: str, *, eps: float) -> np.ndarray:
     cov_type = cov_type.lower()
     if cov_type == "diag":
         v = np.var(X, axis=0, ddof=1)
-        # Some dimensions can be (near) constant within a period/cluster → var≈0.
-        # Clamp to eps to avoid singular covariances and noisy slogdet warnings.
         v = np.where(np.isfinite(v), v, 0.0)
         v = np.maximum(v, float(eps))
         return np.diag(v)
@@ -593,7 +580,6 @@ def _cov_est(X: np.ndarray, cov_type: str, *, eps: float) -> np.ndarray:
 
 
 def _slogdet_psd(A: np.ndarray) -> Tuple[float, float]:
-    # Avoid noisy RuntimeWarnings when matrices are near-singular or ill-conditioned.
     with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
         sign, logdet = np.linalg.slogdet(A)
     return float(sign), float(logdet)
@@ -670,7 +656,6 @@ _COMP_ORDER = [
 ]
 
 
-
 def _p_to_stars(p: float) -> str:
     if not np.isfinite(p):
         return "n/a"
@@ -686,11 +671,6 @@ def _p_to_stars(p: float) -> str:
 
 
 def _mannwhitney_safe(a: np.ndarray, b: np.ndarray, alternative: str = "two-sided") -> float:
-    """Mann-Whitney U test with guardrails.
-
-    Returns a p-value (float). If the test can't be computed (empty arrays, all ties, etc.),
-    returns 1.0 or nan depending on the failure mode.
-    """
     a = np.asarray(a, dtype=float)
     b = np.asarray(b, dtype=float)
     a = a[np.isfinite(a)]
@@ -699,7 +679,6 @@ def _mannwhitney_safe(a: np.ndarray, b: np.ndarray, alternative: str = "two-side
     if a.size == 0 or b.size == 0:
         return float("nan")
 
-    # If both samples are exactly the same constant values, MWU is not informative.
     if np.all(a == a.flat[0]) and np.all(b == b.flat[0]) and a.flat[0] == b.flat[0]:
         return 1.0
 
@@ -707,7 +686,6 @@ def _mannwhitney_safe(a: np.ndarray, b: np.ndarray, alternative: str = "two-side
         res = stats.mannwhitneyu(a, b, alternative=alternative, method="auto")
         return float(res.pvalue)
     except TypeError:
-        # older SciPy without 'method'
         try:
             res = stats.mannwhitneyu(a, b, alternative=alternative)
             return float(res.pvalue)
@@ -717,36 +695,21 @@ def _mannwhitney_safe(a: np.ndarray, b: np.ndarray, alternative: str = "two-side
         return 1.0
 
 
-
-
 def _holm_bonferroni(pvals: Iterable[float]) -> np.ndarray:
-    """Holm-Bonferroni step-down correction.
-
-    Parameters
-    ----------
-    pvals:
-        Iterable of p-values (any non-finite values are treated as 1.0).
-
-    Returns
-    -------
-    np.ndarray
-        Adjusted p-values in the ORIGINAL order (same length as input).
-    """
     p = np.asarray(list(pvals), dtype=float)
     if p.size == 0:
         return p
 
-    # Treat NaN/inf as 1.0 so they don't create weird ordering/adjustments
     p_clean = np.where(np.isfinite(p), p, 1.0)
 
     m = int(p_clean.size)
-    order = np.argsort(p_clean)  # ascending
+    order = np.argsort(p_clean)
     p_sorted = p_clean[order]
 
     adj_sorted = np.empty_like(p_sorted)
     prev = 0.0
     for i, pv in enumerate(p_sorted):
-        mult = float(m - i)  # m, m-1, ..., 1
+        mult = float(m - i)
         val = mult * float(pv)
         if val < prev:
             val = prev
@@ -757,12 +720,9 @@ def _holm_bonferroni(pvals: Iterable[float]) -> np.ndarray:
     adj[order] = adj_sorted
     return adj
 
-def _add_sig_bracket(ax: plt.Axes, x1: float, x2: float, y: float, h: float, text: str) -> None:
-    # Draw a simple bracket from x1 to x2 at height y with label above.
-    ax.plot([x1, x1, x2, x2], [y, y + h, y + h, y], lw=1.5, color="black", clip_on=False)
 
-    # Place the label slightly above the bracket so the text never overlaps the bar itself.
-    # Use a small padding in *data units*; scale with bracket height and keep a minimum.
+def _add_sig_bracket(ax: plt.Axes, x1: float, x2: float, y: float, h: float, text: str) -> None:
+    ax.plot([x1, x1, x2, x2], [y, y + h, y + h, y], lw=1.5, color="black", clip_on=False)
     text_pad = max(h * 0.5, 0.012)
     ax.text((x1 + x2) / 2.0, y + h + text_pad, text, ha="center", va="bottom", fontsize=11, clip_on=False)
 
@@ -775,27 +735,27 @@ def _boxplot_bc_by_group(
     out_png: Path,
     *,
     show_stats: bool = True,
-    stats_mode: str = "all_pairs",  # "all_pairs" or "vs_first"
+    stats_mode: str = "all_pairs",
+    title_y: float | None = None,
 ) -> None:
-    """Group-level boxplot with optional pairwise stats annotations."""
     fig, ax = plt.subplots(figsize=(10, 4.5))
-
-    # --- aesthetics (requested) ---
     ax.grid(False)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
 
-    # Matplotlib 3.9 renamed labels->tick_labels
     try:
-        bp = ax.boxplot(data, tick_labels=groups, showfliers=True)
+        ax.boxplot(data, tick_labels=groups, showfliers=True)
     except TypeError:
-        bp = ax.boxplot(data, labels=groups, showfliers=True)
+        ax.boxplot(data, labels=groups, showfliers=True)
 
-    ax.set_title(title, pad=18)
+    if title_y is not None:
+        ax.set_title(title, pad=18, y=title_y)
+    else:
+        ax.set_title(title, pad=18)
+
     ax.set_ylabel(ylabel)
     ax.grid(False)
 
-    # --- dynamic y-limits (allow slight negatives if they occur) ---
     mins_maxs = []
     for v in data:
         arr = np.asarray(v, dtype=float)
@@ -811,49 +771,39 @@ def _boxplot_bc_by_group(
     y_lower = min(-0.05, ymin - 0.05)
     y_upper_base = max(1.05, ymax + 0.05)
 
-    # Optional stats across groups (Mann-Whitney U + Holm correction)
     if show_stats and len(groups) >= 2:
         x_positions = list(range(1, len(groups) + 1))
-
         pairs: List[Tuple[int, int, str, str, float]] = []
+
         if stats_mode == "vs_first":
             for j in range(1, len(groups)):
-                g1 = groups[0]
-                g2 = groups[j]
-                a = data[0]
-                b = data[j]
-                p = _mannwhitney_safe(a, b)
-                pairs.append((0, j, g1, g2, p))
+                p = _mannwhitney_safe(data[0], data[j])
+                pairs.append((0, j, groups[0], groups[j], p))
         else:
             for i in range(len(groups)):
                 for j in range(i + 1, len(groups)):
-                    g1 = groups[i]
-                    g2 = groups[j]
-                    a = data[i]
-                    b = data[j]
-                    p = _mannwhitney_safe(a, b)
-                    pairs.append((i, j, g1, g2, p))
+                    p = _mannwhitney_safe(data[i], data[j])
+                    pairs.append((i, j, groups[i], groups[j], p))
 
         pvals = np.array([p for *_rest, p in pairs], dtype=float)
         p_holm = _holm_bonferroni(pvals)
 
-        # Annotation geometry (add generous headroom so brackets/text don't collide with each other or the title)
         y_span = max(1e-9, ymax - y_lower)
         base = ymax + max(0.05, 0.06 * y_span)
         h = max(0.025, 0.03 * y_span)
         step = max(0.08, 0.10 * y_span)
-# Sort by span then stack
+
         spans = [(abs(j - i), k) for k, (i, j, *_rest) in enumerate(pairs)]
         spans.sort()
+
         for level, (_span, k) in enumerate(spans):
-            i, j, g1, g2, U = pairs[k]
+            i, j, *_rest = pairs[k]
             p_adj = float(p_holm[k])
             stars = _p_to_stars(p_adj)
             label = f"{stars} (p={p_adj:.3g})" if stars != "n.s." else f"n.s. (p={p_adj:.3g})"
             y = base + level * step
             _add_sig_bracket(ax, x_positions[i], x_positions[j], y, h, label)
 
-        # Make sure brackets are comfortably visible (avoid title/text collisions)
         text_pad = max(0.015, 0.6 * h)
         top_needed = base + (len(pairs) - 1) * step + h + text_pad + max(0.06, 0.06 * y_span)
         ax.set_ylim(y_lower, min(1.40, max(y_upper_base, top_needed)))
@@ -864,15 +814,16 @@ def _boxplot_bc_by_group(
     fig.savefig(out_png, dpi=200, bbox_inches="tight", pad_inches=0.2)
     plt.close(fig)
 
+
 def _write_group_stats(df: pd.DataFrame, out_txt: Path, title: str) -> None:
-    lines: List[str] = []
-    lines.append(title)
-    lines.append("")
+    lines: List[str] = [title, ""]
     for g in _GROUP_ORDER:
         sub = df[df["group"] == g]["bhattacharyya_coeff"].dropna()
         if len(sub) == 0:
             continue
-        lines.append(f"[{g}] n={len(sub)} mean={sub.mean():.6g} median={sub.median():.6g} std={sub.std(ddof=1):.6g}")
+        lines.append(
+            f"[{g}] n={len(sub)} mean={sub.mean():.6g} median={sub.median():.6g} std={sub.std(ddof=1):.6g}"
+        )
     lines.append("")
 
     if _HAVE_SCIPY:
@@ -883,8 +834,10 @@ def _write_group_stats(df: pd.DataFrame, out_txt: Path, title: str) -> None:
                 if len(groups) >= 3:
                     H, p = stats.kruskal(*groups)
                     lines.append(f"Kruskal–Wallis: H={H:.6g} p={p:.6g}")
+
                 present = [(g, df[df["group"] == g]["bhattacharyya_coeff"].dropna().values) for g in _GROUP_ORDER]
                 present = [(g, v) for g, v in present if len(v) > 0]
+
                 if len(present) >= 2:
                     pairs = []
                     pvals = []
@@ -895,11 +848,13 @@ def _write_group_stats(df: pd.DataFrame, out_txt: Path, title: str) -> None:
                             U, p2 = stats.mannwhitneyu(v1, v2, alternative="two-sided")
                             pairs.append((g1, g2, float(U)))
                             pvals.append(float(p2))
+
                     m = len(pvals)
                     order = np.argsort(pvals)
                     p_adj = [None] * m
                     for rank, idx in enumerate(order):
                         p_adj[idx] = min(1.0, pvals[idx] * (m - rank))
+
                     lines.append("Pairwise Mann–Whitney U (Holm-adjusted):")
                     for (g1, g2, U), p_raw, p_holm in zip(pairs, pvals, p_adj):
                         lines.append(f"  {g1} vs {g2}: U={U:.6g} p={p_raw:.6g} p_holm={p_holm:.6g}")
@@ -911,18 +866,29 @@ def _write_group_stats(df: pd.DataFrame, out_txt: Path, title: str) -> None:
     out_txt.write_text("\n".join(lines) + "\n")
 
 
-def _paired_drift_plot_birdlevel(df: pd.DataFrame, out_png: Path, out_txt: Path) -> None:
-    pre = df[df["comparison"] == "pre_early_vs_late"].groupby(["animal_id", "group"], as_index=False)["bhattacharyya_coeff"].mean()
-    post = df[df["comparison"] == "post_early_vs_late"].groupby(["animal_id", "group"], as_index=False)["bhattacharyya_coeff"].mean()
+def _paired_drift_plot_birdlevel(
+    df: pd.DataFrame,
+    out_png: Path,
+    out_txt: Path,
+    *,
+    title: str = "Paired drift BC comparison within birds by hit type",
+) -> None:
+    pre = (
+        df[df["comparison"] == "pre_early_vs_late"]
+        .groupby(["animal_id", "group"], as_index=False)["bhattacharyya_coeff"]
+        .mean()
+    )
+    post = (
+        df[df["comparison"] == "post_early_vs_late"]
+        .groupby(["animal_id", "group"], as_index=False)["bhattacharyya_coeff"]
+        .mean()
+    )
     merged = pd.merge(pre, post, on=["animal_id", "group"], suffixes=("_pre", "_post"))
 
-    stats_lines: List[str] = []
-    stats_lines.append("Paired drift BC comparison within birds by hit type")
-    stats_lines.append("Metric: Bhattacharyya coefficient (higher = more similar)")
-    stats_lines.append("")
+    stats_lines: List[str] = [title, "Metric: Bhattacharyya coefficient (higher = more similar)", ""]
 
     fig, axes = plt.subplots(1, 3, figsize=(16, 5), sharey=True)
-    fig.suptitle("Paired drift BC comparison within birds by hit type", y=0.98)
+    fig.suptitle(title, y=0.98)
 
     for ax, g in zip(axes, _GROUP_ORDER):
         sub = merged[merged["group"] == g].copy()
@@ -939,8 +905,6 @@ def _paired_drift_plot_birdlevel(df: pd.DataFrame, out_png: Path, out_txt: Path)
         y1 = sub["bhattacharyya_coeff_pre"].values
         y2 = sub["bhattacharyya_coeff_post"].values
 
-        # NOTE: Axes.boxplot() resets tick locations/labels (manage_ticks=True by default),
-        # so set the human-readable labels *after* calling boxplot.
         ax.boxplot([y1, y2], positions=[1, 2], widths=0.5, showfliers=False)
         ax.set_xticks([1, 2])
         ax.set_xticklabels(["pre-lesion", "post-lesion"])
@@ -955,8 +919,14 @@ def _paired_drift_plot_birdlevel(df: pd.DataFrame, out_png: Path, out_txt: Path)
             try:
                 w, p = stats.wilcoxon(y1, y2, alternative="two-sided", zero_method="wilcox")
                 stats_lines.append(f"[{g}] n_birds={len(sub)} Wilcoxon(pre vs post drift BC): W={w:.6g} p={p:.6g}")
-                ax.text(0.5, 0.95, f"n.s. (p={p:.3g})" if p >= 0.05 else f"* (p={p:.3g})",
-                        ha="center", va="top", transform=ax.transAxes)
+                ax.text(
+                    0.5,
+                    0.95,
+                    f"n.s. (p={p:.3g})" if p >= 0.05 else f"* (p={p:.3g})",
+                    ha="center",
+                    va="top",
+                    transform=ax.transAxes,
+                )
             except Exception as e:
                 stats_lines.append(f"[{g}] n_birds={len(sub)} Wilcoxon failed: {repr(e)}")
         else:
@@ -964,10 +934,89 @@ def _paired_drift_plot_birdlevel(df: pd.DataFrame, out_png: Path, out_txt: Path)
 
     axes[0].set_ylabel("Bhattacharyya coefficient (BC)")
     fig.tight_layout()
-    fig.savefig(out_png, dpi=200, bbox_inches='tight', pad_inches=0.2)
+    fig.savefig(out_png, dpi=200, bbox_inches="tight", pad_inches=0.2)
     plt.close(fig)
 
     out_txt.write_text("\n".join(stats_lines) + "\n")
+
+
+def _paired_cluster_plots_by_bird(
+    df: pd.DataFrame,
+    out_dir: Path,
+    *,
+    array_key: str,
+    cov_type: str,
+    stamp: str,
+    title_suffix: str = "all syllables",
+) -> None:
+    """
+    Make one paired plot per bird using ALL cluster-level BC values.
+
+    Each line corresponds to one cluster that has both a pre_early_vs_late BC and
+    a post_early_vs_late BC.
+    """
+    pre = (
+        df[df["comparison"] == "pre_early_vs_late"]
+        [["animal_id", "group", "cluster_label", "bhattacharyya_coeff"]]
+        .rename(columns={"bhattacharyya_coeff": "bhattacharyya_coeff_pre"})
+    )
+    post = (
+        df[df["comparison"] == "post_early_vs_late"]
+        [["animal_id", "group", "cluster_label", "bhattacharyya_coeff"]]
+        .rename(columns={"bhattacharyya_coeff": "bhattacharyya_coeff_post"})
+    )
+    merged = pd.merge(pre, post, on=["animal_id", "group", "cluster_label"], how="inner")
+
+    if len(merged) == 0:
+        print(f"[skip per-bird plots] no overlapping pre/post early-late cluster BC values for {title_suffix}")
+        return
+
+    per_bird_dir = out_dir / "per_bird_cluster_paired_BC"
+    per_bird_dir.mkdir(parents=True, exist_ok=True)
+
+    for (animal_id, group), sub in merged.groupby(["animal_id", "group"], sort=True):
+        sub = sub.sort_values("cluster_label").copy()
+        if len(sub) == 0:
+            continue
+
+        fig, ax = plt.subplots(figsize=(8.5, 5.5))
+        ax.grid(False)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+        y1 = sub["bhattacharyya_coeff_pre"].to_numpy(dtype=float)
+        y2 = sub["bhattacharyya_coeff_post"].to_numpy(dtype=float)
+
+        for _, r in sub.iterrows():
+            y_pre = float(r["bhattacharyya_coeff_pre"])
+            y_post = float(r["bhattacharyya_coeff_post"])
+            ax.plot([1, 2], [y_pre, y_post], alpha=0.75, linewidth=1.1)
+            ax.scatter([1, 2], [y_pre, y_post], s=28)
+
+            if len(sub) <= 20:
+                ax.text(2.04, y_post, str(int(r["cluster_label"])), fontsize=8, va="center")
+
+        vals = np.concatenate([y1, y2]) if len(sub) > 0 else np.array([0.0, 1.0])
+        vals = vals[np.isfinite(vals)]
+        if vals.size == 0:
+            y_min, y_max = 0.0, 1.0
+        else:
+            y_min = float(vals.min())
+            y_max = float(vals.max())
+
+        ax.set_xlim(0.85, 2.18 if len(sub) <= 20 else 2.05)
+        ax.set_ylim(min(0.0, y_min - 0.05), min(1.05, max(1.05, y_max + 0.05)))
+        ax.set_xticks([1, 2])
+        ax.set_xticklabels(["pre-lesion", "post-lesion"])
+        ax.set_ylabel("Bhattacharyya coefficient (BC)")
+        ax.set_title(f"{animal_id}: cluster-level paired drift BC\n{group} ({title_suffix})", pad=14)
+        ax.text(0.02, 0.98, f"n clusters={len(sub)}", transform=ax.transAxes, ha="left", va="top")
+
+        safe_animal = re.sub(r"[^A-Za-z0-9._-]+", "_", str(animal_id))
+        out_png = per_bird_dir / f"{safe_animal}_cluster_paired_drift_BC_{array_key}_{cov_type}_{stamp}.png"
+        fig.tight_layout()
+        fig.savefig(out_png, dpi=200, bbox_inches="tight", pad_inches=0.2)
+        plt.close(fig)
 
 
 def process_one_npz(npz_path: Path, meta: Dict[str, Any], cfg: PrePostBCConfig) -> List[Dict[str, Any]]:
@@ -1035,8 +1084,12 @@ def process_one_npz(npz_path: Path, meta: Dict[str, Any], cfg: PrePostBCConfig) 
     pre_early = pre_late = None
     post_early = post_late = None
     if cfg.split_early_late:
-        pre_early, pre_late = _split_early_late_masks_by_file(file_indices, file_dt_map, pre_mask, method=cfg.early_late_split_method)
-        post_early, post_late = _split_early_late_masks_by_file(file_indices, file_dt_map, post_mask, method=cfg.early_late_split_method)
+        pre_early, pre_late = _split_early_late_masks_by_file(
+            file_indices, file_dt_map, pre_mask, method=cfg.early_late_split_method
+        )
+        post_early, post_late = _split_early_late_masks_by_file(
+            file_indices, file_dt_map, post_mask, method=cfg.early_late_split_method
+        )
 
     labels = np.unique(clusters.astype(int))
     if not cfg.include_noise:
@@ -1060,7 +1113,9 @@ def process_one_npz(npz_path: Path, meta: Dict[str, Any], cfg: PrePostBCConfig) 
             return None
 
         if cfg.balance_pair_samples:
-            idx_a, idx_b, n_target, n_a_raw, n_b_raw = _balanced_subsample_pair(idx_a, idx_b, rng=rng, cap=cap)
+            idx_a, idx_b, n_target, n_a_raw, n_b_raw = _balanced_subsample_pair(
+                idx_a, idx_b, rng=rng, cap=cap
+            )
             if n_target < cfg.min_points_per_period:
                 return None
         else:
@@ -1154,8 +1209,10 @@ def run_root_directory(cfg: PrePostBCConfig) -> Dict[str, str]:
         meta = animal_meta.get(aid, {"hit_type": None, "treatment_date": None, "group": "unknown"})
         tasks.append((p, meta))
 
-    print(f"[BC] NPZ files found: {len(npz_files)} (workers={cfg_eff.workers}, cap={cfg_eff.max_points_per_cluster_period}, "
-          f"cov={cfg_eff.cov_type}, balance={cfg_eff.balance_pair_samples}, split_early_late={cfg_eff.split_early_late})")
+    print(
+        f"[BC] NPZ files found: {len(npz_files)} (workers={cfg_eff.workers}, cap={cfg_eff.max_points_per_cluster_period}, "
+        f"cov={cfg_eff.cov_type}, balance={cfg_eff.balance_pair_samples}, split_early_late={cfg_eff.split_early_late})"
+    )
 
     all_rows: List[Dict[str, Any]] = []
     t0 = time.time()
@@ -1165,6 +1222,7 @@ def run_root_directory(cfg: PrePostBCConfig) -> Dict[str, str]:
             all_rows.extend(process_one_npz(p, meta, cfg_eff))
     else:
         from concurrent.futures import ProcessPoolExecutor, as_completed
+
         with ProcessPoolExecutor(max_workers=cfg_eff.workers) as ex:
             futs = [ex.submit(process_one_npz, p, meta, cfg_eff) for p, meta in tasks]
             for fut in as_completed(futs):
@@ -1181,38 +1239,91 @@ def run_root_directory(cfg: PrePostBCConfig) -> Dict[str, str]:
     stamp = _now_stamp()
     out_csv = out_dir / f"bhattacharyya_comparisons_{cfg_eff.array_key}_{cfg_eff.cov_type}_{stamp}.csv"
     df = pd.DataFrame(all_rows)
-    if cfg_eff.variance_csv is not None:
+
+    if cfg_eff.variance_csv is not None and len(df) > 0:
         df = _add_variance_tier_column(df, cfg_eff.variance_csv, cfg_eff.variance_top_pct)
 
     df.to_csv(out_csv, index=False)
     print(f"Saved CSV: {out_csv}")
 
     if cfg_eff.make_plots and len(df) > 0:
-        for comp_key, comp_title in _COMP_ORDER:
-            sub = df[df["comparison"] == comp_key].copy()
-            if len(sub) == 0:
-                continue
-            png = out_dir / f"{comp_key}_bc_by_hit_type_{cfg_eff.array_key}_{cfg_eff.cov_type}_{stamp}.png"
-            txt = out_dir / f"{comp_key}_bc_stats_{cfg_eff.array_key}_{cfg_eff.cov_type}_{stamp}.txt"
-            # Prepare group-wise arrays for plotting
-            groups = [g for g in _GROUP_ORDER if (sub["group"] == g).any()]
-            data = [
-                sub.loc[sub["group"] == g, "bhattacharyya_coeff"].dropna().to_numpy()
-                for g in groups
-            ]
+        # Always make per-bird cluster paired plots using ALL syllables
+        _paired_cluster_plots_by_bird(
+            df,
+            out_dir,
+            array_key=cfg_eff.array_key,
+            cov_type=cfg_eff.cov_type,
+            stamp=stamp,
+            title_suffix="all syllables",
+        )
 
-            _boxplot_bc_by_group(
-                title=f"BC by hit type: {comp_title}",
-                ylabel="Bhattacharyya coefficient (BC)",
-                groups=groups,
-                data=data,
-                out_png=png,
+        plot_specs: List[Tuple[str, pd.DataFrame]] = []
+        if (cfg_eff.variance_csv is not None) and ("variance_tier" in df.columns):
+            for tier_label in ("high", "low"):
+                df_tier = df[df["variance_tier"] == tier_label].copy()
+                if len(df_tier) > 0:
+                    plot_specs.append((tier_label, df_tier))
+        else:
+            plot_specs.append(("all", df))
+
+        for tier_label, df_plot in plot_specs:
+            if tier_label == "all":
+                tier_dir = out_dir
+                tier_descr = "all syllables"
+            else:
+                tier_dir = out_dir / f"variance_{tier_label}_top{int(cfg_eff.variance_top_pct)}"
+                tier_dir.mkdir(parents=True, exist_ok=True)
+                if tier_label == "high":
+                    tier_descr = f"high-variance syllables (top {cfg_eff.variance_top_pct:.0f}%)"
+                else:
+                    tier_descr = f"low-variance syllables (bottom {100.0 - cfg_eff.variance_top_pct:.0f}%)"
+
+                tier_csv = tier_dir / f"bhattacharyya_comparisons_{cfg_eff.array_key}_{cfg_eff.cov_type}_{stamp}_{tier_label}.csv"
+                df_plot.to_csv(tier_csv, index=False)
+
+            for comp_key, comp_title in _COMP_ORDER:
+                sub = df_plot[df_plot["comparison"] == comp_key].copy()
+                if len(sub) == 0:
+                    continue
+
+                png = tier_dir / f"{comp_key}_bc_by_hit_type_{cfg_eff.array_key}_{cfg_eff.cov_type}_{stamp}.png"
+                txt = tier_dir / f"{comp_key}_bc_stats_{cfg_eff.array_key}_{cfg_eff.cov_type}_{stamp}.txt"
+
+                groups = []
+                data = []
+                for g in _GROUP_ORDER:
+                    arr = sub.loc[sub["group"] == g, "bhattacharyya_coeff"].dropna().to_numpy()
+                    if arr.size:
+                        groups.append(f"{g}\n(n={arr.size})")
+                        data.append(arr)
+
+                if len(data) >= 2:
+                    _boxplot_bc_by_group(
+                        title=f"BC by hit type: {comp_title} ({tier_descr})",
+                        ylabel="Bhattacharyya coefficient (BC)",
+                        groups=groups,
+                        data=data,
+                        out_png=png,
+                        show_stats=True,
+                        stats_mode="all_pairs",
+                        title_y=1.08,
+                    )
+                    _write_group_stats(sub, txt, title=f"BC by hit type: {comp_title} ({tier_descr})")
+                else:
+                    print(f"[skip plot] {comp_key} ({tier_label}) not enough groups with data")
+
+            paired_png = tier_dir / (
+                f"paired_drift_BC_pre_vs_post_by_hit_birdlevel_{cfg_eff.array_key}_{cfg_eff.cov_type}_{stamp}.png"
             )
-            _write_group_stats(sub, txt, title=f"BC by hit type: {comp_title}")
-
-        paired_png = out_dir / f"paired_drift_BC_pre_vs_post_by_hit_birdlevel_{cfg_eff.array_key}_{cfg_eff.cov_type}_{stamp}.png"
-        paired_txt = out_dir / f"paired_drift_BC_pre_vs_post_stats_birdlevel_{cfg_eff.array_key}_{cfg_eff.cov_type}_{stamp}.txt"
-        _paired_drift_plot_birdlevel(df, paired_png, paired_txt)
+            paired_txt = tier_dir / (
+                f"paired_drift_BC_pre_vs_post_by_hit_birdlevel_{cfg_eff.array_key}_{cfg_eff.cov_type}_{stamp}.txt"
+            )
+            _paired_drift_plot_birdlevel(
+                df_plot,
+                paired_png,
+                paired_txt,
+                title=f"Paired drift BC comparison within birds by hit type ({tier_descr})",
+            )
 
     return {"results_csv": str(out_csv), "out_dir": str(out_dir)}
 
@@ -1257,8 +1368,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--no-plots", action="store_true")
 
-    p.add_argument("--variance-csv", default=None, help="CSV with per-bird per-syllable variance values (used to split into high/low variance tiers).")
-    p.add_argument("--variance-top-pct", type=float, default=30.0, help="Top percentage (per bird) to label as 'high variance' (default 30 = top 30%).")
+    p.add_argument(
+        "--variance-csv",
+        default=None,
+        help="CSV with per-bird per-syllable variance values (used to split into high/low variance tiers).",
+    )
+    p.add_argument(
+        "--variance-top-pct",
+        type=float,
+        default=30.0,
+        help="Top percentage (per bird) to label as 'high variance' (default 30 = top 30%).",
+    )
     return p
 
 
