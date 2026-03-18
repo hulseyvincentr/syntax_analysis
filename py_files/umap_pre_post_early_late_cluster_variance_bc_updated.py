@@ -370,105 +370,24 @@ _DATETIME_RE = re.compile(r"(\d{4})[-_](\d{2})[-_](\d{2})[^0-9]?(\d{2})[-_]?(\d{
 
 def _parse_datetime_from_filename(name: str) -> Tuple[Optional[pd.Timestamp], Optional[pd.Timestamp]]:
     """
-    Parse recording datetime/date from filename.
-
-    Supported patterns include:
-      - YYYY-MM-DD
-      - YYYY_MM_DD
-      - YYYYMMDD
-      - Excel serial + month/day/time, e.g.
-            R08_45786.27152402_5_9_7_32_32_segment_0.npz
-
     Returns:
-        (recording_datetime, recording_date_normalized)
+        (recording_datetime, recording_date)
     """
     s = str(name)
 
-    # ------------------------------------------------------------------
-    # 1) Excel serial + explicit month/day/time
-    #    Example:
-    #      R08_45786.27152402_5_9_7_32_32_segment_0.npz
-    # ------------------------------------------------------------------
-    m = re.search(
-        r"_(\d{5}(?:\.\d+)?)_(\d{1,2})_(\d{1,2})_(\d{1,2})_(\d{1,2})_(\d{1,2})(?:_|$)",
-        s
-    )
-    if m is not None:
-        serial_str, mo_str, d_str, hh_str, mm_str, ss_str = m.groups()
+    mdt = _DATETIME_RE.search(s)
+    if mdt is not None:
+        y, mo, d, hh, mm, ss = map(int, mdt.groups())
         try:
-            serial = float(serial_str)
-
-            # Excel-style serial date origin
-            dt = pd.Timestamp("1899-12-30") + pd.to_timedelta(serial, unit="D")
-
-            # Optional consistency check against the explicit month/day/time in filename
-            mo = int(mo_str)
-            d = int(d_str)
-            hh = int(hh_str)
-            mm = int(mm_str)
-            ss = int(ss_str)
-
-            # If explicit fields differ slightly from fractional rounding,
-            # rebuild using the year from the serial and the explicit M/D/H/M/S.
-            if (
-                dt.month != mo or
-                dt.day != d or
-                dt.hour != hh or
-                dt.minute != mm or
-                abs(dt.second - ss) > 1
-            ):
-                dt = pd.Timestamp(year=dt.year, month=mo, day=d, hour=hh, minute=mm, second=ss)
-
-            return dt, dt.normalize()
-        except Exception:
-            pass
-
-    # ------------------------------------------------------------------
-    # 2) YYYY-MM-DD_HH-MM-SS or YYYY_MM_DD_HH_MM_SS
-    # ------------------------------------------------------------------
-    m = re.search(
-        r"(?<!\d)(\d{4})[-_](\d{2})[-_](\d{2})[T _-]?(\d{2})[:\-_]?(\d{2})[:\-_]?(\d{2})(?!\d)",
-        s
-    )
-    if m is not None:
-        try:
-            y, mo, d, hh, mm, ss = map(int, m.groups())
             dt = pd.Timestamp(year=y, month=mo, day=d, hour=hh, minute=mm, second=ss)
             return dt, dt.normalize()
         except Exception:
             pass
 
-    # ------------------------------------------------------------------
-    # 3) YYYYMMDD_HHMMSS
-    # ------------------------------------------------------------------
-    m = re.search(r"(?<!\d)(\d{4})(\d{2})(\d{2})[T _-]?(\d{2})(\d{2})(\d{2})(?!\d)", s)
-    if m is not None:
+    md = _DATE_RE.search(s)
+    if md is not None:
+        y, mo, d = map(int, md.groups())
         try:
-            y, mo, d, hh, mm, ss = map(int, m.groups())
-            dt = pd.Timestamp(year=y, month=mo, day=d, hour=hh, minute=mm, second=ss)
-            return dt, dt.normalize()
-        except Exception:
-            pass
-
-    # ------------------------------------------------------------------
-    # 4) YYYY-MM-DD or YYYY_MM_DD
-    # ------------------------------------------------------------------
-    m = re.search(r"(?<!\d)(\d{4})[-_](\d{2})[-_](\d{2})(?!\d)", s)
-    if m is not None:
-        try:
-            y, mo, d = map(int, m.groups())
-            dt = pd.Timestamp(year=y, month=mo, day=d)
-            return dt, dt.normalize()
-        except Exception:
-            pass
-
-    # ------------------------------------------------------------------
-    # 5) YYYYMMDD
-    # ------------------------------------------------------------------
-    m = re.search(r"(?<!\d)(\d{4})(\d{2})(\d{2})(?!\d)", s)
-    if m is not None:
-        try:
-            y, mo, d = map(int, m.groups())
             dt = pd.Timestamp(year=y, month=mo, day=d)
             return dt, dt.normalize()
         except Exception:
@@ -569,13 +488,9 @@ def _load_point_table(cfg: UMAPEarlyLateConfig) -> Tuple[np.ndarray, np.ndarray,
     )
 
     if points["recording_date"].isna().all():
-        sample_names = (
-            points["file_name"].dropna().astype(str).head(10).tolist()
-            if "file_name" in points.columns else []
-        )
         raise ValueError(
-            "Could not parse recording dates from file metadata. "
-            f"Example file names: {sample_names}"
+            "Could not parse recording dates from file names. "
+            "Expected file names to contain YYYY-MM-DD or YYYY_MM_DD."
         )
 
     points = points.loc[points["keep"]].copy()
