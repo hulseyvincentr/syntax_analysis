@@ -5,23 +5,40 @@ umap_graph_batch_pre_post_variance.py
 
 %run /Users/mirandahulsey-vincent/Documents/allPythonCode/syntax_analysis/py_files/umap_graph_batch_pre_post_variance.py --summary-csv "/Volumes/my_own_SSD/updated_AreaX_outputs/batch_umap_pre_post_variance/batch_cluster_variance_bc_summary.csv" --metadata-xlsx "/Volumes/my_own_SSD/updated_AreaX_outputs/Area_X_lesion_metadata_with_hit_types.xlsx" --out-dir "/Volumes/my_own_SSD/updated_AreaX_outputs/umap_graph_batch_pre_post_variance"
 
-Graph batch UMAP/variance summary metrics by lesion hit type, and make paired
-pre-vs-post bird-level plots.
+Reduced, interpretable graphing script for batch UMAP/variance outputs.
 
-Inputs
-------
-1) batch_cluster_variance_bc_summary.csv
-   Produced by umap_batch_pre_post_variance.py
+This version is aligned to the updated metric-generation file
+umap_pre_post_early_late_cluster_variance_bc.py, including new UMAP-space metrics.
 
-2) Area_X_lesion_metadata_with_hit_types.xlsx
-   Uses sheet "animal_hit_type_summary" by default, merging on Animal ID.
+Main questions
+--------------
+1) Overlap change
+   - bc_pre_vs_post
+   - bc_pre_vs_post_equal_groups
+
+2) Mean / representational shift
+   - centroid_shift_raw
+   - centroid_shift_umap
+   - centroid_shift_raw_equal_groups
+   - centroid_shift_umap_equal_groups
+
+3) Spread / variance change
+   - post_over_pre_rms_radius
+   - post_over_pre_rms_radius_umap
+   - post_over_pre_rms_radius_equal_groups
+   - post_over_pre_rms_radius_umap_equal_groups
+
+Also keeps direct paired pre-vs-post RMS radius comparisons for:
+- latent space
+- UMAP space
+- equal-group latent space
+- equal-group UMAP space
 
 Outputs
 -------
 out_dir/
   merged_cluster_level_with_hit_type.csv
   bird_level_mean_by_animal.csv
-  bird_level_median_by_animal.csv
 
   cluster_level/
     <metric>_cluster_level_by_hit_type.png
@@ -29,16 +46,16 @@ out_dir/
   bird_level_mean/
     <metric>_bird_mean_by_hit_type.png
 
-  bird_level_median/
-    <metric>_bird_median_by_hit_type.png
+  paired_cluster_level/
+    paired_<metric_name>_cluster_level_pre_vs_post_grouped_by_hit_type.png
 
   paired_bird_level_mean/
-    paired_<metric_name>_bird_mean_pre_vs_post_by_hit_type.png
+    paired_<metric_name>_bird_mean_pre_vs_post_grouped_by_hit_type.png
 
   stats/
     cluster_level_stats.csv
     bird_level_mean_stats.csv
-    bird_level_median_stats.csv
+    paired_cluster_level_pre_post_stats.csv
     paired_bird_level_mean_pre_post_stats.csv
 """
 
@@ -68,93 +85,42 @@ except Exception:
 # ----------------------------
 
 DEFAULT_METRICS = [
-    # BC metrics
-    "bc_pre_early_vs_late",
-    "bc_post_early_vs_late",
     "bc_pre_vs_post",
-
-    # raw/all-data centroid + spread metrics
-    "pre_centroid_norm_raw",
-    "post_centroid_norm_raw",
-    "pre_centroid_dist_to_cluster_global_raw",
-    "post_centroid_dist_to_cluster_global_raw",
     "centroid_shift_raw",
-    "pre_rms_radius_raw",
-    "post_rms_radius_raw",
+    "centroid_shift_umap",
     "post_over_pre_rms_radius",
-    "pre_trace_cov_raw",
-    "post_trace_cov_raw",
-    "post_over_pre_trace_cov",
-
-    # equal-group BC metrics
-    "bc_pre_early_vs_late_equal_groups",
-    "bc_post_early_vs_late_equal_groups",
+    "post_over_pre_rms_radius_umap",
     "bc_pre_vs_post_equal_groups",
-
-    # equal-group centroid + spread metrics
-    "pre_centroid_norm_raw_equal_groups",
-    "post_centroid_norm_raw_equal_groups",
-    "pre_centroid_dist_to_cluster_global_raw_equal_groups",
-    "post_centroid_dist_to_cluster_global_raw_equal_groups",
     "centroid_shift_raw_equal_groups",
-    "pre_rms_radius_raw_equal_groups",
-    "post_rms_radius_raw_equal_groups",
+    "centroid_shift_umap_equal_groups",
     "post_over_pre_rms_radius_equal_groups",
-    "pre_trace_cov_raw_equal_groups",
-    "post_trace_cov_raw_equal_groups",
-    "post_over_pre_trace_cov_equal_groups",
+    "post_over_pre_rms_radius_umap_equal_groups",
 ]
 
 PAIRED_METRIC_SPECS = [
     {
-        "name": "bhattacharyya_coefficient",
-        "pre_col": "bc_pre_early_vs_late",
-        "post_col": "bc_post_early_vs_late",
-        "ylabel": "Bhattacharyya coefficient (BC)",
-    },
-    {
-        "name": "centroid_distance_to_cluster_global",
-        "pre_col": "pre_centroid_dist_to_cluster_global_raw",
-        "post_col": "post_centroid_dist_to_cluster_global_raw",
-        "ylabel": "Distance to cluster-global centroid",
-    },
-    {
-        "name": "rms_radius",
+        "name": "rms_radius_raw",
         "pre_col": "pre_rms_radius_raw",
         "post_col": "post_rms_radius_raw",
-        "ylabel": "RMS radius",
+        "ylabel": "RMS radius (latent space)",
     },
     {
-        "name": "trace_covariance",
-        "pre_col": "pre_trace_cov_raw",
-        "post_col": "post_trace_cov_raw",
-        "ylabel": "Trace of covariance",
-    },
-
-    # equal-group versions
-    {
-        "name": "bhattacharyya_coefficient_equal_groups",
-        "pre_col": "bc_pre_early_vs_late_equal_groups",
-        "post_col": "bc_post_early_vs_late_equal_groups",
-        "ylabel": "Bhattacharyya coefficient (BC), equal groups",
-    },
-    {
-        "name": "centroid_distance_to_cluster_global_equal_groups",
-        "pre_col": "pre_centroid_dist_to_cluster_global_raw_equal_groups",
-        "post_col": "post_centroid_dist_to_cluster_global_raw_equal_groups",
-        "ylabel": "Distance to cluster-global centroid, equal groups",
+        "name": "rms_radius_umap",
+        "pre_col": "pre_rms_radius_umap",
+        "post_col": "post_rms_radius_umap",
+        "ylabel": "RMS radius (UMAP space)",
     },
     {
         "name": "rms_radius_equal_groups",
         "pre_col": "pre_rms_radius_raw_equal_groups",
         "post_col": "post_rms_radius_raw_equal_groups",
-        "ylabel": "RMS radius, equal groups",
+        "ylabel": "RMS radius (latent space, equal groups)",
     },
     {
-        "name": "trace_covariance_equal_groups",
-        "pre_col": "pre_trace_cov_raw_equal_groups",
-        "post_col": "post_trace_cov_raw_equal_groups",
-        "ylabel": "Trace of covariance, equal groups",
+        "name": "rms_radius_umap_equal_groups",
+        "pre_col": "pre_rms_radius_umap_equal_groups",
+        "post_col": "post_rms_radius_umap_equal_groups",
+        "ylabel": "RMS radius (UMAP space, equal groups)",
     },
 ]
 
@@ -272,6 +238,13 @@ def _holm_bonferroni(pvals: Sequence[float]) -> np.ndarray:
     adj = np.empty_like(adj_sorted)
     adj[order] = adj_sorted
     return adj
+
+
+def _add_sig_bracket(ax, x1: float, x2: float, y: float, h: float, text: str) -> None:
+    ax.plot([x1, x1, x2, x2], [y, y + h, y + h, y], lw=1.4, color="black", clip_on=False)
+    text_pad = max(h * 0.4, 0.01)
+    ax.text((x1 + x2) / 2.0, y + h + text_pad, text,
+            ha="center", va="bottom", fontsize=11, clip_on=False)
 
 
 def _mannwhitney_safe(a: np.ndarray, b: np.ndarray) -> Tuple[float, float]:
@@ -415,7 +388,6 @@ def _paired_stats_for_metric(
     df: pd.DataFrame,
     *,
     group_col: str,
-    bird_col: str,
     pre_col: str,
     post_col: str,
     groups: Sequence[str],
@@ -431,7 +403,7 @@ def _paired_stats_for_metric(
     raw_idx = []
 
     for g in groups:
-        sub = df.loc[df[group_col] == g, [bird_col, pre_col, post_col]].copy()
+        sub = df.loc[df[group_col] == g, [pre_col, post_col]].copy()
         sub[pre_col] = pd.to_numeric(sub[pre_col], errors="coerce")
         sub[post_col] = pd.to_numeric(sub[post_col], errors="coerce")
         sub = sub[np.isfinite(sub[pre_col]) & np.isfinite(sub[post_col])].copy()
@@ -446,7 +418,7 @@ def _paired_stats_for_metric(
             "metric": metric_name,
             "group": g,
             "test": "wilcoxon",
-            "n_birds": int(len(sub)),
+            "n_units": int(len(sub)),
             "statistic": stat,
             "p_raw": p_raw,
             "note": note,
@@ -488,6 +460,8 @@ def _box_strip_plot(
     out_png: Path,
     figsize=(10.5, 5.2),
     rng_seed: int = 0,
+    stats_df: Optional[pd.DataFrame] = None,
+    annotate_only_significant: bool = True,
 ) -> None:
     rng = np.random.default_rng(rng_seed)
 
@@ -522,18 +496,71 @@ def _box_strip_plot(
     ax.grid(False)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-
     plt.setp(ax.get_xticklabels(), rotation=20, ha="right")
+
+    all_vals = np.concatenate(plot_values) if len(plot_values) > 0 else np.array([0.0, 1.0])
+    all_vals = all_vals[np.isfinite(all_vals)]
+    if all_vals.size == 0:
+        ymin, ymax = 0.0, 1.0
+    else:
+        ymin, ymax = float(np.min(all_vals)), float(np.max(all_vals))
+
+    y_span = max(1e-9, ymax - ymin)
+    y_lower = ymin - max(0.05 * y_span, 0.05)
+    y_upper = ymax + max(0.08 * y_span, 0.08)
+
+    pairs_to_draw = []
+    if stats_df is not None and len(stats_df) > 0:
+        pos_map = {g: i + 1 for i, g in enumerate(plot_groups)}
+
+        required_cols = {"group_1", "group_2", "p_holm", "sig_label"}
+        if required_cols.issubset(stats_df.columns):
+            for _, row in stats_df.iterrows():
+                g1 = str(row["group_1"])
+                g2 = str(row["group_2"])
+
+                if g1 not in pos_map or g2 not in pos_map:
+                    continue
+
+                p_adj = pd.to_numeric(pd.Series([row["p_holm"]]), errors="coerce").iloc[0]
+                sig_label = str(row["sig_label"])
+
+                if annotate_only_significant:
+                    if (not np.isfinite(p_adj)) or (p_adj >= 0.05) or (sig_label in ("n.s.", "n/a")):
+                        continue
+
+                x1 = float(pos_map[g1])
+                x2 = float(pos_map[g2])
+                if x1 > x2:
+                    x1, x2 = x2, x1
+
+                pairs_to_draw.append((x1, x2, sig_label))
+
+    if len(pairs_to_draw) > 0:
+        pairs_to_draw = sorted(pairs_to_draw, key=lambda t: (t[1] - t[0], t[0]))
+
+        base = ymax + max(0.07 * y_span, 0.07)
+        h = max(0.03 * y_span, 0.03)
+        step = max(0.10 * y_span, 0.10)
+
+        for level, (x1, x2, label) in enumerate(pairs_to_draw):
+            y = base + level * step
+            _add_sig_bracket(ax, x1, x2, y, h, label)
+
+        top_needed = base + (len(pairs_to_draw) - 1) * step + h + max(0.08 * y_span, 0.08)
+        y_upper = max(y_upper, top_needed)
+
+    ax.set_ylim(y_lower, y_upper)
+
     fig.tight_layout()
     fig.savefig(out_png, dpi=200, bbox_inches="tight")
     plt.close(fig)
 
 
-def _paired_pre_post_plot(
+def _paired_grouped_pre_post_boxplot(
     df: pd.DataFrame,
     *,
     group_col: str,
-    bird_col: str,
     pre_col: str,
     post_col: str,
     groups: List[str],
@@ -541,63 +568,106 @@ def _paired_pre_post_plot(
     title: str,
     out_png: Path,
     stats_df: Optional[pd.DataFrame] = None,
+    rng_seed: int = 0,
 ) -> None:
-    n_panels = max(1, len(groups))
-    fig, axes = plt.subplots(1, n_panels, figsize=(5.0 * n_panels, 5.2), sharey=True)
-    if n_panels == 1:
-        axes = [axes]
+    rng = np.random.default_rng(rng_seed)
+
+    plot_groups = []
+    plot_subs = []
+    for g in groups:
+        sub = df.loc[df[group_col] == g, [pre_col, post_col]].copy()
+        sub[pre_col] = pd.to_numeric(sub[pre_col], errors="coerce")
+        sub[post_col] = pd.to_numeric(sub[post_col], errors="coerce")
+        sub = sub[np.isfinite(sub[pre_col]) & np.isfinite(sub[post_col])].copy()
+        if len(sub) > 0:
+            plot_groups.append(g)
+            plot_subs.append(sub)
+
+    if len(plot_subs) == 0:
+        return
+
+    fig, ax = plt.subplots(figsize=(4.2 * len(plot_groups), 5.8))
+
+    positions_pre = []
+    positions_post = []
+    xticks = []
+    xticklabels = []
+
+    all_vals = []
+
+    current = 1.0
+    gap_within = 0.8
+    gap_between = 1.6
+
+    for sub, g in zip(plot_subs, plot_groups):
+        y_pre = sub[pre_col].to_numpy(dtype=float)
+        y_post = sub[post_col].to_numpy(dtype=float)
+
+        p_pre = current
+        p_post = current + gap_within
+
+        positions_pre.append(p_pre)
+        positions_post.append(p_post)
+
+        ax.boxplot([y_pre], positions=[p_pre], widths=0.55, showfliers=False)
+        ax.boxplot([y_post], positions=[p_post], widths=0.55, showfliers=False)
+
+        for pre_v, post_v in zip(y_pre, y_post):
+            ax.plot([p_pre, p_post], [pre_v, post_v], alpha=0.7)
+            ax.scatter([p_pre, p_post], [pre_v, post_v], s=22)
+
+        x_pre = _jitter_positions(len(y_pre), p_pre, 0.08, rng)
+        x_post = _jitter_positions(len(y_post), p_post, 0.08, rng)
+        ax.scatter(x_pre, y_pre, s=20, alpha=0.7)
+        ax.scatter(x_post, y_post, s=20, alpha=0.7)
+
+        xticks.extend([p_pre, p_post])
+        xticklabels.extend([f"Pre\n{g}", "Post"])
+
+        all_vals.extend(list(y_pre))
+        all_vals.extend(list(y_post))
+
+        current = p_post + gap_between
+
+    all_vals = np.asarray(all_vals, dtype=float)
+    all_vals = all_vals[np.isfinite(all_vals)]
+    ymin = float(np.min(all_vals)) if all_vals.size else 0.0
+    ymax = float(np.max(all_vals)) if all_vals.size else 1.0
+    y_span = max(1e-9, ymax - ymin)
+    y_lower = ymin - max(0.05 * y_span, 0.05)
+    y_upper = ymax + max(0.16 * y_span, 0.12)
 
     stats_map = {}
     if stats_df is not None and len(stats_df) > 0:
         stats_map = {str(r["group"]): r for _, r in stats_df.iterrows()}
 
-    for ax, g in zip(axes, groups):
-        sub = df.loc[df[group_col] == g, [bird_col, pre_col, post_col]].copy()
-        sub[pre_col] = pd.to_numeric(sub[pre_col], errors="coerce")
-        sub[post_col] = pd.to_numeric(sub[post_col], errors="coerce")
-        sub = sub[np.isfinite(sub[pre_col]) & np.isfinite(sub[post_col])].copy()
-
-        if len(sub) == 0:
-            ax.text(0.5, 0.5, "No birds", ha="center", va="center", transform=ax.transAxes)
-            ax.set_xticks([1, 2])
-            ax.set_xticklabels(["Pre", "Post"])
-            ax.set_title(g)
-            ax.grid(False)
-            ax.spines["top"].set_visible(False)
-            ax.spines["right"].set_visible(False)
-            continue
-
-        y1 = sub[pre_col].to_numpy(dtype=float)
-        y2 = sub[post_col].to_numpy(dtype=float)
-
-        ax.boxplot([y1, y2], positions=[1, 2], widths=0.5, showfliers=False)
-        for _, r in sub.iterrows():
-            ax.plot([1, 2], [r[pre_col], r[post_col]], alpha=0.8)
-            ax.scatter([1, 2], [r[pre_col], r[post_col]], s=22)
-
-        ax.set_xticks([1, 2])
-        ax.set_xticklabels(["Pre", "Post"])
-        ax.set_title(g)
-        ax.grid(False)
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-
-        stat_row = stats_map.get(g, None)
-        if stat_row is not None:
-            p_txt = stat_row.get("p_holm", np.nan)
-            n_txt = stat_row.get("n_birds", len(sub))
-            note = stat_row.get("note", "")
-            sig = stat_row.get("sig_label", "n/a")
-            if np.isfinite(p_txt):
-                label = f"{sig} (p={p_txt:.3g}, n={int(n_txt)})"
+    for g, p_pre, p_post in zip(plot_groups, positions_pre, positions_post):
+        row = stats_map.get(g, None)
+        label = "n/a"
+        if row is not None:
+            p_adj = row.get("p_holm", np.nan)
+            sig = row.get("sig_label", "n/a")
+            if np.isfinite(p_adj):
+                label = sig
             else:
-                label = f"n/a (n={int(n_txt)})"
-            if isinstance(note, str) and len(note) > 0:
-                label = label + f"\n{note}"
-            ax.text(0.5, 0.98, label, ha="center", va="top", transform=ax.transAxes, fontsize=10)
+                label = "n/a"
 
-    axes[0].set_ylabel(ylabel)
-    fig.suptitle(title, y=1.02)
+        y = ymax + max(0.06 * y_span, 0.05)
+        h = max(0.03 * y_span, 0.03)
+        _add_sig_bracket(ax, p_pre, p_post, y, h, label)
+
+    top_needed = ymax + max(0.06 * y_span, 0.05) + max(0.03 * y_span, 0.03) + max(0.08 * y_span, 0.08)
+    y_upper = max(y_upper, top_needed)
+
+    ax.set_xticks(xticks)
+    ax.set_xticklabels(xticklabels)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(False)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.set_ylim(y_lower, y_upper)
+
     fig.tight_layout()
     fig.savefig(out_png, dpi=200, bbox_inches="tight")
     plt.close(fig)
@@ -659,7 +729,6 @@ def make_bird_level_summary(
     df: pd.DataFrame,
     *,
     metrics: Sequence[str],
-    agg: str = "mean",
 ) -> pd.DataFrame:
     keep_cols = ["animal_id", "lesion_hit_type"]
     use_cols = keep_cols + [m for m in metrics if m in df.columns]
@@ -670,9 +739,6 @@ def make_bird_level_summary(
             sub[m] = pd.to_numeric(sub[m], errors="coerce")
 
     grouped = sub.groupby(["animal_id", "lesion_hit_type"], as_index=False)
-
-    if agg == "median":
-        return grouped.median(numeric_only=True)
     return grouped.mean(numeric_only=True)
 
 
@@ -697,10 +763,10 @@ def graph_metrics_by_hit_type(
     _safe_mkdir(out_dir)
     cluster_dir = out_dir / "cluster_level"
     bird_mean_dir = out_dir / "bird_level_mean"
-    bird_median_dir = out_dir / "bird_level_median"
+    paired_cluster_dir = out_dir / "paired_cluster_level"
     paired_bird_mean_dir = out_dir / "paired_bird_level_mean"
     stats_dir = out_dir / "stats"
-    for p in [cluster_dir, bird_mean_dir, bird_median_dir, paired_bird_mean_dir, stats_dir]:
+    for p in [cluster_dir, bird_mean_dir, paired_cluster_dir, paired_bird_mean_dir, stats_dir]:
         _safe_mkdir(p)
 
     metrics = list(metrics) if metrics is not None else list(DEFAULT_METRICS)
@@ -720,20 +786,22 @@ def graph_metrics_by_hit_type(
     merged_csv = out_dir / "merged_cluster_level_with_hit_type.csv"
     merged.to_csv(merged_csv, index=False)
 
-    bird_mean = make_bird_level_summary(merged, metrics=metrics, agg="mean")
+    # Include paired RMS columns in bird-level mean summary even if not in DEFAULT_METRICS
+    bird_mean_metric_cols = list(dict.fromkeys(
+        list(metrics)
+        + [spec["pre_col"] for spec in PAIRED_METRIC_SPECS]
+        + [spec["post_col"] for spec in PAIRED_METRIC_SPECS]
+    ))
+    bird_mean = make_bird_level_summary(merged, metrics=bird_mean_metric_cols)
     bird_mean_csv = out_dir / "bird_level_mean_by_animal.csv"
     bird_mean.to_csv(bird_mean_csv, index=False)
 
-    bird_median = make_bird_level_summary(merged, metrics=metrics, agg="median")
-    bird_median_csv = out_dir / "bird_level_median_by_animal.csv"
-    bird_median.to_csv(bird_median_csv, index=False)
-
     cluster_stats_all: List[pd.DataFrame] = []
     bird_mean_stats_all: List[pd.DataFrame] = []
-    bird_median_stats_all: List[pd.DataFrame] = []
+    paired_cluster_stats_all: List[pd.DataFrame] = []
     paired_bird_mean_stats_all: List[pd.DataFrame] = []
 
-    # Standard by-hit-type plots
+    # Standard by-hit-type plots for reduced main metrics
     for metric in metrics:
         if metric not in merged.columns:
             print(f"[skip] metric not found in CSV: {metric}")
@@ -745,6 +813,14 @@ def graph_metrics_by_hit_type(
         df_metric = df_metric[np.isfinite(df_metric[metric])].copy()
 
         if len(df_metric) > 0:
+            stats_df = _pairwise_stats_for_metric(
+                df_metric,
+                group_col="lesion_hit_type",
+                value_col=metric,
+                groups=hit_type_order,
+                level_label="cluster_level",
+            )
+
             out_png = cluster_dir / f"{_clean_filename(metric)}_cluster_level_by_hit_type.png"
             _box_strip_plot(
                 df_metric,
@@ -754,15 +830,9 @@ def graph_metrics_by_hit_type(
                 title=f"{metric} by lesion hit type (cluster level)",
                 ylabel=metric,
                 out_png=out_png,
+                stats_df=stats_df,
             )
 
-            stats_df = _pairwise_stats_for_metric(
-                df_metric,
-                group_col="lesion_hit_type",
-                value_col=metric,
-                groups=hit_type_order,
-                level_label="cluster_level",
-            )
             if len(stats_df) > 0:
                 cluster_stats_all.append(stats_df)
 
@@ -773,6 +843,14 @@ def graph_metrics_by_hit_type(
             df_bm = df_bm[np.isfinite(df_bm[metric])].copy()
 
             if len(df_bm) > 0:
+                stats_df = _pairwise_stats_for_metric(
+                    df_bm,
+                    group_col="lesion_hit_type",
+                    value_col=metric,
+                    groups=hit_type_order,
+                    level_label="bird_level_mean",
+                )
+
                 out_png = bird_mean_dir / f"{_clean_filename(metric)}_bird_mean_by_hit_type.png"
                 _box_strip_plot(
                     df_bm,
@@ -782,89 +860,83 @@ def graph_metrics_by_hit_type(
                     title=f"{metric} by lesion hit type (bird mean)",
                     ylabel=metric,
                     out_png=out_png,
+                    stats_df=stats_df,
                 )
 
-                stats_df = _pairwise_stats_for_metric(
-                    df_bm,
-                    group_col="lesion_hit_type",
-                    value_col=metric,
-                    groups=hit_type_order,
-                    level_label="bird_level_mean",
-                )
                 if len(stats_df) > 0:
                     bird_mean_stats_all.append(stats_df)
 
-        # bird median plot + stats
-        if metric in bird_median.columns:
-            df_bmed = bird_median[["lesion_hit_type", metric]].copy()
-            df_bmed[metric] = pd.to_numeric(df_bmed[metric], errors="coerce")
-            df_bmed = df_bmed[np.isfinite(df_bmed[metric])].copy()
-
-            if len(df_bmed) > 0:
-                out_png = bird_median_dir / f"{_clean_filename(metric)}_bird_median_by_hit_type.png"
-                _box_strip_plot(
-                    df_bmed,
-                    group_col="lesion_hit_type",
-                    value_col=metric,
-                    groups=hit_type_order,
-                    title=f"{metric} by lesion hit type (bird median)",
-                    ylabel=metric,
-                    out_png=out_png,
-                )
-
-                stats_df = _pairwise_stats_for_metric(
-                    df_bmed,
-                    group_col="lesion_hit_type",
-                    value_col=metric,
-                    groups=hit_type_order,
-                    level_label="bird_level_median",
-                )
-                if len(stats_df) > 0:
-                    bird_median_stats_all.append(stats_df)
-
-    # Paired pre/post bird-level mean plots
+    # Paired pre/post RMS-radius plots at cluster level and bird-mean level
     for spec in PAIRED_METRIC_SPECS:
         pre_col = spec["pre_col"]
         post_col = spec["post_col"]
         metric_name = spec["name"]
         ylabel = spec["ylabel"]
 
-        if pre_col not in bird_mean.columns or post_col not in bird_mean.columns:
-            print(f"[skip paired] missing columns for {metric_name}: {pre_col}, {post_col}")
-            continue
+        # cluster level
+        if pre_col in merged.columns and post_col in merged.columns:
+            stats_df_cluster = _paired_stats_for_metric(
+                merged,
+                group_col="lesion_hit_type",
+                pre_col=pre_col,
+                post_col=post_col,
+                groups=hit_type_order,
+                metric_name=metric_name,
+                level_label="paired_cluster_level",
+            )
 
-        stats_df = _paired_stats_for_metric(
-            bird_mean,
-            group_col="lesion_hit_type",
-            bird_col="animal_id",
-            pre_col=pre_col,
-            post_col=post_col,
-            groups=hit_type_order,
-            metric_name=metric_name,
-            level_label="paired_bird_level_mean",
-        )
+            if len(stats_df_cluster) > 0:
+                paired_cluster_stats_all.append(stats_df_cluster)
 
-        if len(stats_df) > 0:
-            paired_bird_mean_stats_all.append(stats_df)
+            out_png = paired_cluster_dir / f"paired_{_clean_filename(metric_name)}_cluster_level_pre_vs_post_grouped_by_hit_type.png"
+            _paired_grouped_pre_post_boxplot(
+                merged,
+                group_col="lesion_hit_type",
+                pre_col=pre_col,
+                post_col=post_col,
+                groups=hit_type_order,
+                ylabel=ylabel,
+                title=f"{metric_name}: pre vs post within lesion hit type (all clusters)",
+                out_png=out_png,
+                stats_df=stats_df_cluster,
+            )
+        else:
+            print(f"[skip paired cluster] missing columns for {metric_name}: {pre_col}, {post_col}")
 
-        out_png = paired_bird_mean_dir / f"paired_{_clean_filename(metric_name)}_bird_mean_pre_vs_post_by_hit_type.png"
-        _paired_pre_post_plot(
-            bird_mean,
-            group_col="lesion_hit_type",
-            bird_col="animal_id",
-            pre_col=pre_col,
-            post_col=post_col,
-            groups=hit_type_order,
-            ylabel=ylabel,
-            title=f"{metric_name}: bird mean pre vs post by lesion hit type",
-            out_png=out_png,
-            stats_df=stats_df,
-        )
+        # bird mean
+        if pre_col in bird_mean.columns and post_col in bird_mean.columns:
+            stats_df_bird = _paired_stats_for_metric(
+                bird_mean,
+                group_col="lesion_hit_type",
+                pre_col=pre_col,
+                post_col=post_col,
+                groups=hit_type_order,
+                metric_name=metric_name,
+                level_label="paired_bird_level_mean",
+            )
+
+            if len(stats_df_bird) > 0:
+                paired_bird_mean_stats_all.append(stats_df_bird)
+
+            out_png = paired_bird_mean_dir / f"paired_{_clean_filename(metric_name)}_bird_mean_pre_vs_post_grouped_by_hit_type.png"
+            _paired_grouped_pre_post_boxplot(
+                bird_mean,
+                group_col="lesion_hit_type",
+                pre_col=pre_col,
+                post_col=post_col,
+                groups=hit_type_order,
+                ylabel=ylabel,
+                title=f"{metric_name}: pre vs post within lesion hit type (bird means)",
+                out_png=out_png,
+                stats_df=stats_df_bird,
+            )
+        else:
+            print(f"[skip paired bird mean] missing columns for {metric_name}: {pre_col}, {post_col}")
 
     # Save stats tables
     cluster_stats_csv = stats_dir / "cluster_level_stats.csv"
     bird_mean_stats_csv = stats_dir / "bird_level_mean_stats.csv"
-    bird_median_stats_csv = stats_dir / "bird_level_median_stats.csv"
+    paired_cluster_stats_csv = stats_dir / "paired_cluster_level_pre_post_stats.csv"
     paired_bird_mean_stats_csv = stats_dir / "paired_bird_level_mean_pre_post_stats.csv"
 
     if len(cluster_stats_all) > 0:
@@ -877,10 +949,10 @@ def graph_metrics_by_hit_type(
     else:
         pd.DataFrame().to_csv(bird_mean_stats_csv, index=False)
 
-    if len(bird_median_stats_all) > 0:
-        pd.concat(bird_median_stats_all, ignore_index=True).to_csv(bird_median_stats_csv, index=False)
+    if len(paired_cluster_stats_all) > 0:
+        pd.concat(paired_cluster_stats_all, ignore_index=True).to_csv(paired_cluster_stats_csv, index=False)
     else:
-        pd.DataFrame().to_csv(bird_median_stats_csv, index=False)
+        pd.DataFrame().to_csv(paired_cluster_stats_csv, index=False)
 
     if len(paired_bird_mean_stats_all) > 0:
         pd.concat(paired_bird_mean_stats_all, ignore_index=True).to_csv(paired_bird_mean_stats_csv, index=False)
@@ -889,19 +961,17 @@ def graph_metrics_by_hit_type(
 
     print(f"Saved merged CSV: {merged_csv}")
     print(f"Saved bird mean CSV: {bird_mean_csv}")
-    print(f"Saved bird median CSV: {bird_median_csv}")
     print(f"Saved cluster stats CSV: {cluster_stats_csv}")
     print(f"Saved bird mean stats CSV: {bird_mean_stats_csv}")
-    print(f"Saved bird median stats CSV: {bird_median_stats_csv}")
+    print(f"Saved paired cluster-level pre/post stats CSV: {paired_cluster_stats_csv}")
     print(f"Saved paired bird mean pre/post stats CSV: {paired_bird_mean_stats_csv}")
 
     return {
         "merged_csv": merged_csv,
         "bird_mean_csv": bird_mean_csv,
-        "bird_median_csv": bird_median_csv,
         "cluster_stats_csv": cluster_stats_csv,
         "bird_mean_stats_csv": bird_mean_stats_csv,
-        "bird_median_stats_csv": bird_median_stats_csv,
+        "paired_cluster_stats_csv": paired_cluster_stats_csv,
         "paired_bird_mean_stats_csv": paired_bird_mean_stats_csv,
         "out_dir": out_dir,
     }
@@ -925,7 +995,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--metrics",
         nargs="*",
         default=None,
-        help="Optional list of metrics to graph. If omitted, uses the default metric list.",
+        help="Optional list of main summary metrics to graph. If omitted, uses the reduced default set.",
     )
     p.add_argument(
         "--cluster-filter",
