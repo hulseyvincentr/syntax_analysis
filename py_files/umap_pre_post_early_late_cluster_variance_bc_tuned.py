@@ -87,7 +87,7 @@ class UMAPEarlyLateConfig:
     vocalization_only: bool = True
 
     # Minimum / maximum points used for analysis
-    min_points_per_period: int = 200
+    min_points_per_period: int = 6000
     max_points_per_period: Optional[int] = None
     max_points_per_period_for_plot: Optional[int] = None
 
@@ -107,8 +107,8 @@ class UMAPEarlyLateConfig:
     dpi: int = 200
 
     # Overlap / BC params
-    bc_bins: int = 100
-    overlap_density_bins: int = 180
+    bc_bins: int = 20
+    overlap_density_bins: int = 20
     overlap_density_gamma: float = 0.55
 
     # Metadata lookup defaults
@@ -370,24 +370,105 @@ _DATETIME_RE = re.compile(r"(\d{4})[-_](\d{2})[-_](\d{2})[^0-9]?(\d{2})[-_]?(\d{
 
 def _parse_datetime_from_filename(name: str) -> Tuple[Optional[pd.Timestamp], Optional[pd.Timestamp]]:
     """
+    Parse recording datetime/date from filename.
+
+    Supported patterns include:
+      - YYYY-MM-DD
+      - YYYY_MM_DD
+      - YYYYMMDD
+      - Excel serial + month/day/time, e.g.
+            R08_45786.27152402_5_9_7_32_32_segment_0.npz
+
     Returns:
-        (recording_datetime, recording_date)
+        (recording_datetime, recording_date_normalized)
     """
     s = str(name)
 
-    mdt = _DATETIME_RE.search(s)
-    if mdt is not None:
-        y, mo, d, hh, mm, ss = map(int, mdt.groups())
+    # ------------------------------------------------------------------
+    # 1) Excel serial + explicit month/day/time
+    #    Example:
+    #      R08_45786.27152402_5_9_7_32_32_segment_0.npz
+    # ------------------------------------------------------------------
+    m = re.search(
+        r"_(\d{5}(?:\.\d+)?)_(\d{1,2})_(\d{1,2})_(\d{1,2})_(\d{1,2})_(\d{1,2})(?:_|$)",
+        s
+    )
+    if m is not None:
+        serial_str, mo_str, d_str, hh_str, mm_str, ss_str = m.groups()
         try:
+            serial = float(serial_str)
+
+            # Excel-style serial date origin
+            dt = pd.Timestamp("1899-12-30") + pd.to_timedelta(serial, unit="D")
+
+            # Optional consistency check against the explicit month/day/time in filename
+            mo = int(mo_str)
+            d = int(d_str)
+            hh = int(hh_str)
+            mm = int(mm_str)
+            ss = int(ss_str)
+
+            # If explicit fields differ slightly from fractional rounding,
+            # rebuild using the year from the serial and the explicit M/D/H/M/S.
+            if (
+                dt.month != mo or
+                dt.day != d or
+                dt.hour != hh or
+                dt.minute != mm or
+                abs(dt.second - ss) > 1
+            ):
+                dt = pd.Timestamp(year=dt.year, month=mo, day=d, hour=hh, minute=mm, second=ss)
+
+            return dt, dt.normalize()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # 2) YYYY-MM-DD_HH-MM-SS or YYYY_MM_DD_HH_MM_SS
+    # ------------------------------------------------------------------
+    m = re.search(
+        r"(?<!\d)(\d{4})[-_](\d{2})[-_](\d{2})[T _-]?(\d{2})[:\-_]?(\d{2})[:\-_]?(\d{2})(?!\d)",
+        s
+    )
+    if m is not None:
+        try:
+            y, mo, d, hh, mm, ss = map(int, m.groups())
             dt = pd.Timestamp(year=y, month=mo, day=d, hour=hh, minute=mm, second=ss)
             return dt, dt.normalize()
         except Exception:
             pass
 
-    md = _DATE_RE.search(s)
-    if md is not None:
-        y, mo, d = map(int, md.groups())
+    # ------------------------------------------------------------------
+    # 3) YYYYMMDD_HHMMSS
+    # ------------------------------------------------------------------
+    m = re.search(r"(?<!\d)(\d{4})(\d{2})(\d{2})[T _-]?(\d{2})(\d{2})(\d{2})(?!\d)", s)
+    if m is not None:
         try:
+            y, mo, d, hh, mm, ss = map(int, m.groups())
+            dt = pd.Timestamp(year=y, month=mo, day=d, hour=hh, minute=mm, second=ss)
+            return dt, dt.normalize()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # 4) YYYY-MM-DD or YYYY_MM_DD
+    # ------------------------------------------------------------------
+    m = re.search(r"(?<!\d)(\d{4})[-_](\d{2})[-_](\d{2})(?!\d)", s)
+    if m is not None:
+        try:
+            y, mo, d = map(int, m.groups())
+            dt = pd.Timestamp(year=y, month=mo, day=d)
+            return dt, dt.normalize()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # 5) YYYYMMDD
+    # ------------------------------------------------------------------
+    m = re.search(r"(?<!\d)(\d{4})(\d{2})(\d{2})(?!\d)", s)
+    if m is not None:
+        try:
+            y, mo, d = map(int, m.groups())
             dt = pd.Timestamp(year=y, month=mo, day=d)
             return dt, dt.normalize()
         except Exception:
@@ -488,9 +569,13 @@ def _load_point_table(cfg: UMAPEarlyLateConfig) -> Tuple[np.ndarray, np.ndarray,
     )
 
     if points["recording_date"].isna().all():
+        sample_names = (
+            points["file_name"].dropna().astype(str).head(10).tolist()
+            if "file_name" in points.columns else []
+        )
         raise ValueError(
-            "Could not parse recording dates from file names. "
-            "Expected file names to contain YYYY-MM-DD or YYYY_MM_DD."
+            "Could not parse recording dates from file metadata. "
+            f"Example file names: {sample_names}"
         )
 
     points = points.loc[points["keep"]].copy()
@@ -1224,7 +1309,31 @@ def run_one_bird(cfg: UMAPEarlyLateConfig) -> str:
     if len(points_df) == 0:
         raise ValueError("No usable points remain after filtering.")
 
-    cluster_values = sorted(points_df["cluster"].dropna().unique(), key=lambda x: (str(type(x)), x))
+    cluster_counts = points_df.groupby("cluster").size().to_dict()
+    cluster_values_all = sorted(points_df["cluster"].dropna().unique(), key=lambda x: (str(type(x)), x))
+    cluster_values = [
+        c for c in cluster_values_all
+        if int(cluster_counts.get(c, 0)) >= int(cfg.min_points_per_period)
+    ]
+
+    skipped_small = [
+        (c, int(cluster_counts.get(c, 0)))
+        for c in cluster_values_all
+        if int(cluster_counts.get(c, 0)) < int(cfg.min_points_per_period)
+    ]
+    if skipped_small:
+        print(
+            f"[one-bird] {animal_id}: skipping {len(skipped_small)} clusters with total raw points "
+            f"< {int(cfg.min_points_per_period)}"
+        )
+        preview = ", ".join(f"{c} (n={n})" for c, n in skipped_small[:12])
+        if preview:
+            print(f"[one-bird] skipped clusters preview: {preview}")
+
+    if not cluster_values:
+        raise ValueError(
+            f"No clusters met the minimum total raw point threshold of {int(cfg.min_points_per_period)}."
+        )
 
     rows: List[Dict[str, Any]] = []
     for cluster_id in cluster_values:
@@ -1272,7 +1381,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--only-cluster-id", default=None, type=int)
     p.add_argument("--no-vocalization-only", action="store_true")
 
-    p.add_argument("--min-points-per-period", default=200, type=int)
+    p.add_argument("--min-points-per-period", default=6000, type=int,
+                   help="Minimum TOTAL raw points required in a cluster to analyze it. Clusters below this threshold are skipped before per-cluster analysis.")
     p.add_argument("--max-points-per-period", default=None, type=int)
     p.add_argument("--plot-max-points-per-period", default=None, type=int)
 
@@ -1285,8 +1395,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--metric", default="euclidean", type=str)
 
     p.add_argument("--dpi", default=200, type=int)
-    p.add_argument("--bc-bins", default=100, type=int)
-    p.add_argument("--overlap-density-bins", default=180, type=int)
+    p.add_argument("--bc-bins", default=20, type=int)
+    p.add_argument("--overlap-density-bins", default=20, type=int)
     p.add_argument("--overlap-density-gamma", default=0.55, type=float)
 
     p.add_argument("--metadata-sheet", default=None, type=str)
