@@ -29,7 +29,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional, Sequence, Dict, List, Union
 
-import re  # NEW: for inferring animal_id from filename
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
@@ -71,23 +70,40 @@ def build_label_color_lut(all_labels: np.ndarray) -> Dict[int, str]:
 # =========================
 def _infer_animal_id_from_path(p: Path) -> str:
     """
-    Try to infer animal ID from an NPZ path.
+    Infer an animal ID from an NPZ path without assuming a 'USA####' pattern.
 
-    Looks for patterns like 'USA5337' in the filename first;
-    if not found, falls back to the stem.
+    Strategy
+    --------
+    1. Use everything before the first underscore in the file stem.
+       Example: 'CanaryA_45424.5463_segment_0.npz' -> 'CanaryA'
+    2. Also consider the full stem.
+    3. Also consider the parent folder name.
+    4. Return the first non-empty unique candidate.
     """
-    name = p.name
-    m = re.search(r"(USA\\d{4})", name)
-    if m:
-        return m.group(1)
+    candidates: List[str] = []
 
-    # As a fallback, search entire path string
-    m2 = re.search(r"(USA\\d{4})", p.as_posix())
-    if m2:
-        return m2.group(1)
+    stem = p.stem.strip()
+    if stem:
+        parts = stem.split("_")
+        candidates.append(parts[0].strip())
+        candidates.append(stem)
 
-    # Last fallback: just use the stem of the filename
-    return p.stem
+    parent_name = p.parent.name.strip()
+    if parent_name:
+        candidates.append(parent_name)
+        parent_parts = parent_name.split("_")
+        if parent_parts:
+            candidates.append(parent_parts[0].strip())
+
+    seen = set()
+    unique_candidates: List[str] = []
+    for c in candidates:
+        if not c or c in seen:
+            continue
+        seen.add(c)
+        unique_candidates.append(c)
+
+    return unique_candidates[0] if unique_candidates else p.stem
 
 
 # =========================
@@ -101,18 +117,23 @@ def plot_umap_colored_by_labels(
     show_plot: bool,
     add_legend: bool,
     *,
-    animal_id: Optional[str] = None,  # NEW: include ID in the UMAP title
+    animal_id: Optional[str] = None,
 ) -> None:
     """Scatter UMAP colored by HDBSCAN labels. Saves to output_dir if provided."""
-    # Use first two columns in case embedding has >2 dims
     if embedding.ndim != 2 or embedding.shape[0] != labels.shape[0] or embedding.shape[1] < 2:
         print("[WARN] UMAP plot skipped: embedding must be shape (T, 2+) matching labels length.")
         return
 
     colors = [lut[int(lab)] for lab in labels]
     fig, ax = plt.subplots(figsize=(6.5, 5.5))
-    ax.scatter(embedding[:, 0], embedding[:, 1],
-               c=colors, s=10, alpha=0.7, linewidths=0)
+    ax.scatter(
+        embedding[:, 0],
+        embedding[:, 1],
+        c=colors,
+        s=10,
+        alpha=0.7,
+        linewidths=0,
+    )
     ax.set_xlabel("UMAP 1")
     ax.set_ylabel("UMAP 2")
 
@@ -123,7 +144,6 @@ def plot_umap_colored_by_labels(
 
     ax.grid(True, alpha=0.3)
 
-    # Legend with ~14 rows per column
     if add_legend:
         uniq = sorted(np.unique(labels.astype(int)))
         handles = [Patch(facecolor=lut[l], label=str(l)) for l in uniq]
@@ -169,7 +189,7 @@ def plot_spectrogram_samples_for_labels(
     npz_path: Union[str, Path],
     output_dir: Optional[Union[str, Path]] = None,
     *,
-    selected_labels: Optional[Sequence[int]] = None,  # None → all labels
+    selected_labels: Optional[Sequence[int]] = None,
     skip_noise_label: bool = True,
     spectrogram_length: int = 1000,
     num_sample_spectrograms: int = 1,
@@ -185,19 +205,17 @@ def plot_spectrogram_samples_for_labels(
     UMAP plot colored by labels.
     """
     npz_path = Path(npz_path)
-    animal_id = _infer_animal_id_from_path(npz_path)  # NEW: infer ID once
+    animal_id = _infer_animal_id_from_path(npz_path)
     arr = np.load(npz_path, allow_pickle=True)
 
-    labels = arr["hdbscan_labels"]      # shape (T,)
-    S = arr["s"]                        # shape (F, T) or (T, F)
+    labels = arr["hdbscan_labels"]
+    S = arr["s"]
 
-    # Try to load UMAP embedding (optional)
     embedding = arr["embedding_outputs"] if "embedding_outputs" in arr.files else None
 
     if S.ndim != 2:
         raise ValueError("Expected a 2D spectrogram in arr['s'].")
 
-    # Ensure S has shape (F, T)
     if S.shape[1] != labels.shape[0] and S.shape[0] == labels.shape[0]:
         S = S.T
 
@@ -205,7 +223,6 @@ def plot_spectrogram_samples_for_labels(
     if T != labels.shape[0]:
         raise ValueError("After orientation, spectrogram time (T) must match labels length.")
 
-    # Decide labels to process
     unique_labels = np.unique(labels)
     if selected_labels is None:
         labels_to_process = [int(l) for l in unique_labels]
@@ -219,20 +236,17 @@ def plot_spectrogram_samples_for_labels(
         print("[WARN] No labels selected to process.")
         return
 
-    # Prepare save directory if requested
     saved_paths: List[str] = []
     outdir: Optional[Path] = None
     if output_dir is not None:
         outdir = Path(output_dir)
         outdir.mkdir(parents=True, exist_ok=True)
 
-    # Build color LUT
     label_color_lut = build_label_color_lut(labels)
 
-    # Inner function uses closure over S, labels, etc.
     def generate_and_plot_for_label(lbl: int) -> None:
         """Generate up to N non-overlapping stitched spectrograms for a given label."""
-        idx = np.flatnonzero(labels == lbl)  # sorted indices for this label
+        idx = np.flatnonzero(labels == lbl)
         if idx.size == 0:
             print(f"[WARN] No timebins for label {lbl}; skipping.")
             return
@@ -254,19 +268,23 @@ def plot_spectrogram_samples_for_labels(
         for k in range(actual_samples):
             start = k * spectrogram_length
             end = start + spectrogram_length
-            selected_idx = idx[start:end]          # non-overlapping slice
-            S_sel = S[:, selected_idx].astype(float)  # linear units
+            selected_idx = idx[start:end]
+            S_sel = S[:, selected_idx].astype(float)
 
-            # Plot (linear)
             fig, ax = plt.subplots(figsize=(10, 4))
             im = ax.imshow(S_sel, origin="lower", aspect="auto", cmap=cmap)
             if show_colorbar:
                 fig.colorbar(im, ax=ax, label="Spectrogram (linear units)")
 
             ax.tick_params(
-                axis='both', which='both',
-                bottom=False, top=False, left=False, right=False,
-                labelbottom=False, labelleft=False,
+                axis="both",
+                which="both",
+                bottom=False,
+                top=False,
+                left=False,
+                right=False,
+                labelbottom=False,
+                labelleft=False,
             )
 
             ax.set_title(
@@ -275,7 +293,6 @@ def plot_spectrogram_samples_for_labels(
             )
             fig.tight_layout()
 
-            # Save directly to output_dir when requested
             if save_sample_spectrograms and outdir is not None:
                 fname = f"label{lbl}_sample{k+1}_N{spectrogram_length}.png"
                 save_path = outdir / fname
@@ -288,11 +305,9 @@ def plot_spectrogram_samples_for_labels(
             else:
                 plt.close(fig)
 
-    # Run for each label
     for lbl in labels_to_process:
         generate_and_plot_for_label(lbl)
 
-    # UMAP plot at the end (once)
     if make_umap_plot:
         if embedding is None:
             print("[WARN] 'embedding_outputs' not found in NPZ; skipping UMAP plot.")
@@ -304,7 +319,7 @@ def plot_spectrogram_samples_for_labels(
                 outdir=outdir,
                 show_plot=show_plots,
                 add_legend=show_umap_legend,
-                animal_id=animal_id,  # NEW: pass ID into title
+                animal_id=animal_id,
             )
 
     if saved_paths:
@@ -314,8 +329,37 @@ def plot_spectrogram_samples_for_labels(
 
 
 if __name__ == "__main__":
-    # Optional local test; will NOT run when imported by NPZ_plot_wrapper
     example_npz = Path("/path/to/some_bird.npz")
     example_out = Path("/path/to/output_dir")
     print("[INFO] This is just a self-test block. Edit paths if you want to run this file directly.")
     # plot_spectrogram_samples_for_labels(example_npz, example_out)
+    
+    
+    """
+    from pathlib import Path
+import importlib
+import syllable_sample_spectrograms as sss
+
+importlib.reload(sss)
+
+npz_path = Path("/Volumes/my_own_SSD/updated_AreaX_outputs/USA5288/USA5288.npz")
+output_dir = Path("/Volumes/my_own_SSD/updated_AreaX_outputs/USA5288/USA5288_repertoire")
+
+sss.plot_spectrogram_samples_for_labels(
+    npz_path=npz_path,
+    output_dir=output_dir,
+    selected_labels=None,
+    skip_noise_label=True,
+    spectrogram_length=1000,
+    num_sample_spectrograms=1,
+    cmap="gray_r",
+    show_colorbar=False,
+    show_plots=True,
+    save_sample_spectrograms=True,
+    make_umap_plot=True,
+    show_umap_legend=True,
+)
+    
+    
+    
+    """
