@@ -26,6 +26,35 @@ plot_spectrogram_samples_for_labels(
 )
 """
 
+"""
+from pathlib import Path
+import importlib
+import syllable_sample_spectrograms_updated as sss
+
+importlib.reload(sss)
+
+npz_path = Path("/Volumes/my_own_SSD/updated_AreaX_outputs/USA5443/USA5443.npz")
+output_dir = Path("/Volumes/my_own_SSD/updated_AreaX_outputs/USA5443/USA5443")
+color_json = Path("/Volumes/my_own_SSD/updated_AreaX_outputs/fixed_label_colors_50.json")
+
+sss.plot_spectrogram_samples_for_labels(
+    npz_path=npz_path,
+    output_dir=output_dir,
+    selected_labels=None,
+    skip_noise_label=True,
+    spectrogram_length=1000,
+    num_sample_spectrograms=1,
+    cmap="gray_r",
+    show_colorbar=False,
+    show_plots=True,
+    save_sample_spectrograms=True,
+    make_umap_plot=True,
+    show_umap_legend=True,
+    label_universe=range(50),
+    fixed_label_colors_json=color_json,
+)
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
