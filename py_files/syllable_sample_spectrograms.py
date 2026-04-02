@@ -21,6 +21,7 @@ plot_spectrogram_samples_for_labels(
     save_sample_spectrograms=True,
     make_umap_plot=True,
     show_umap_legend=True,
+    save_umap_label_key=True,
 )
 """
 
@@ -42,7 +43,7 @@ def _get_tab60_palette() -> List[str]:
     tab20 = plt.get_cmap("tab20").colors
     tab20b = plt.get_cmap("tab20b").colors
     tab20c = plt.get_cmap("tab20c").colors
-    palette = [mcolors.to_hex(c) for c in (*tab20, *tab20b, *tab20c)]  # 60 colors
+    palette = [mcolors.to_hex(c) for c in (*tab20, *tab20b, *tab20c)]
     return palette
 
 
@@ -59,7 +60,7 @@ def build_label_color_lut(all_labels: np.ndarray) -> Dict[int, str]:
     if len(non_noise) > len(palette):
         print(f"[WARN] {len(non_noise)} non-noise labels exceed 60 colors; colors will repeat.")
 
-    lut: Dict[int, str] = {-1: "#7f7f7f"}  # gray for noise
+    lut: Dict[int, str] = {-1: "#7f7f7f"}
     for i, lab in enumerate(non_noise):
         lut[lab] = palette[i % len(palette)]
     return lut
@@ -107,6 +108,55 @@ def _infer_animal_id_from_path(p: Path) -> str:
 
 
 # =========================
+# Separate label-color key
+# =========================
+def save_label_color_key_png(
+    labels: np.ndarray,
+    lut: Dict[int, str],
+    outdir: Path,
+    *,
+    animal_id: Optional[str] = None,
+) -> None:
+    """Save a separate PNG showing label -> color mapping."""
+    uniq = sorted(np.unique(labels.astype(int)))
+    handles = [Patch(facecolor=lut[l], edgecolor="none", label=str(l)) for l in uniq]
+
+    max_rows = 28
+    ncols = max(1, int(np.ceil(len(handles) / max_rows)))
+    nrows = int(np.ceil(len(handles) / ncols))
+
+    fig_w = 2.8 + 1.6 * ncols
+    fig_h = max(2.0, 0.33 * nrows + 1.0)
+
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    ax.axis("off")
+
+    if animal_id is not None:
+        title = f"{animal_id} — label color key"
+    else:
+        title = "Label color key"
+
+    ax.legend(
+        handles=handles,
+        title=title,
+        ncol=ncols,
+        loc="center",
+        frameon=False,
+        fontsize=10,
+        title_fontsize=11,
+        handlelength=1.2,
+        handletextpad=0.5,
+        columnspacing=1.2,
+        labelspacing=0.5,
+    )
+
+    save_path = outdir / "umap_hdbscan_labels_key.png"
+    fig.savefig(save_path, dpi=300, bbox_inches="tight", pad_inches=0.1)
+    plt.close(fig)
+    print(f"[SAVE] {save_path}")
+
+
+# =========================
 # UMAP plot (optional)
 # =========================
 def plot_umap_colored_by_labels(
@@ -142,11 +192,11 @@ def plot_umap_colored_by_labels(
     else:
         ax.set_title("UMAP embedding (HDBSCAN labels)")
 
-    ax.grid(True, alpha=0.3)
+    ax.grid(False)
 
     if add_legend:
         uniq = sorted(np.unique(labels.astype(int)))
-        handles = [Patch(facecolor=lut[l], label=str(l)) for l in uniq]
+        handles = [Patch(facecolor=lut[l], edgecolor="none", label=str(l)) for l in uniq]
 
         max_rows = 14
         ncols = int(np.ceil(len(handles) / max_rows)) or 1
@@ -199,10 +249,12 @@ def plot_spectrogram_samples_for_labels(
     save_sample_spectrograms: bool = True,
     make_umap_plot: bool = True,
     show_umap_legend: bool = True,
+    save_umap_label_key: bool = True,
 ) -> None:
     """
     Generate stitched spectrogram samples for HDBSCAN labels and optionally a
-    UMAP plot colored by labels.
+    UMAP plot colored by labels. Also optionally save a separate PNG key for
+    label-to-color mapping.
     """
     npz_path = Path(npz_path)
     animal_id = _infer_animal_id_from_path(npz_path)
@@ -308,6 +360,17 @@ def plot_spectrogram_samples_for_labels(
     for lbl in labels_to_process:
         generate_and_plot_for_label(lbl)
 
+    if save_umap_label_key:
+        if outdir is None:
+            print("[WARN] output_dir is None; cannot save separate label-color key PNG.")
+        else:
+            save_label_color_key_png(
+                labels=labels,
+                lut=label_color_lut,
+                outdir=outdir,
+                animal_id=animal_id,
+            )
+
     if make_umap_plot:
         if embedding is None:
             print("[WARN] 'embedding_outputs' not found in NPZ; skipping UMAP plot.")
@@ -333,33 +396,30 @@ if __name__ == "__main__":
     example_out = Path("/path/to/output_dir")
     print("[INFO] This is just a self-test block. Edit paths if you want to run this file directly.")
     # plot_spectrogram_samples_for_labels(example_npz, example_out)
-    
-    
+
     """
     from pathlib import Path
-import importlib
-import syllable_sample_spectrograms as sss
+    import importlib
+    import syllable_sample_spectrograms as sss
 
-importlib.reload(sss)
+    importlib.reload(sss)
 
-npz_path = Path("/Volumes/my_own_SSD/updated_AreaX_outputs/USA5288/USA5288.npz")
-output_dir = Path("/Volumes/my_own_SSD/updated_AreaX_outputs/USA5288/USA5288_repertoire")
+    npz_path = Path("/Volumes/my_own_SSD/updated_AreaX_outputs/USA5288/USA5288.npz")
+    output_dir = Path("/Volumes/my_own_SSD/updated_AreaX_outputs/USA5288/USA5288_repertoire")
 
-sss.plot_spectrogram_samples_for_labels(
-    npz_path=npz_path,
-    output_dir=output_dir,
-    selected_labels=None,
-    skip_noise_label=True,
-    spectrogram_length=1000,
-    num_sample_spectrograms=1,
-    cmap="gray_r",
-    show_colorbar=False,
-    show_plots=True,
-    save_sample_spectrograms=True,
-    make_umap_plot=True,
-    show_umap_legend=True,
-)
-    
-    
-    
+    sss.plot_spectrogram_samples_for_labels(
+        npz_path=npz_path,
+        output_dir=output_dir,
+        selected_labels=None,
+        skip_noise_label=True,
+        spectrogram_length=1000,
+        num_sample_spectrograms=1,
+        cmap="gray_r",
+        show_colorbar=False,
+        show_plots=True,
+        save_sample_spectrograms=True,
+        make_umap_plot=True,
+        show_umap_legend=True,
+        save_umap_label_key=True,
+    )
     """
