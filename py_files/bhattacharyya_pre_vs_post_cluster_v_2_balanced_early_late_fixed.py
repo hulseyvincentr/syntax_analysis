@@ -6,7 +6,7 @@ bhattacharyya_pre_vs_post_cluster_v2_balanced_early_late.py
 Extends your original bhattacharyya_pre_vs_post_cluster.py by adding:
 1) Balanced sample sizes per comparison (subsample both periods to min(nA, nB), optionally capped).
 2) Additional comparisons:
-     - pre_vs_post                  (post vs pre)
+     - pre_vs_post                  (post vs pre) 
      - pre_early_vs_late            (late pre vs early pre)
      - post_early_vs_late           (late post vs early post)
      - late_pre_vs_early_post       (early post vs late pre)
@@ -25,7 +25,9 @@ BC is computed under a multivariate Gaussian approximation:
         DB = 1/8 (dmu^T Sigma^-1 dmu) + 1/2 ln( det(Sigma) / sqrt(det(Sigma_A) det(Sigma_B)) )
         where Sigma = (Sigma_A + Sigma_B)/2
   - Bhattacharyya coefficient (BC):
+# %%
         BC = exp(-DB)
+
 
 Outputs:
   - CSV with one row per (animal_id, cluster_label, comparison) that has enough points in both periods.
