@@ -22,6 +22,10 @@ Features
 - In comparison mode, it can make both:
     * a titled comparison figure with dedicated Song A / Song B title rows
     * a second clean comparison figure with only spectrograms and annotations
+- In example mode, it can generate separate versions with x-axis units in:
+    * frames
+    * milliseconds
+    * seconds
 
 Main public functions
 ---------------------
@@ -372,6 +376,47 @@ def _resolve_segment_from_records(
 # -----------------------------------------------------------------------------
 # Plotting helpers
 # -----------------------------------------------------------------------------
+def _normalize_x_axis_unit(unit: str) -> str:
+    unit = str(unit).strip().lower()
+    if unit in {"frames", "frame", "bins", "timebins", "time_bins"}:
+        return "frames"
+    if unit in {"ms", "millisecond", "milliseconds"}:
+        return "ms"
+    if unit in {"s", "sec", "secs", "second", "seconds"}:
+        return "seconds"
+    raise ValueError("x_axis_unit must be one of: frames, ms, seconds")
+
+
+def _parse_x_axis_units(text: Optional[str]) -> Optional[List[str]]:
+    if text is None or text == "":
+        return None
+    parts = [p.strip() for p in text.split(",") if p.strip() != ""]
+    out: List[str] = []
+    for p in parts:
+        u = _normalize_x_axis_unit(p)
+        if u not in out:
+            out.append(u)
+    return out
+
+
+def _get_x_axis_scale_and_label(
+    x_axis_unit: str,
+    frame_ms: Optional[float],
+) -> Tuple[float, str]:
+    unit = _normalize_x_axis_unit(x_axis_unit)
+
+    if unit == "frames":
+        return 1.0, "Time (frames)"
+
+    if frame_ms is None:
+        raise ValueError("frame_ms must be provided when x_axis_unit is 'ms' or 'seconds'")
+
+    if unit == "ms":
+        return float(frame_ms), "Time (ms)"
+
+    return float(frame_ms) / 1000.0, "Time (s)"
+
+
 def _run_boundaries(lab_view: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     frames = lab_view.size
     if frames == 0:
@@ -398,22 +443,27 @@ def _draw_label_bar(
     lab_view: np.ndarray,
     label_color_lut: Dict[int, str],
     label_edge_lw: float,
+    *,
+    x_scale: float = 1.0,
 ) -> None:
     run_starts, run_ends = _run_boundaries(lab_view)
     ax.set_ylim(0, 1)
     ax.set_yticks([])
+
     for rs, re in zip(run_starts, run_ends):
         lab = int(lab_view[rs])
         ax.add_patch(
             Rectangle(
-                (rs, 0),
-                re - rs,
+                (rs * x_scale, 0),
+                (re - rs) * x_scale,
                 1,
                 facecolor=label_color_lut.get(lab, "#7f7f7f"),
                 edgecolor="white",
                 linewidth=label_edge_lw,
             )
         )
+
+    ax.set_xlim(0, lab_view.size * x_scale)
 
 
 # -----------------------------------------------------------------------------
@@ -438,6 +488,8 @@ def plot_segment(
     show_plots: bool,
     save_plots: bool,
     out_dir: Optional[Path],
+    x_axis_unit: str = "frames",
+    frame_ms: Optional[float] = None,
 ) -> Optional[Path]:
     """Plot one segment with a spectrogram and a colored label bar."""
     total_frames = labels_full.size
@@ -459,6 +511,9 @@ def plot_segment(
 
     vmin, vmax = np.percentile(s_view, [5, 99])
 
+    x_scale, x_label = _get_x_axis_scale_and_label(x_axis_unit, frame_ms)
+    x_max = (view_end - view_start) * x_scale
+
     fig = plt.figure(figsize=(12, 6))
     gs = fig.add_gridspec(2, 1, height_ratios=[1.0, label_bar_height], hspace=0.0)
     ax1 = fig.add_subplot(gs[0, 0])
@@ -473,20 +528,27 @@ def plot_segment(
         cmap="gray_r",
         vmin=vmin,
         vmax=vmax,
-        extent=(view_start, view_end, 0, s_view.shape[0]),
+        extent=(0, x_max, 0, s_view.shape[0]),
         interpolation="nearest",
     )
-    ax1.set_xlim(view_start, view_end)
+    ax1.set_xlim(0, x_max)
     ax1.set_ylabel("Freq bins")
 
     name = file_name_from_id(fid, file_map)
     ax1.set_title(
-        f"Example {seg_num + 1} | {used_label_key} | {name} | frames {view_start}:{view_end}",
+        f"Example {seg_num + 1} | {used_label_key} | {name} | "
+        f"frames {view_start}:{view_end} | x-axis: {x_axis_unit}",
         pad=6,
     )
 
-    _draw_label_bar(ax2, lab_view, label_color_lut, label_edge_lw)
-    ax2.set_xlabel("Time (frames)")
+    _draw_label_bar(
+        ax2,
+        lab_view,
+        label_color_lut,
+        label_edge_lw,
+        x_scale=x_scale,
+    )
+    ax2.set_xlabel(x_label)
     _style_spec_and_bar_axes(ax1, ax2, hide_bar_xlabels=False)
 
     fig.subplots_adjust(left=0.07, right=0.99, bottom=0.10, top=0.92, hspace=0.0)
@@ -494,7 +556,7 @@ def plot_segment(
     save_path = None
     if save_plots and out_dir is not None:
         out_dir.mkdir(parents=True, exist_ok=True)
-        save_path = out_dir / f"label_blocks_example_{seg_num + 1:02d}.png"
+        save_path = out_dir / f"label_blocks_example_{seg_num + 1:02d}_{x_axis_unit}.png"
         fig.savefig(save_path, dpi=300, bbox_inches="tight")
         print(f"[SAVE] {save_path}")
 
@@ -522,6 +584,8 @@ def run_plot_label_blocks(
     label_universe: Optional[Sequence[int]] = None,
     show_plots: bool = True,
     save_plots: bool = False,
+    x_axis_units: Sequence[str] = ("frames", "ms", "seconds"),
+    frame_ms: Optional[float] = None,
 ) -> List[Path]:
     """
     Run the label-block plotting workflow on one NPZ.
@@ -533,6 +597,15 @@ def run_plot_label_blocks(
     npz_path = Path(npz_path)
     if out_dir is not None:
         out_dir = Path(out_dir)
+
+    normalized_units: List[str] = []
+    for unit in x_axis_units:
+        u = _normalize_x_axis_unit(unit)
+        if u not in normalized_units:
+            normalized_units.append(u)
+
+    if any(u in {"ms", "seconds"} for u in normalized_units) and frame_ms is None:
+        raise ValueError("frame_ms must be provided when x_axis_units includes 'ms' or 'seconds'")
 
     data = np.load(npz_path, allow_pickle=True)
     try:
@@ -562,30 +635,34 @@ def run_plot_label_blocks(
             print(f"Using fixed label colors from: {Path(fixed_label_colors_json)}")
         else:
             print("Using internally generated label colors.")
+        print(f"Generating x-axis versions: {', '.join(normalized_units)}")
 
         saved_paths: List[Path] = []
         for k, (_orig_i, s0, e0, fid) in enumerate(chosen):
-            saved = plot_segment(
-                seg_num=k,
-                s0=s0,
-                e0=e0,
-                fid=fid,
-                spectrogram_tf=spectrogram_tf,
-                labels_full=labels_full,
-                used_label_key=used_label_key,
-                file_map=file_map,
-                label_color_lut=label_color_lut,
-                pad=pad,
-                max_plot_frames=max_plot_frames,
-                smooth_w=smooth_w,
-                label_bar_height=label_bar_height,
-                label_edge_lw=label_edge_lw,
-                show_plots=show_plots,
-                save_plots=save_plots,
-                out_dir=out_dir,
-            )
-            if saved is not None:
-                saved_paths.append(saved)
+            for unit in normalized_units:
+                saved = plot_segment(
+                    seg_num=k,
+                    s0=s0,
+                    e0=e0,
+                    fid=fid,
+                    spectrogram_tf=spectrogram_tf,
+                    labels_full=labels_full,
+                    used_label_key=used_label_key,
+                    file_map=file_map,
+                    label_color_lut=label_color_lut,
+                    pad=pad,
+                    max_plot_frames=max_plot_frames,
+                    smooth_w=smooth_w,
+                    label_bar_height=label_bar_height,
+                    label_edge_lw=label_edge_lw,
+                    show_plots=show_plots,
+                    save_plots=save_plots,
+                    out_dir=out_dir,
+                    x_axis_unit=unit,
+                    frame_ms=frame_ms,
+                )
+                if saved is not None:
+                    saved_paths.append(saved)
 
         return saved_paths
     finally:
@@ -627,6 +704,8 @@ def _build_two_song_comparison_figure(
     use_seconds: bool,
     frame_ms: Optional[float],
     show_song_titles: bool,
+    tick_label_fontsize: int = 20,
+    axis_label_fontsize: int = 24,
 ):
     """Build either the titled or clean two-song comparison figure."""
     if show_song_titles:
@@ -719,8 +798,8 @@ def _build_two_song_comparison_figure(
         interpolation="nearest",
     )
 
-    ax_spec_a.set_ylabel("Freq bins")
-    ax_spec_b.set_ylabel("Freq bins")
+    ax_spec_a.set_ylabel("Freq bins", fontsize=axis_label_fontsize)
+    ax_spec_b.set_ylabel("Freq bins", fontsize=axis_label_fontsize)
     ax_spec_a.set_xlim(0, shared_len)
     ax_spec_b.set_xlim(0, shared_len)
 
@@ -733,13 +812,17 @@ def _build_two_song_comparison_figure(
     if use_seconds:
         if frame_ms is None:
             raise ValueError("frame_ms must be provided when use_seconds=True")
-        ax_bar_b.set_xlabel("Time (s)")
+        ax_bar_b.set_xlabel("Time (s)", fontsize=axis_label_fontsize)
         ticks = ax_bar_b.get_xticks()
         labels = [f"{t * frame_ms / 1000.0:.2f}" for t in ticks]
         ax_bar_b.set_xticks(ticks)
-        ax_bar_b.set_xticklabels(labels)
+        ax_bar_b.set_xticklabels(labels, fontsize=tick_label_fontsize)
     else:
-        ax_bar_b.set_xlabel("Time (frames)")
+        ax_bar_b.set_xlabel("Time (frames)", fontsize=axis_label_fontsize)
+
+    ax_spec_a.tick_params(axis="both", labelsize=tick_label_fontsize)
+    ax_spec_b.tick_params(axis="both", labelsize=tick_label_fontsize)
+    ax_bar_b.tick_params(axis="both", labelsize=tick_label_fontsize)
 
     fig.subplots_adjust(left=0.07, right=0.99, bottom=0.08, top=top)
     return fig
@@ -763,6 +846,8 @@ def compare_two_segments_same_timescale(
     label_edge_lw: float = 0.6,
     use_seconds: bool = False,
     frame_ms: Optional[float] = None,
+    tick_label_fontsize: int = 20,
+    axis_label_fontsize: int = 24,
     show_plot: bool = True,
     save_plot: bool = False,
     make_clean_figure: bool = True,
@@ -880,6 +965,8 @@ def compare_two_segments_same_timescale(
             use_seconds=use_seconds,
             frame_ms=frame_ms,
             show_song_titles=True,
+            tick_label_fontsize=tick_label_fontsize,
+            axis_label_fontsize=axis_label_fontsize,
         )
 
         save_path = None
@@ -927,6 +1014,8 @@ def compare_two_segments_same_timescale(
                 use_seconds=use_seconds,
                 frame_ms=frame_ms,
                 show_song_titles=False,
+                tick_label_fontsize=tick_label_fontsize,
+                axis_label_fontsize=axis_label_fontsize,
             )
 
             if save_clean_figure and out_dir is not None:
@@ -946,7 +1035,6 @@ def compare_two_segments_same_timescale(
             data.close()
         except Exception:
             pass
-
 
 
 def compare_two_segments_by_file_name(
@@ -1022,6 +1110,17 @@ def build_argparser() -> argparse.ArgumentParser:
         default=None,
         help="Optional comma-separated label universe, e.g. '0,1,2,3,4'",
     )
+    p.add_argument(
+        "--x-axis-units",
+        default="frames,ms,seconds",
+        help="Comma-separated x-axis units to generate for example plots: frames, ms, seconds",
+    )
+    p.add_argument(
+        "--frame-ms",
+        type=float,
+        default=None,
+        help="Milliseconds per frame/time bin when using ms or seconds axes",
+    )
     p.add_argument("--show-plots", dest="show_plots", action="store_true", help="Display figures interactively")
     p.add_argument("--no-show-plots", dest="show_plots", action="store_false", help="Do not display figures")
     p.set_defaults(show_plots=True)
@@ -1046,7 +1145,8 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--separate-contrast", dest="shared_contrast", action="store_false", help="Scale each song separately")
     p.set_defaults(shared_contrast=True)
     p.add_argument("--use-seconds", action="store_true", help="Label x-axis in seconds instead of frames")
-    p.add_argument("--frame-ms", type=float, default=None, help="Milliseconds per frame when --use-seconds is set")
+    p.add_argument("--tick-label-fontsize", type=int, default=20, help="Tick label fontsize for compare figures")
+    p.add_argument("--axis-label-fontsize", type=int, default=24, help="Axis label fontsize for compare figures")
     p.add_argument("--save-plot", action="store_true", help="Save titled comparison figure to --out-dir")
     p.add_argument("--no-clean-figure", dest="make_clean_figure", action="store_false", help="Do not make the second clean comparison figure")
     p.add_argument("--make-clean-figure", dest="make_clean_figure", action="store_true", help="Make the second clean comparison figure")
@@ -1065,6 +1165,7 @@ def main() -> None:
     args = build_argparser().parse_args()
 
     label_universe = _parse_label_universe(args.label_universe)
+    x_axis_units = _parse_x_axis_units(args.x_axis_units)
 
     if args.mode == "examples":
         run_plot_label_blocks(
@@ -1082,6 +1183,8 @@ def main() -> None:
             label_universe=label_universe,
             show_plots=args.show_plots,
             save_plots=args.save_plots,
+            x_axis_units=x_axis_units if x_axis_units is not None else ("frames", "ms", "seconds"),
+            frame_ms=args.frame_ms,
         )
         return
 
@@ -1105,6 +1208,8 @@ def main() -> None:
         label_edge_lw=args.label_edge_lw,
         use_seconds=args.use_seconds,
         frame_ms=args.frame_ms,
+        tick_label_fontsize=args.tick_label_fontsize,
+        axis_label_fontsize=args.axis_label_fontsize,
         show_plot=args.show_plots,
         save_plot=args.save_plot,
         make_clean_figure=args.make_clean_figure,
@@ -1115,3 +1220,33 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    
+    
+    """
+    import importlib
+import npz_sample_song_annotations as nsa
+importlib.reload(nsa)
+
+nsa.compare_two_segments_same_timescale(
+    npz_path="/Volumes/my_own_SSD/updated_AreaX_outputs/USA5288/USA5288.npz",
+    segment_index_a=31,
+    segment_index_b=158,
+    index_space="filtered",
+    out_dir="/Volumes/my_own_SSD/updated_AreaX_outputs/USA5288/song_comparisons",
+    label_source="hdbscan_labels",
+    smooth_w=51,
+    pad=0,
+    min_segment_frames=800,
+    shared_contrast=True,
+    use_seconds=True,
+    frame_ms=2.70,
+    tick_label_fontsize=20,
+    axis_label_fontsize=24,
+    show_plot=True,
+    save_plot=True,
+    make_clean_figure=True,
+    show_clean_figure=True,
+    save_clean_figure=True,
+)
+    
+    """
