@@ -1,6 +1,6 @@
 
 # -*- coding: utf-8 -*-
-# phrase_duration_pre_vs_post_grouped_with_label_colors.py
+# phrase_duration_pre_vs_post_grouped_with_label_colors_updated_v8.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -19,6 +19,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from matplotlib.ticker import FuncFormatter
+from matplotlib.lines import Line2D
 import seaborn as sns
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -33,9 +34,17 @@ except Exception as e:
 # ──────────────────────────────────────────────────────────────────────────────
 # Styling
 # ──────────────────────────────────────────────────────────────────────────────
-TITLE_FS = 18
-LABEL_FS = 16
-TICK_FS = 13
+TITLE_FS = 24
+LABEL_FS = 22
+TICK_FS = 18
+
+
+LESION_HIT_TYPE_LABEL_RENAMES = {
+    "Area X visible (Lateral only)": "Lateral lesion only",
+    "large lesion Area X not visible": "Complete Medial and Lateral lesion",
+    'Area X visible "Medial+Lateral hit"': "Partial Medial and Lateral lesion",
+    "Area X visible Medial+Lateral hit": "Partial Medial and Lateral lesion",
+}
 
 def _pretty_axes(ax, x_rotation: int = 0):
     for spine in ["top", "right"]:
@@ -76,6 +85,13 @@ class GroupedPlotsResult:
     early_pre_colored_path: Optional[Path]
     late_pre_colored_path: Optional[Path]
     post_colored_path: Optional[Path]
+    compact_grouped_syllable_points_path: Optional[Path]
+    compact_grouped_syllable_points_no_significance_path: Optional[Path]
+    compact_grouped_significance_path: Optional[Path]
+    compact_grouped_syllable_points_no_title_no_xlabels_path: Optional[Path]
+    compact_grouped_syllable_points_large_xticks_path: Optional[Path]
+    compact_grouped_syllable_points_sorted_by_post_variance_path: Optional[Path]
+    compact_grouped_syllable_points_sorted_by_post_variance_group_colors_path: Optional[Path]
     combined_grouped_path: Optional[Path]
     combined_grouped_colored_path: Optional[Path]
     aggregate_path: Optional[Path]
@@ -89,6 +105,7 @@ class GroupedPlotsResult:
     syllable_labels: List[str]
     y_limits: Tuple[float, float]
     phrase_duration_stats_df: pd.DataFrame
+    compact_grouped_significance_df: pd.DataFrame
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Utilities: dates, parsing, labels, durations extraction
@@ -257,6 +274,28 @@ def _collect_unique_labels_sorted(df: pd.DataFrame, dict_col: str) -> List[str]:
         return [labs[i] for i in order]
     except Exception:
         return sorted(labs)
+
+def _rename_lesion_hit_type_labels_in_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+
+    candidate_cols = [
+        "Lesion hit type",
+        "Lesion hit type group",
+        "lesion_hit_type",
+        "lesion_hit_type_group",
+        "Hit Type",
+        "hit_type",
+        "Group",
+        "group",
+    ]
+
+    out = df.copy()
+    for col in candidate_cols:
+        if col in out.columns:
+            out[col] = out[col].replace(LESION_HIT_TYPE_LABEL_RENAMES)
+    return out
+
 
 def _build_durations_table(df: pd.DataFrame, labels: Sequence[str]) -> tuple[pd.DataFrame, str | None]:
     col = _find_best_spans_column(df)
@@ -615,6 +654,118 @@ def _stars(p: float) -> str:
 def _fmt_p(p: float) -> str:
     return f"{p:.2e}" if p < 0.001 else f"{p:.3f}"
 
+def _draw_sig_bracket(ax, x1: float, x2: float, y: float, h: float, text: str, *, fontsize: Optional[int] = None):
+    if not text:
+        return
+    ax.plot([x1, x1, x2, x2], [y, y + h, y + h, y], color="black", linewidth=1.0, zorder=5, clip_on=False)
+    ax.text(
+        (x1 + x2) / 2.0,
+        y + h,
+        text,
+        ha="center",
+        va="bottom",
+        fontsize=TICK_FS if fontsize is None else fontsize,
+        color="black",
+        zorder=6,
+        clip_on=False,
+    )
+
+def _collect_compact_group_values(group_defs, labels: Sequence[str]) -> Dict[str, Dict[str, np.ndarray]]:
+    out: Dict[str, Dict[str, np.ndarray]] = {str(lbl): {} for lbl in labels}
+    for gname, ds in group_defs:
+        if ds is None or len(ds) == 0:
+            continue
+        tall = _explode_for_plot(ds, labels).copy()
+        tall["Syllable"] = tall["Syllable"].astype(str)
+        for lbl in labels:
+            vals = pd.to_numeric(
+                tall.loc[tall["Syllable"] == str(lbl), "Phrase Duration (ms)"],
+                errors="coerce",
+            ).dropna().to_numpy(dtype=float)
+            out[str(lbl)][gname] = vals
+    return out
+
+def _build_compact_significance_df(
+    compact_group_values: Dict[str, Dict[str, np.ndarray]],
+    labels: Sequence[str],
+) -> pd.DataFrame:
+    comparison_defs = [
+        ("Early Pre", "Late Pre", "Early Pre vs Late Pre"),
+        ("Late Pre", "Post", "Late Pre vs Post"),
+    ]
+
+    rows = []
+    for group_a, group_b, comparison_name in comparison_defs:
+        pending = []
+        raw_ps = []
+
+        for lbl in labels:
+            lbl_key = str(lbl)
+            vals_a = np.asarray(compact_group_values.get(lbl_key, {}).get(group_a, np.array([], dtype=float)), dtype=float)
+            vals_b = np.asarray(compact_group_values.get(lbl_key, {}).get(group_b, np.array([], dtype=float)), dtype=float)
+
+            if vals_a.size == 0 or vals_b.size == 0:
+                rows.append({
+                    "Syllable": lbl_key,
+                    "Comparison": comparison_name,
+                    "Group_A": group_a,
+                    "Group_B": group_b,
+                    "N_A": int(vals_a.size),
+                    "N_B": int(vals_b.size),
+                    "P_raw": np.nan,
+                    "P_BH": np.nan,
+                    "Stars": "",
+                    "Significant": False,
+                })
+                continue
+
+            _, p_raw = _try_mannwhitney(vals_a, vals_b)
+            pending.append((lbl_key, int(vals_a.size), int(vals_b.size), float(p_raw)))
+            raw_ps.append(float(p_raw))
+
+        adj_ps = _p_adjust_bh(raw_ps) if raw_ps else []
+        adj_lookup = {lbl: p_adj for (lbl, _, _, _), p_adj in zip(pending, adj_ps)}
+        raw_lookup = {lbl: p_raw for (lbl, _, _, p_raw) in pending}
+        n_lookup = {lbl: (n_a, n_b) for lbl, n_a, n_b, _ in pending}
+
+        for lbl in labels:
+            lbl_key = str(lbl)
+            if lbl_key not in raw_lookup:
+                continue
+            p_raw = raw_lookup[lbl_key]
+            p_adj = adj_lookup[lbl_key]
+            n_a, n_b = n_lookup[lbl_key]
+            is_sig = bool(np.isfinite(p_adj) and p_adj < 0.05)
+            rows.append({
+                "Syllable": lbl_key,
+                "Comparison": comparison_name,
+                "Group_A": group_a,
+                "Group_B": group_b,
+                "N_A": int(n_a),
+                "N_B": int(n_b),
+                "P_raw": float(p_raw),
+                "P_BH": float(p_adj),
+                "Stars": _stars(float(p_adj)) if is_sig else "",
+                "Significant": is_sig,
+            })
+
+    out = pd.DataFrame(rows, columns=[
+        "Syllable",
+        "Comparison",
+        "Group_A",
+        "Group_B",
+        "N_A",
+        "N_B",
+        "P_raw",
+        "P_BH",
+        "Stars",
+        "Significant",
+    ])
+    if not out.empty:
+        out["Syllable"] = pd.Categorical(out["Syllable"], categories=[str(x) for x in labels], ordered=True)
+        out = out.sort_values(["Syllable", "Comparison"]).reset_index(drop=True)
+    return out
+
 def _calc_global_ylim(datasets, labels):
     vals = []
     for ds in datasets:
@@ -656,6 +807,7 @@ def run_phrase_duration_pre_vs_post_grouped(
 
     fixed_label_colors_json: Optional[Union[str, Path]] = None,
     make_colored_violin_plots: bool = False,
+    make_box_plots: bool = False,
 ) -> GroupedPlotsResult:
     df = None
     if premerged_annotations_df is not None:
@@ -703,6 +855,8 @@ def run_phrase_duration_pre_vs_post_grouped(
 
     if df is None or df.empty:
         raise ValueError("No data available after reading/merging annotations.")
+
+    df = _rename_lesion_hit_type_labels_in_df(df)
 
     decoded_path = Path(decoded_database_json) if decoded_database_json else None
     if output_dir is None:
@@ -772,12 +926,22 @@ def run_phrase_duration_pre_vs_post_grouped(
     if y_max_ms:
         y_max = float(y_max_ms)
 
+    compact_group_plot_defs = [
+        ("Early Pre", early_pre),
+        ("Late Pre", late_pre),
+        ("Post", post_g),
+    ]
+    compact_group_values = _collect_compact_group_values(compact_group_plot_defs, labels)
+    compact_significance_df = _build_compact_significance_df(compact_group_values, labels)
+    compact_significance_path = output_dir / f"{animal_id}_compact_grouped_phrase_duration_within_syllable_significance.csv"
+    compact_significance_df.to_csv(compact_significance_path, index=False)
+
     def _make_plot(ds, title, n, fname, label_color_map_for_plot=None):
         tall = _explode_for_plot(ds, labels)
         fig, ax = plt.subplots(figsize=(12, 6))
         _violin_plus_strip(ax, tall, (y_min, y_max), labels, label_color_map=label_color_map_for_plot)
         suffix = " (label-colored)" if label_color_map_for_plot is not None else ""
-        ax.set_title(f"{animal_id} — {title} (N={n}){suffix}", fontsize=TITLE_FS)
+        ax.set_title("")
         fig.tight_layout()
         outname = f"{animal_id}_{fname}_phrase_durations"
         if label_color_map_for_plot is not None:
@@ -802,7 +966,7 @@ def run_phrase_duration_pre_vs_post_grouped(
         for i, (ax, (ds, title, n)) in enumerate(zip(axes, plot_defs)):
             if ds is None or len(ds) == 0:
                 ax.text(0.5, 0.5, "No phrase durations", ha="center", va="center", fontsize=TITLE_FS - 2)
-                ax.set_title(f"{animal_id} — {title} (N={n})", fontsize=TITLE_FS)
+                ax.set_title("")
                 _pretty_axes(ax, 0)
                 if i != 0:
                     ax.tick_params(axis="y", left=False, labelleft=False)
@@ -818,7 +982,7 @@ def run_phrase_duration_pre_vs_post_grouped(
             )
 
             suffix = " (label-colored)" if label_color_map_for_plot is not None else ""
-            ax.set_title(f"{animal_id} — {title} (N={n}){suffix}", fontsize=TITLE_FS)
+            ax.set_title("")
 
             ax.set_xlabel("")
             if i == 0:
@@ -843,8 +1007,237 @@ def run_phrase_duration_pre_vs_post_grouped(
 
         return outp
 
+    def _make_compact_grouped_syllable_points_plot(
+        *,
+        show_significance: bool = True,
+        include_title: bool = True,
+        show_x_label: bool = True,
+        show_xtick_labels: bool = True,
+        xtick_fontsize: Optional[float] = None,
+        file_suffix: str = "",
+        label_order: Optional[Sequence[Union[str, int]]] = None,
+        title_note: str = "",
+        color_mode: str = "syllable",
+    ):
+        compact_color_map = label_color_map
+        if compact_color_map is None:
+            compact_color_map = _resolve_label_color_map(labels, fixed_label_colors_json=fixed_label_colors_json)
+
+        group_plot_defs = compact_group_plot_defs
+        marker_map = {
+            "Early Pre": "o",
+            "Late Pre": "s",
+            "Post": "X",
+        }
+        offset_map = {
+            "Early Pre": -0.24,
+            "Late Pre": 0.0,
+            "Post": 0.24,
+        }
+        group_color_map = {
+            "Early Pre": "#000000",
+            "Late Pre": "#0000FF",
+            "Post": "#FF0000",
+        }
+
+        fig_w = max(15, 0.58 * len(labels) + 4)
+        fig, ax = plt.subplots(figsize=(fig_w, 5.0))
+        sns.set_style("white")
+        rng = np.random.default_rng(0)
+
+        plot_labels = list(labels) if label_order is None else [str(x) for x in label_order]
+
+        any_points = False
+        all_plotted_values = []
+
+        for gname, ds in group_plot_defs:
+            if ds is None or len(ds) == 0:
+                continue
+
+            for i, lbl in enumerate(plot_labels):
+                vals = np.asarray(compact_group_values.get(str(lbl), {}).get(gname, np.array([], dtype=float)), dtype=float)
+
+                if vals.size == 0:
+                    continue
+
+                any_points = True
+                all_plotted_values.append(vals)
+                x_center = i + offset_map[gname]
+                xvals = x_center + rng.uniform(-0.05, 0.05, size=vals.size)
+                if color_mode == "group":
+                    color = group_color_map.get(gname, "#7f7f7f")
+                else:
+                    color = compact_color_map.get(str(lbl), "#7f7f7f")
+
+                raw_marker = marker_map[gname]
+                if raw_marker == "X":
+                    raw_size = 16
+                    raw_lw = 0.35
+                else:
+                    raw_size = 14
+                    raw_lw = 0.0
+
+                ax.scatter(
+                    xvals,
+                    vals,
+                    s=raw_size,
+                    marker=raw_marker,
+                    c=color,
+                    alpha=0.28,
+                    linewidths=raw_lw,
+                    edgecolors="none" if raw_lw == 0.0 else color,
+                    zorder=2,
+                )
+
+                q1, med, q3 = np.percentile(vals, [25, 50, 75])
+                ax.vlines(x_center, q1, q3, color=color, linewidth=2.2, alpha=0.95, zorder=3)
+                ax.scatter(
+                    [x_center],
+                    [med],
+                    s=88,
+                    marker=marker_map[gname],
+                    c=color,
+                    edgecolors="black",
+                    linewidths=0.7,
+                    zorder=4,
+                )
+
+        if not any_points:
+            ax.text(0.5, 0.5, "No phrase durations", ha="center", va="center", fontsize=TITLE_FS - 2)
+            _pretty_axes(ax, 0)
+            ax.set_axis_off()
+        else:
+            ax.set_xlim(-0.6, len(plot_labels) - 0.4)
+            ax.set_xticks(np.arange(len(plot_labels)))
+            if show_xtick_labels:
+                use_xtick_fs = TICK_FS if xtick_fontsize is None else xtick_fontsize
+                ax.set_xticklabels([str(lbl) for lbl in plot_labels], fontsize=use_xtick_fs)
+            else:
+                ax.set_xticklabels([])
+                ax.tick_params(axis="x", which="both", length=0)
+
+            ax.set_xlabel("Syllable Label" if show_x_label else "", fontsize=LABEL_FS)
+            ax.set_ylabel("Phrase Duration (s)", fontsize=LABEL_FS)
+
+            base_compact_y_max_ms = 25000.0 if y_max_ms is None else min(float(y_max_ms), 25000.0)
+            if all_plotted_values:
+                max_data_y = float(np.nanmax(np.concatenate(all_plotted_values)))
+            else:
+                max_data_y = base_compact_y_max_ms
+            max_needed_y = max(base_compact_y_max_ms, max_data_y)
+
+            if show_significance:
+                sig_df_plot = compact_significance_df.copy()
+                sig_lookup = {
+                    (str(row["Syllable"]), str(row["Comparison"])): str(row["Stars"])
+                    for _, row in sig_df_plot.iterrows()
+                    if isinstance(row["Stars"], str) and row["Stars"]
+                }
+
+                sig_step = max(350.0, 0.03 * max_needed_y)
+                sig_bar_h = max(150.0, 0.012 * max_needed_y)
+
+                for i, lbl in enumerate(plot_labels):
+                    all_vals = []
+                    for gname, _ in group_plot_defs:
+                        vals = np.asarray(compact_group_values.get(str(lbl), {}).get(gname, np.array([], dtype=float)), dtype=float)
+                        if vals.size:
+                            all_vals.append(vals)
+                    if not all_vals:
+                        continue
+
+                    label_max = float(np.max(np.concatenate(all_vals)))
+                    y_cursor = label_max + 0.25 * sig_step
+
+                    stars_early_late = sig_lookup.get((str(lbl), "Early Pre vs Late Pre"), "")
+                    if stars_early_late:
+                        _draw_sig_bracket(
+                            ax,
+                            i + offset_map["Early Pre"],
+                            i + offset_map["Late Pre"],
+                            y_cursor,
+                            sig_bar_h,
+                            stars_early_late,
+                            fontsize=max(TICK_FS - 2, 12),
+                        )
+                        y_cursor += sig_step
+                        max_needed_y = max(max_needed_y, y_cursor + sig_bar_h)
+
+                    stars_late_post = sig_lookup.get((str(lbl), "Late Pre vs Post"), "")
+                    if stars_late_post:
+                        _draw_sig_bracket(
+                            ax,
+                            i + offset_map["Late Pre"],
+                            i + offset_map["Post"],
+                            y_cursor,
+                            sig_bar_h,
+                            stars_late_post,
+                            fontsize=max(TICK_FS - 2, 12),
+                        )
+                        y_cursor += sig_step
+                        max_needed_y = max(max_needed_y, y_cursor + sig_bar_h)
+
+            ax.set_ylim(0, max_needed_y * 1.02)
+
+            _pretty_axes(ax, 0)
+            _apply_seconds_yaxis(ax)
+            ax.grid(False)
+            ax.xaxis.grid(False)
+            ax.yaxis.grid(False)
+
+            if include_title:
+                title_extra = "" if show_significance else " (no significance annotations)"
+                note = f" {title_note}" if title_note else ""
+                ax.set_title("")
+            else:
+                ax.set_title("")
+
+            display_label_map = {
+                "Early Pre": "early pre-lesion",
+                "Late Pre": "late pre-lesion",
+                "Post": "post-lesion",
+            }
+
+            legend_handles = [
+                Line2D(
+                    [0], [0],
+                    marker=marker_map[g],
+                    linestyle="None",
+                    color=(group_color_map[g] if color_mode == "group" else "black"),
+                    label=display_label_map[g],
+                    markerfacecolor=(group_color_map[g] if color_mode == "group" else "white"),
+                    markeredgecolor=(group_color_map[g] if color_mode == "group" else "black"),
+                    markersize=10,
+                )
+                for g in ["Early Pre", "Late Pre", "Post"]
+            ]
+            ax.legend(
+                handles=legend_handles,
+                fontsize=TICK_FS,
+                frameon=False,
+                bbox_to_anchor=(1.02, 1),
+                loc="upper left",
+            )
+
+        fig.tight_layout()
+        sig_suffix = "" if show_significance else "_no_significance"
+        outp = output_dir / f"{animal_id}_compact_grouped_phrase_durations_by_syllable{sig_suffix}{file_suffix}.png"
+        fig.savefig(outp, dpi=300, transparent=False)
+        if show_plots:
+            plt.show()
+        else:
+            plt.close(fig)
+        return outp
+
+
     ep = lp = po = None
     epc = lpc = poc = None
+    compact_grouped = None
+    compact_grouped_no_sig = None
+    compact_grouped_no_title_no_xlabels = None
+    compact_grouped_large_xticks = None
+    compact_grouped_sorted_by_post_variance = None
+    compact_grouped_sorted_by_post_variance_group_colors = None
     combined = None
     combined_colored = None
     if len(early_pre):
@@ -861,289 +1254,340 @@ def run_phrase_duration_pre_vs_post_grouped(
             poc = _make_plot(post_g, "Post-Treatment", len(post_g), "post", label_color_map_for_plot=label_color_map)
 
     if len(early_pre) or len(late_pre) or len(post_g):
+        compact_grouped = _make_compact_grouped_syllable_points_plot(show_significance=True)
+        compact_grouped_no_sig = _make_compact_grouped_syllable_points_plot(show_significance=False)
+        compact_grouped_no_title_no_xlabels = _make_compact_grouped_syllable_points_plot(
+            show_significance=False,
+            include_title=False,
+            show_x_label=False,
+            show_xtick_labels=False,
+            file_suffix="_no_title_no_xlabels",
+        )
+        compact_grouped_large_xticks = _make_compact_grouped_syllable_points_plot(
+            show_significance=False,
+            xtick_fontsize=max(TICK_FS + 8, 20),
+            file_suffix="_large_xtick_labels",
+        )
+
+        # Sort syllables by post-lesion variance (highest variance on the left).
+        def _post_variance_sort_key(lbl):
+            vals = np.asarray(compact_group_values.get(str(lbl), {}).get("Post", np.array([], dtype=float)), dtype=float)
+            if vals.size <= 1:
+                return 0.0
+            return float(np.nanvar(vals, ddof=1))
+
+        labels_sorted_by_post_variance = sorted(
+            [str(lbl) for lbl in labels],
+            key=_post_variance_sort_key,
+            reverse=True,
+        )
+        compact_grouped_sorted_by_post_variance = _make_compact_grouped_syllable_points_plot(
+            show_significance=False,
+            label_order=labels_sorted_by_post_variance,
+            title_note="(sorted by post-lesion variance)",
+            file_suffix="_sorted_by_post_variance",
+        )
+        compact_grouped_sorted_by_post_variance_group_colors = _make_compact_grouped_syllable_points_plot(
+            show_significance=False,
+            label_order=labels_sorted_by_post_variance,
+            title_note="(sorted by post-lesion variance; group colors)",
+            file_suffix="_sorted_by_post_variance_group_colors",
+            color_mode="group",
+        )
         combined = _make_combined_grouped_plot()
         if make_colored_violin_plots:
             combined_colored = _make_combined_grouped_plot(label_color_map_for_plot=label_color_map)
 
     agg = None
-    daily = _build_daily_aggregate(df, labels, df["_dt"])
-    if not daily.empty:
-        daily["DateStr"] = daily["Date"].dt.strftime("%Y-%m-%d")
-        date_order = sorted(daily["DateStr"].unique())
-
-        fig, ax = plt.subplots(figsize=(16, 6))
-        sns.set(style="white")
-        sns.boxplot(x="DateStr", y="Phrase Duration (ms)", data=daily, order=date_order, color="lightgray", fliersize=0, ax=ax)
-        sns.stripplot(x="DateStr", y="Phrase Duration (ms)", data=daily, order=date_order, jitter=0.25, size=3, alpha=0.6, ax=ax, color="#2E4845")
-
-        t_str = t_date.strftime("%Y-%m-%d")
-        if t_str in date_order:
-            idx = date_order.index(t_str)
-            ax.axvline(idx, color="red", ls="--", lw=1.2)
-
-        ax.set_xlabel("Recording Date")
-        ax.set_ylabel("Phrase Duration (s)")
-        _pretty_axes(ax, 90)
-        _apply_seconds_yaxis(ax)
-        if y_max_ms:
-            ax.set_ylim(0, float(y_max_ms))
-        ax.set_title(f"{animal_id} — Pre/Post Aggregate (per-day box + scatter)", fontsize=TITLE_FS)
-
-        fig.tight_layout()
-        agg = output_dir / f"{animal_id}_aggregate_pre_post_phrase_durations.png"
-        fig.savefig(agg, dpi=300, transparent=False)
-        if show_plots:
-            plt.show()
-        else:
-            plt.close(fig)
-    else:
-        print("[WARN] Aggregate: no durations found to plot.")
-
     agg3 = agg3_auto = agg3_pts = None
-    three_groups = []
-    group_defs = [(early_pre, "Early Pre"), (late_pre, "Late Pre"), (post_g, "Post")]
-    for part, label in group_defs:
-        if len(part):
-            vals = _collect_all_durations(part, labels)
-            if vals.size:
-                three_groups.append(pd.DataFrame({"Group": label, "Phrase Duration (ms)": vals}))
-    if three_groups:
-        tall3 = pd.concat(three_groups, ignore_index=True)
-        order = ["Early Pre", "Late Pre", "Post"]
-        xpos = {g: i for i, g in enumerate(order)}
-        med_map = {glabel: _per_syllable_medians(gdf, labels) for gdf, glabel in group_defs}
-        group_arrays = {g: tall3.loc[tall3["Group"] == g, "Phrase Duration (ms)"].to_numpy() for g in order}
-        kw_stat, kw_p = _try_kruskal([group_arrays[g] for g in order])
+    var_plot = None
+    var_boxscatter = None
+    agg3_var_pts = None
+    agg3_var_stats = None
 
-        pairs = list(combinations(order, 2))
-        raw_p = []
-        for a, b in pairs:
-            _, p = _try_mannwhitney(group_arrays[a], group_arrays[b])
-            raw_p.append(p)
-        adj_p = _p_adjust_bh(raw_p)
+    if make_box_plots:
+        agg = None
+        daily = _build_daily_aggregate(df, labels, df["_dt"])
+        if not daily.empty:
+            daily["DateStr"] = daily["Date"].dt.strftime("%Y-%m-%d")
+            date_order = sorted(daily["DateStr"].unique())
 
-        def _summary_text():
-            lines = [f"Kruskal–Wallis: H={kw_stat:.3g}, p={_fmt_p(kw_p)}"]
-            for (a, b), p_raw, p_adj in zip(pairs, raw_p, adj_p):
-                lines.append(f"{a} vs {b}: p(BH)={_fmt_p(p_adj)}  [{_stars(p_adj)}]")
-            return "\n".join(lines)
+            fig, ax = plt.subplots(figsize=(16, 6))
+            sns.set(style="white")
+            sns.boxplot(x="DateStr", y="Phrase Duration (ms)", data=daily, order=date_order, color="lightgray", fliersize=0, ax=ax)
+            sns.stripplot(x="DateStr", y="Phrase Duration (ms)", data=daily, order=date_order, jitter=0.25, size=3, alpha=0.6, ax=ax, color="#2E4845")
 
-        def _draw_three_box(ax, set_ylim: bool, title: str):
-            sns.boxplot(
-                x="Group",
-                y="Phrase Duration (ms)",
-                data=tall3,
-                order=order,
-                color="lightgray",
-                whis=(0, 100),
-                showfliers=False,
-                ax=ax,
-            )
-            for lbl in [str(x) for x in labels]:
-                xs, ys = [], []
-                for g in order:
-                    y = med_map.get(g, {}).get(lbl, None)
-                    if y is not None:
-                        xs.append(xpos[g])
-                        ys.append(y)
-                if xs:
-                    ax.plot(xs, ys, linestyle="--", linewidth=1, color="0.4", alpha=0.7, zorder=3)
-                    ax.scatter(xs, ys, s=28, edgecolor="white", linewidth=0.5, zorder=4)
-            ax.set_xlabel("")
+            t_str = t_date.strftime("%Y-%m-%d")
+            if t_str in date_order:
+                idx = date_order.index(t_str)
+                ax.axvline(idx, color="red", ls="--", lw=1.2)
+
+            ax.set_xlabel("Recording Date")
             ax.set_ylabel("Phrase Duration (s)")
-            _pretty_axes(ax, 0)
+            _pretty_axes(ax, 90)
             _apply_seconds_yaxis(ax)
-            if set_ylim and y_max_ms:
+            if y_max_ms:
                 ax.set_ylim(0, float(y_max_ms))
-            ax.set_title(title, fontsize=TITLE_FS)
-            ax.text(
+            ax.set_title("")
+
+            fig.tight_layout()
+            agg = output_dir / f"{animal_id}_aggregate_pre_post_phrase_durations.png"
+            fig.savefig(agg, dpi=300, transparent=False)
+            if show_plots:
+                plt.show()
+            else:
+                plt.close(fig)
+        else:
+            print("[WARN] Aggregate: no durations found to plot.")
+
+        agg3 = agg3_auto = agg3_pts = None
+        three_groups = []
+        group_defs = [(early_pre, "Early Pre"), (late_pre, "Late Pre"), (post_g, "Post")]
+        for part, label in group_defs:
+            if len(part):
+                vals = _collect_all_durations(part, labels)
+                if vals.size:
+                    three_groups.append(pd.DataFrame({"Group": label, "Phrase Duration (ms)": vals}))
+        if three_groups:
+            tall3 = pd.concat(three_groups, ignore_index=True)
+            order = ["Early Pre", "Late Pre", "Post"]
+            xpos = {g: i for i, g in enumerate(order)}
+            med_map = {glabel: _per_syllable_medians(gdf, labels) for gdf, glabel in group_defs}
+            group_arrays = {g: tall3.loc[tall3["Group"] == g, "Phrase Duration (ms)"].to_numpy() for g in order}
+            kw_stat, kw_p = _try_kruskal([group_arrays[g] for g in order])
+
+            pairs = list(combinations(order, 2))
+            raw_p = []
+            for a, b in pairs:
+                _, p = _try_mannwhitney(group_arrays[a], group_arrays[b])
+                raw_p.append(p)
+            adj_p = _p_adjust_bh(raw_p)
+
+            def _summary_text():
+                lines = [f"Kruskal–Wallis: H={kw_stat:.3g}, p={_fmt_p(kw_p)}"]
+                for (a, b), p_raw, p_adj in zip(pairs, raw_p, adj_p):
+                    lines.append(f"{a} vs {b}: p(BH)={_fmt_p(p_adj)}  [{_stars(p_adj)}]")
+                return "\n".join(lines)
+
+            def _draw_three_box(ax, set_ylim: bool, title: str):
+                sns.boxplot(
+                    x="Group",
+                    y="Phrase Duration (ms)",
+                    data=tall3,
+                    order=order,
+                    color="lightgray",
+                    whis=(0, 100),
+                    showfliers=False,
+                    ax=ax,
+                )
+                for lbl in [str(x) for x in labels]:
+                    xs, ys = [], []
+                    for g in order:
+                        y = med_map.get(g, {}).get(lbl, None)
+                        if y is not None:
+                            xs.append(xpos[g])
+                            ys.append(y)
+                    if xs:
+                        ax.plot(xs, ys, linestyle="--", linewidth=1, color="0.4", alpha=0.7, zorder=3)
+                        ax.scatter(xs, ys, s=28, edgecolor="white", linewidth=0.5, zorder=4)
+                ax.set_xlabel("")
+                ax.set_ylabel("Phrase Duration (s)")
+                _pretty_axes(ax, 0)
+                _apply_seconds_yaxis(ax)
+                if set_ylim and y_max_ms:
+                    ax.set_ylim(0, float(y_max_ms))
+                ax.set_title("")
+                ax.text(
+                    0.99,
+                    0.98,
+                    _summary_text(),
+                    transform=ax.transAxes,
+                    ha="right",
+                    va="top",
+                    fontsize=LABEL_FS - 2,
+                    bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="0.7", alpha=0.9),
+                )
+
+            fig1, ax1 = plt.subplots(figsize=(10, 6))
+            _draw_three_box(ax1, set_ylim=True, title=f"{animal_id} — Early/Late Pre vs Post (Syllable medians + boxes)")
+            fig1.tight_layout()
+            agg3 = output_dir / f"{animal_id}_aggregate_three_group_phrase_durations.png"
+            fig1.savefig(agg3, dpi=300, transparent=False)
+            if show_plots:
+                plt.show()
+            else:
+                plt.close(fig1)
+
+            fig2, ax2 = plt.subplots(figsize=(10, 6))
+            _draw_three_box(ax2, set_ylim=False, title=f"{animal_id} — Early/Late Pre vs Post (auto y-limits)")
+            fig2.tight_layout()
+            agg3_auto = output_dir / f"{animal_id}_aggregate_three_group_phrase_durations_auto_ylim.png"
+            fig2.savefig(agg3_auto, dpi=300, transparent=False)
+            if show_plots:
+                plt.show()
+            else:
+                plt.close(fig2)
+
+            rows_pts = []
+            for g in order:
+                m = med_map.get(g, {})
+                for lbl, y in m.items():
+                    rows_pts.append({"Group": g, "Syllable": str(lbl), "Phrase Duration (ms)": y})
+            tall3_pts = pd.DataFrame(rows_pts)
+
+            if not tall3_pts.empty:
+                fig3, ax3 = plt.subplots(figsize=(10, 6))
+                sns.set(style="white")
+                sns.boxplot(
+                    x="Group",
+                    y="Phrase Duration (ms)",
+                    data=tall3,
+                    order=order,
+                    color="lightgray",
+                    whis=(0, 100),
+                    showfliers=False,
+                    ax=ax3,
+                )
+                sns.stripplot(
+                    x="Group",
+                    y="Phrase Duration (ms)",
+                    data=tall3_pts,
+                    order=order,
+                    hue="Syllable",
+                    dodge=False,
+                    jitter=0.12,
+                    size=5,
+                    alpha=0.9,
+                    ax=ax3,
+                )
+                ax3.set_xlabel("")
+                ax3.set_ylabel("Phrase Duration (s)")
+                _pretty_axes(ax3, 0)
+                _apply_seconds_yaxis(ax3)
+                if y_max_ms:
+                    ax3.set_ylim(0, float(y_max_ms))
+                ax3.set_title("")
+                ax3.legend(title="Syllable", frameon=False, bbox_to_anchor=(1.02, 1), loc="upper left")
+                fig3.tight_layout()
+                agg3_pts = output_dir / f"{animal_id}_aggregate_three_group_phrase_durations_syllable_points.png"
+                fig3.savefig(agg3_pts, dpi=300, transparent=False)
+                if show_plots:
+                    plt.show()
+                else:
+                    plt.close(fig3)
+        else:
+            print("[WARN] Three-group aggregate: no durations found to plot.")
+
+        var_plot = None
+        var_boxscatter = None
+        agg3_var_pts = None
+        agg3_var_stats = None
+
+        var_maps: Dict[str, Dict[str, float]] = {
+            "Early Pre": _per_syllable_variances(early_pre, labels) if len(early_pre) else {},
+            "Late Pre": _per_syllable_variances(late_pre, labels) if len(late_pre) else {},
+            "Post": _per_syllable_variances(post_g, labels) if len(post_g) else {},
+        }
+
+        rows_var = []
+        def _sort_key(lbl: str):
+            try:
+                return (0, int(lbl))
+            except Exception:
+                return (1, lbl)
+
+        syllables_sorted = sorted({str(l) for l in labels}, key=_sort_key)
+
+        for g in ["Early Pre", "Late Pre", "Post"]:
+            m = var_maps.get(g, {})
+            for lbl in syllables_sorted:
+                if lbl in m:
+                    rows_var.append({"Syllable": lbl, "Variance (ms^2)": m[lbl], "Group": g})
+
+        if rows_var:
+            df_var = pd.DataFrame(rows_var)
+
+            fig_b, ax_b = plt.subplots(figsize=(12, 6))
+            sns.set(style="white")
+            sns.boxplot(x="Syllable", y="Variance (ms^2)", data=df_var, order=syllables_sorted, color="lightgray", fliersize=0, ax=ax_b)
+            sns.stripplot(x="Syllable", y="Variance (ms^2)", data=df_var, order=syllables_sorted, hue="Group", dodge=True, jitter=0.15, size=5, alpha=0.9, ax=ax_b)
+            ax_b.set_xlabel("Syllable Label")
+            ax_b.set_ylabel("Variance of Phrase Duration (ms²)")
+            ax_b.set_title("")
+            _pretty_axes(ax_b, x_rotation=0)
+            ax_b.legend(title="Group", frameon=False, bbox_to_anchor=(1.02, 1), loc="upper left")
+            fig_b.tight_layout()
+            var_boxscatter = output_dir / f"{animal_id}_per_syllable_variance_box_scatter.png"
+            fig_b.savefig(var_boxscatter, dpi=300, transparent=False)
+            if show_plots:
+                plt.show()
+            else:
+                plt.close(fig_b)
+
+            order = ["Early Pre", "Late Pre", "Post"]
+            fig_g, ax_g = plt.subplots(figsize=(10, 6))
+            sns.set(style="white")
+            sns.boxplot(x="Group", y="Variance (ms^2)", data=df_var, order=order, color="lightgray", whis=(0, 100), showfliers=False, ax=ax_g)
+            sns.stripplot(x="Group", y="Variance (ms^2)", data=df_var, order=order, hue="Syllable", dodge=False, jitter=0.12, size=5, alpha=0.9, ax=ax_g)
+            ax_g.set_xlabel("")
+            ax_g.set_ylabel("Variance of Phrase Duration (ms²)")
+            ax_g.set_title("")
+            _pretty_axes(ax_g, 0)
+            ax_g.legend(title="Syllable", frameon=False, bbox_to_anchor=(1.02, 1), loc="upper left")
+            ax_g.set_ylim(0, 2.0e7)
+            fig_g.tight_layout()
+            agg3_var_pts = output_dir / f"{animal_id}_aggregate_three_group_variance_syllable_points.png"
+            fig_g.savefig(agg3_var_pts, dpi=300, transparent=False)
+            if show_plots:
+                plt.show()
+            else:
+                plt.close(fig_g)
+
+            fig_s, ax_s = plt.subplots(figsize=(10, 6))
+            sns.set(style="white")
+            sns.boxplot(x="Group", y="Variance (ms^2)", data=df_var, order=order, color="lightgray", whis=(0, 100), showfliers=False, ax=ax_s)
+            sns.stripplot(x="Group", y="Variance (ms^2)", data=df_var, order=order, dodge=False, jitter=0.15, size=5, alpha=0.9, ax=ax_s)
+            ax_s.set_xlabel("")
+            ax_s.set_ylabel("Variance of Phrase Duration (ms²)")
+            ax_s.set_title("")
+            _pretty_axes(ax_s, 0)
+            ax_s.set_ylim(0, 2.0e7)
+
+            var_arrays = {g: df_var.loc[df_var["Group"] == g, "Variance (ms^2)"].to_numpy() for g in order}
+            kw_stat_v, kw_p_v = _try_kruskal([var_arrays[g] for g in order])
+            pairs = list(combinations(order, 2))
+            raw_p_v = []
+            for a, b in pairs:
+                _, pv = _try_mannwhitney(var_arrays[a], var_arrays[b])
+                raw_p_v.append(pv)
+            adj_p_v = _p_adjust_bh(raw_p_v)
+
+            lines = [f"Kruskal–Wallis: H={kw_stat_v:.3g}, p={_fmt_p(kw_p_v)}"]
+            for (a, b), p_adj in zip(pairs, adj_p_v):
+                lines.append(f"{a} vs {b}: p(BH)={_fmt_p(p_adj)}  [{_stars(p_adj)}]")
+            ax_s.text(
                 0.99,
                 0.98,
-                _summary_text(),
-                transform=ax.transAxes,
+                "\n".join(lines),
+                transform=ax_s.transAxes,
                 ha="right",
                 va="top",
                 fontsize=LABEL_FS - 2,
                 bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="0.7", alpha=0.9),
             )
 
-        fig1, ax1 = plt.subplots(figsize=(10, 6))
-        _draw_three_box(ax1, set_ylim=True, title=f"{animal_id} — Early/Late Pre vs Post (Syllable medians + boxes)")
-        fig1.tight_layout()
-        agg3 = output_dir / f"{animal_id}_aggregate_three_group_phrase_durations.png"
-        fig1.savefig(agg3, dpi=300, transparent=False)
-        if show_plots:
-            plt.show()
-        else:
-            plt.close(fig1)
-
-        fig2, ax2 = plt.subplots(figsize=(10, 6))
-        _draw_three_box(ax2, set_ylim=False, title=f"{animal_id} — Early/Late Pre vs Post (auto y-limits)")
-        fig2.tight_layout()
-        agg3_auto = output_dir / f"{animal_id}_aggregate_three_group_phrase_durations_auto_ylim.png"
-        fig2.savefig(agg3_auto, dpi=300, transparent=False)
-        if show_plots:
-            plt.show()
-        else:
-            plt.close(fig2)
-
-        rows_pts = []
-        for g in order:
-            m = med_map.get(g, {})
-            for lbl, y in m.items():
-                rows_pts.append({"Group": g, "Syllable": str(lbl), "Phrase Duration (ms)": y})
-        tall3_pts = pd.DataFrame(rows_pts)
-
-        if not tall3_pts.empty:
-            fig3, ax3 = plt.subplots(figsize=(10, 6))
-            sns.set(style="white")
-            sns.boxplot(
-                x="Group",
-                y="Phrase Duration (ms)",
-                data=tall3,
-                order=order,
-                color="lightgray",
-                whis=(0, 100),
-                showfliers=False,
-                ax=ax3,
-            )
-            sns.stripplot(
-                x="Group",
-                y="Phrase Duration (ms)",
-                data=tall3_pts,
-                order=order,
-                hue="Syllable",
-                dodge=False,
-                jitter=0.12,
-                size=5,
-                alpha=0.9,
-                ax=ax3,
-            )
-            ax3.set_xlabel("")
-            ax3.set_ylabel("Phrase Duration (s)")
-            _pretty_axes(ax3, 0)
-            _apply_seconds_yaxis(ax3)
-            if y_max_ms:
-                ax3.set_ylim(0, float(y_max_ms))
-            ax3.set_title(f"{animal_id} — Early/Late Pre vs Post (boxes + syllable points)", fontsize=TITLE_FS)
-            ax3.legend(title="Syllable", frameon=False, bbox_to_anchor=(1.02, 1), loc="upper left")
-            fig3.tight_layout()
-            agg3_pts = output_dir / f"{animal_id}_aggregate_three_group_phrase_durations_syllable_points.png"
-            fig3.savefig(agg3_pts, dpi=300, transparent=False)
+            fig_s.tight_layout()
+            agg3_var_stats = output_dir / f"{animal_id}_aggregate_three_group_variance_box_scatter_STATS.png"
+            fig_s.savefig(agg3_var_stats, dpi=300, transparent=False)
             if show_plots:
                 plt.show()
             else:
-                plt.close(fig3)
+                plt.close(fig_s)
+        else:
+            print("[WARN] Per-syllable variance plots: no variance data available.")
+
     else:
-        print("[WARN] Three-group aggregate: no durations found to plot.")
-
-    var_plot = None
-    var_boxscatter = None
-    agg3_var_pts = None
-    agg3_var_stats = None
-
-    var_maps: Dict[str, Dict[str, float]] = {
-        "Early Pre": _per_syllable_variances(early_pre, labels) if len(early_pre) else {},
-        "Late Pre": _per_syllable_variances(late_pre, labels) if len(late_pre) else {},
-        "Post": _per_syllable_variances(post_g, labels) if len(post_g) else {},
-    }
-
-    rows_var = []
-    def _sort_key(lbl: str):
-        try:
-            return (0, int(lbl))
-        except Exception:
-            return (1, lbl)
-
-    syllables_sorted = sorted({str(l) for l in labels}, key=_sort_key)
-
-    for g in ["Early Pre", "Late Pre", "Post"]:
-        m = var_maps.get(g, {})
-        for lbl in syllables_sorted:
-            if lbl in m:
-                rows_var.append({"Syllable": lbl, "Variance (ms^2)": m[lbl], "Group": g})
-
-    if rows_var:
-        df_var = pd.DataFrame(rows_var)
-
-        fig_b, ax_b = plt.subplots(figsize=(12, 6))
-        sns.set(style="white")
-        sns.boxplot(x="Syllable", y="Variance (ms^2)", data=df_var, order=syllables_sorted, color="lightgray", fliersize=0, ax=ax_b)
-        sns.stripplot(x="Syllable", y="Variance (ms^2)", data=df_var, order=syllables_sorted, hue="Group", dodge=True, jitter=0.15, size=5, alpha=0.9, ax=ax_b)
-        ax_b.set_xlabel("Syllable Label")
-        ax_b.set_ylabel("Variance of Phrase Duration (ms²)")
-        ax_b.set_title(f"{animal_id} — Per-Syllable Variance (box + scatter by group)", fontsize=TITLE_FS)
-        _pretty_axes(ax_b, x_rotation=0)
-        ax_b.legend(title="Group", frameon=False, bbox_to_anchor=(1.02, 1), loc="upper left")
-        fig_b.tight_layout()
-        var_boxscatter = output_dir / f"{animal_id}_per_syllable_variance_box_scatter.png"
-        fig_b.savefig(var_boxscatter, dpi=300, transparent=False)
-        if show_plots:
-            plt.show()
-        else:
-            plt.close(fig_b)
-
-        order = ["Early Pre", "Late Pre", "Post"]
-        fig_g, ax_g = plt.subplots(figsize=(10, 6))
-        sns.set(style="white")
-        sns.boxplot(x="Group", y="Variance (ms^2)", data=df_var, order=order, color="lightgray", whis=(0, 100), showfliers=False, ax=ax_g)
-        sns.stripplot(x="Group", y="Variance (ms^2)", data=df_var, order=order, hue="Syllable", dodge=False, jitter=0.12, size=5, alpha=0.9, ax=ax_g)
-        ax_g.set_xlabel("")
-        ax_g.set_ylabel("Variance of Phrase Duration (ms²)")
-        ax_g.set_title(f"{animal_id} — Early/Late Pre vs Post (variance: boxes + syllable points)", fontsize=TITLE_FS)
-        _pretty_axes(ax_g, 0)
-        ax_g.legend(title="Syllable", frameon=False, bbox_to_anchor=(1.02, 1), loc="upper left")
-        ax_g.set_ylim(0, 2.0e7)
-        fig_g.tight_layout()
-        agg3_var_pts = output_dir / f"{animal_id}_aggregate_three_group_variance_syllable_points.png"
-        fig_g.savefig(agg3_var_pts, dpi=300, transparent=False)
-        if show_plots:
-            plt.show()
-        else:
-            plt.close(fig_g)
-
-        fig_s, ax_s = plt.subplots(figsize=(10, 6))
-        sns.set(style="white")
-        sns.boxplot(x="Group", y="Variance (ms^2)", data=df_var, order=order, color="lightgray", whis=(0, 100), showfliers=False, ax=ax_s)
-        sns.stripplot(x="Group", y="Variance (ms^2)", data=df_var, order=order, dodge=False, jitter=0.15, size=5, alpha=0.9, ax=ax_s)
-        ax_s.set_xlabel("")
-        ax_s.set_ylabel("Variance of Phrase Duration (ms²)")
-        ax_s.set_title(f"{animal_id} — Early/Late Pre vs Post (variance: boxes + jitter + stats)", fontsize=TITLE_FS)
-        _pretty_axes(ax_s, 0)
-        ax_s.set_ylim(0, 2.0e7)
-
-        var_arrays = {g: df_var.loc[df_var["Group"] == g, "Variance (ms^2)"].to_numpy() for g in order}
-        kw_stat_v, kw_p_v = _try_kruskal([var_arrays[g] for g in order])
-        pairs = list(combinations(order, 2))
-        raw_p_v = []
-        for a, b in pairs:
-            _, pv = _try_mannwhitney(var_arrays[a], var_arrays[b])
-            raw_p_v.append(pv)
-        adj_p_v = _p_adjust_bh(raw_p_v)
-
-        lines = [f"Kruskal–Wallis: H={kw_stat_v:.3g}, p={_fmt_p(kw_p_v)}"]
-        for (a, b), p_adj in zip(pairs, adj_p_v):
-            lines.append(f"{a} vs {b}: p(BH)={_fmt_p(p_adj)}  [{_stars(p_adj)}]")
-        ax_s.text(
-            0.99,
-            0.98,
-            "\n".join(lines),
-            transform=ax_s.transAxes,
-            ha="right",
-            va="top",
-            fontsize=LABEL_FS - 2,
-            bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="0.7", alpha=0.9),
-        )
-
-        fig_s.tight_layout()
-        agg3_var_stats = output_dir / f"{animal_id}_aggregate_three_group_variance_box_scatter_STATS.png"
-        fig_s.savefig(agg3_var_stats, dpi=300, transparent=False)
-        if show_plots:
-            plt.show()
-        else:
-            plt.close(fig_s)
-    else:
-        print("[WARN] Per-syllable variance plots: no variance data available.")
+        print("[INFO] Skipping aggregate/box/variance plots because make_box_plots=False.")
 
     stats_df = _build_phrase_duration_stats_df(early_pre, late_pre, post_g, labels)
 
@@ -1154,6 +1598,13 @@ def run_phrase_duration_pre_vs_post_grouped(
         early_pre_colored_path=epc,
         late_pre_colored_path=lpc,
         post_colored_path=poc,
+        compact_grouped_syllable_points_path=compact_grouped,
+        compact_grouped_syllable_points_no_significance_path=compact_grouped_no_sig,
+        compact_grouped_significance_path=compact_significance_path,
+        compact_grouped_syllable_points_no_title_no_xlabels_path=compact_grouped_no_title_no_xlabels,
+        compact_grouped_syllable_points_large_xticks_path=compact_grouped_large_xticks,
+        compact_grouped_syllable_points_sorted_by_post_variance_path=compact_grouped_sorted_by_post_variance,
+        compact_grouped_syllable_points_sorted_by_post_variance_group_colors_path=compact_grouped_sorted_by_post_variance_group_colors,
         combined_grouped_path=combined,
         combined_grouped_colored_path=combined_colored,
         aggregate_path=agg,
@@ -1167,9 +1618,133 @@ def run_phrase_duration_pre_vs_post_grouped(
         syllable_labels=[str(x) for x in labels],
         y_limits=(y_min, y_max),
         phrase_duration_stats_df=stats_df,
+        compact_grouped_significance_df=compact_significance_df,
     )
 
 # ──────────────────────────────────────────────────────────────────────────────
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Metadata Excel helpers
+# ──────────────────────────────────────────────────────────────────────────────
+def _coerce_sheet_name(sheet_name: Optional[Union[str, int]]) -> Optional[Union[str, int]]:
+    if sheet_name is None:
+        return None
+    if isinstance(sheet_name, int):
+        return sheet_name
+    s = str(sheet_name).strip()
+    if s == "":
+        return None
+    if s.isdigit():
+        return int(s)
+    return s
+
+
+def _find_column_case_insensitive(df: pd.DataFrame, requested: str) -> Optional[str]:
+    if requested in df.columns:
+        return requested
+    requested_norm = str(requested).strip().lower()
+    for col in df.columns:
+        if str(col).strip().lower() == requested_norm:
+            return col
+    return None
+
+
+def _load_metadata_dataframe_from_excel(
+    excel_path: Union[str, Path],
+    *,
+    sheet_name: Optional[Union[str, int]] = None,
+    id_col: str = "Animal ID",
+    treatment_date_col: str = "Treatment date",
+) -> Tuple[pd.DataFrame, str, str, Union[str, int]]:
+    """
+    Load the metadata sheet containing animal IDs and treatment dates.
+
+    If sheet_name is None, search all sheets and use the first one containing
+    the requested ID and treatment-date columns.
+    """
+    excel_path = Path(excel_path)
+    sheet_name = _coerce_sheet_name(sheet_name)
+
+    if sheet_name is not None:
+        df = pd.read_excel(excel_path, sheet_name=sheet_name)
+        actual_id_col = _find_column_case_insensitive(df, id_col)
+        actual_treatment_col = _find_column_case_insensitive(df, treatment_date_col)
+        if actual_id_col is None or actual_treatment_col is None:
+            raise ValueError(
+                f"Sheet {sheet_name!r} in {excel_path} does not contain columns "
+                f"{id_col!r} and {treatment_date_col!r}. Columns found: {list(df.columns)}"
+            )
+        return df, actual_id_col, actual_treatment_col, sheet_name
+
+    sheets = pd.read_excel(excel_path, sheet_name=None)
+    for this_sheet_name, df in sheets.items():
+        actual_id_col = _find_column_case_insensitive(df, id_col)
+        actual_treatment_col = _find_column_case_insensitive(df, treatment_date_col)
+        if actual_id_col is not None and actual_treatment_col is not None:
+            return df, actual_id_col, actual_treatment_col, this_sheet_name
+
+    sheet_summaries = {name: list(df.columns) for name, df in sheets.items()}
+    raise ValueError(
+        f"Could not find a metadata sheet in {excel_path} containing columns "
+        f"{id_col!r} and {treatment_date_col!r}. Sheets/columns found: {sheet_summaries}"
+    )
+
+
+def _lookup_treatment_date_from_metadata_excel(
+    excel_path: Union[str, Path],
+    animal_id: str,
+    *,
+    sheet_name: Optional[Union[str, int]] = None,
+    id_col: str = "Animal ID",
+    treatment_date_col: str = "Treatment date",
+) -> Tuple[Union[str, pd.Timestamp], Union[str, int]]:
+    """
+    Find one animal's treatment date in the metadata Excel file.
+    """
+    df, actual_id_col, actual_treatment_col, used_sheet = _load_metadata_dataframe_from_excel(
+        excel_path,
+        sheet_name=sheet_name,
+        id_col=id_col,
+        treatment_date_col=treatment_date_col,
+    )
+
+    animal_norm = str(animal_id).strip().upper()
+    ids = df[actual_id_col].astype(str).str.strip().str.upper()
+    matches = df.loc[ids == animal_norm]
+
+    if matches.empty:
+        available = sorted(df[actual_id_col].dropna().astype(str).unique().tolist())
+        preview = available[:20]
+        raise ValueError(
+            f"Animal ID {animal_id!r} was not found in {excel_path} sheet {used_sheet!r}. "
+            f"First available IDs: {preview}"
+        )
+
+    vals = matches[actual_treatment_col].dropna()
+    if vals.empty:
+        raise ValueError(
+            f"Animal ID {animal_id!r} was found in {excel_path} sheet {used_sheet!r}, "
+            f"but it has no non-empty treatment date in column {actual_treatment_col!r}."
+        )
+
+    return vals.iloc[0], used_sheet
+
+
+def _infer_animal_id_from_cli_paths(
+    *,
+    animal_id: Optional[str],
+    annotations: Optional[str],
+    premerged: Optional[str],
+) -> Optional[str]:
+    if animal_id:
+        return str(animal_id)
+    for path_text in [annotations, premerged]:
+        if path_text:
+            stem = Path(path_text).stem
+            if stem:
+                return stem.split("_")[0]
+    return None
+
 # Batch wrapper
 # ──────────────────────────────────────────────────────────────────────────────
 def run_batch_phrase_duration_from_excel(
@@ -1188,20 +1763,23 @@ def run_batch_phrase_duration_from_excel(
     show_plots: bool = True,
     fixed_label_colors_json: Optional[Union[str, Path]] = None,
     make_colored_violin_plots: bool = False,
+    make_box_plots: bool = False,
 ) -> Dict[str, GroupedPlotsResult]:
     excel_path = Path(excel_path)
     json_root = Path(json_root)
 
-    meta_df = pd.read_excel(excel_path, sheet_name=sheet_name)
-
-    if id_col not in meta_df.columns:
-        raise ValueError(f"Column '{id_col}' not found in Excel file: {excel_path}")
-    if treatment_date_col not in meta_df.columns:
-        raise ValueError(f"Column '{treatment_date_col}' not found in Excel file: {excel_path}")
+    meta_df, actual_id_col, actual_treatment_date_col, used_sheet = _load_metadata_dataframe_from_excel(
+        excel_path,
+        sheet_name=sheet_name,
+        id_col=id_col,
+        treatment_date_col=treatment_date_col,
+    )
+    meta_df = _rename_lesion_hit_type_labels_in_df(meta_df)
+    print(f"[INFO] Using metadata sheet {used_sheet!r} from {excel_path}")
 
     animal_to_tdate: Dict[str, Union[str, pd.Timestamp, None]] = {}
-    for aid, group in meta_df.groupby(id_col):
-        vals = group[treatment_date_col].dropna().unique()
+    for aid, group in meta_df.groupby(actual_id_col):
+        vals = group[actual_treatment_date_col].dropna().unique()
         tdate = vals[0] if len(vals) > 0 else None
         animal_to_tdate[str(aid)] = tdate
 
@@ -1263,6 +1841,7 @@ def run_batch_phrase_duration_from_excel(
             animal_id_override=animal_id,
             fixed_label_colors_json=fixed_label_colors_json,
             make_colored_violin_plots=make_colored_violin_plots,
+            make_box_plots=make_box_plots,
         )
 
         results[animal_id] = res
@@ -1290,7 +1869,37 @@ def _build_arg_parser():
     p.add_argument("--repeat-gap-ms", type=float, default=10.0)
     p.add_argument("--repeat-gap-inclusive", action="store_true")
     p.add_argument("--outdir", type=str, default=None, help="Output directory")
-    p.add_argument("--treatment-date", type=str, required=True)
+    p.add_argument(
+        "--treatment-date",
+        type=str,
+        default=None,
+        help="Treatment/lesion date. If omitted, use --metadata-excel and --animal-id to read it from metadata.",
+    )
+    p.add_argument(
+        "--metadata-excel",
+        type=str,
+        default=None,
+        help="Metadata Excel file containing Animal ID and Treatment date columns.",
+    )
+    p.add_argument(
+        "--metadata-sheet",
+        type=str,
+        default=None,
+        help="Optional metadata sheet name or index. If omitted, all sheets are searched.",
+    )
+    p.add_argument("--metadata-id-col", type=str, default="Animal ID")
+    p.add_argument("--metadata-treatment-date-col", type=str, default="Treatment date")
+    p.add_argument(
+        "--batch-from-metadata",
+        action="store_true",
+        help="Run all animals listed in the metadata Excel file. Requires --metadata-excel and --json-root.",
+    )
+    p.add_argument(
+        "--json-root",
+        type=str,
+        default=None,
+        help="Root folder to search for decoded_database.json and song_detection.json files in batch mode.",
+    )
     p.add_argument("--grouping_mode", type=str, default="auto_balance", choices=["explicit", "auto_balance"])
     p.add_argument("--early_group_size", type=int, default=100)
     p.add_argument("--late_group_size", type=int, default=100)
@@ -1300,6 +1909,11 @@ def _build_arg_parser():
     p.add_argument("--animal-id", type=str, default=None)
     p.add_argument("--fixed-label-colors-json", type=str, default=None)
     p.add_argument("--make-colored-violins", action="store_true")
+    p.add_argument(
+        "--make-box-plots",
+        action="store_true",
+        help="Also generate aggregate/box/variance plots. Default is to skip these and make violin/compact plots only.",
+    )
     p.add_argument("--no-show", action="store_true")
     return p
 
@@ -1307,6 +1921,65 @@ def main():
     p = _build_arg_parser()
     args = p.parse_args()
     restrict = [str(x) for x in args.labels] if args.labels else None
+    metadata_sheet = _coerce_sheet_name(args.metadata_sheet)
+
+    if args.batch_from_metadata:
+        if args.metadata_excel is None:
+            raise ValueError("--batch-from-metadata requires --metadata-excel")
+        if args.json_root is None:
+            raise ValueError("--batch-from-metadata requires --json-root")
+
+        results = run_batch_phrase_duration_from_excel(
+            excel_path=args.metadata_excel,
+            json_root=args.json_root,
+            sheet_name=metadata_sheet,
+            id_col=args.metadata_id_col,
+            treatment_date_col=args.metadata_treatment_date_col,
+            grouping_mode=args.grouping_mode,
+            early_group_size=args.early_group_size,
+            late_group_size=args.late_group_size,
+            post_group_size=args.post_group_size,
+            restrict_to_labels=restrict,
+            y_max_ms=args.y_max_ms,
+            show_plots=not args.no_show,
+            fixed_label_colors_json=args.fixed_label_colors_json,
+            make_colored_violin_plots=args.make_colored_violins,
+            make_box_plots=args.make_box_plots,
+        )
+        print(f"\n[OK] Batch complete. Animals processed: {len(results)}")
+        for animal_id, res in results.items():
+            print(f"  {animal_id}: compact grouped = {res.compact_grouped_syllable_points_path}")
+            print(f"  {animal_id}: compact no sig  = {res.compact_grouped_syllable_points_no_significance_path}")
+        return
+
+    treatment_date = args.treatment_date
+    animal_id_for_lookup = _infer_animal_id_from_cli_paths(
+        animal_id=args.animal_id,
+        annotations=args.annotations,
+        premerged=args.premerged,
+    )
+
+    if treatment_date is None:
+        if args.metadata_excel is None:
+            raise ValueError(
+                "No --treatment-date was provided. Provide either --treatment-date directly "
+                "or provide --metadata-excel plus --animal-id so the treatment date can be read from Excel."
+            )
+        if animal_id_for_lookup is None:
+            raise ValueError(
+                "Could not infer animal ID for metadata lookup. Provide --animal-id."
+            )
+        treatment_date, used_sheet = _lookup_treatment_date_from_metadata_excel(
+            args.metadata_excel,
+            animal_id_for_lookup,
+            sheet_name=metadata_sheet,
+            id_col=args.metadata_id_col,
+            treatment_date_col=args.metadata_treatment_date_col,
+        )
+        print(
+            f"[INFO] Read treatment_date={treatment_date} for animal {animal_id_for_lookup} "
+            f"from {args.metadata_excel} sheet {used_sheet!r}"
+        )
 
     res = run_phrase_duration_pre_vs_post_grouped(
         premerged_annotations_df=None,
@@ -1319,7 +1992,7 @@ def main():
         repeat_gap_ms=args.repeat_gap_ms,
         repeat_gap_inclusive=args.repeat_gap_inclusive,
         output_dir=args.outdir,
-        treatment_date=args.treatment_date,
+        treatment_date=treatment_date,
         grouping_mode=args.grouping_mode,
         early_group_size=args.early_group_size,
         late_group_size=args.late_group_size,
@@ -1327,9 +2000,10 @@ def main():
         restrict_to_labels=restrict,
         y_max_ms=args.y_max_ms,
         show_plots=not args.no_show,
-        animal_id_override=args.animal_id,
+        animal_id_override=animal_id_for_lookup,
         fixed_label_colors_json=args.fixed_label_colors_json,
         make_colored_violin_plots=args.make_colored_violins,
+        make_box_plots=args.make_box_plots,
     )
 
     print("\n[OK] Plots saved:")
@@ -1339,6 +2013,9 @@ def main():
     print("  early_pre colored:", res.early_pre_colored_path)
     print("  late_pre colored :", res.late_pre_colored_path)
     print("  post colored     :", res.post_colored_path)
+    print("  compact grouped  :", res.compact_grouped_syllable_points_path)
+    print("  compact no sig   :", res.compact_grouped_syllable_points_no_significance_path)
+    print("  compact sig csv  :", res.compact_grouped_significance_path)
     print("  combined grouped :", res.combined_grouped_path)
     print("  combined colored :", res.combined_grouped_colored_path)
     print("  aggregate:", res.aggregate_path)
@@ -1378,11 +2055,15 @@ res = pdpg.run_phrase_duration_pre_vs_post_grouped(
     show_plots=True,
     fixed_label_colors_json=color_json,
     make_colored_violin_plots=True,
+    make_box_plots=False,
 )
 
 print(res.early_pre_colored_path)
 print(res.late_pre_colored_path)
 print(res.post_colored_path)
+print(res.compact_grouped_syllable_points_path)
+print(res.compact_grouped_significance_path)
+print(res.compact_grouped_significance_df.head())
 print(res.combined_grouped_colored_path)
 
 """
