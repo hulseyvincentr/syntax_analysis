@@ -27,8 +27,9 @@ Main questions
    - post_over_pre_rms_radius_equal_groups
    - post_over_pre_rms_radius_umap_equal_groups
 
-Also keeps direct paired pre-vs-post comparisons for the equal-group outputs where both
-pre and post columns exist in the batch summary:
+Also keeps direct paired pre-vs-post comparisons within each lesion hit type for the equal-group outputs where both
+pre and post columns exist in the batch summary. For each paired plot, this version saves both
+the original paired-line plot and a second boxplots-only figure with no individual points or connecting lines:
 - Bhattacharyya coefficient: pre early-vs-late vs post early-vs-late
 - RMS radius in latent space
 - RMS radius in UMAP space
@@ -55,9 +56,11 @@ out_dir/
 
   paired_cluster_level/
     paired_<metric_name>_cluster_level_pre_vs_post_grouped_by_hit_type.png
+    paired_<metric_name>_cluster_level_pre_vs_post_grouped_by_hit_type_boxplots_only.png
 
   paired_bird_level_mean/
     paired_<metric_name>_bird_mean_pre_vs_post_grouped_by_hit_type.png
+    paired_<metric_name>_bird_mean_pre_vs_post_grouped_by_hit_type_boxplots_only.png
 
   stats/
     cluster_level_stats.csv
@@ -87,10 +90,6 @@ except Exception:
     _HAVE_SCIPY = False
 
 
-# ----------------------------
-# Defaults
-# ----------------------------
-
 DEFAULT_METRICS = [
     "bc_pre_vs_post_equal_groups",
     "bc_pre_early_vs_late_equal_groups",
@@ -109,10 +108,10 @@ PAIRED_METRIC_SPECS = [
         "ylabel": "Bhattacharyya coefficient (early vs late, equal groups)",
     },
     {
-        "name": "rms_radius_raw_equal_groups",
+        "name": "rms_radius_TweetyBERT_latent_equal_groups",
         "pre_col": "pre_rms_radius_raw_equal_groups",
         "post_col": "post_rms_radius_raw_equal_groups",
-        "ylabel": "RMS radius (latent space, equal groups)",
+        "ylabel": "RMS radius (TweetyBERT latent space, equal groups)",
     },
     {
         "name": "rms_radius_umap_equal_groups",
@@ -128,10 +127,54 @@ DEFAULT_HIT_TYPE_ORDER = [
     "Medial/Lateral visible + large lesion",
 ]
 
+COLOR_GROUP_ORDER = [
+    "sham saline injection",
+    "Area X visible (Lateral only)",
+    "Area X visible (Medial+Lateral hit)",
+    "large lesion Area X not visible",
+]
 
-# ----------------------------
-# Utilities
-# ----------------------------
+COLOR_BY_GROUP = {
+    "sham saline injection": "#ff1a1a",
+    "Area X visible (Lateral only)": "#c4b5fd",
+    "Area X visible (Medial+Lateral hit)": "#6a3d9a",
+    "large lesion Area X not visible": "#000000",
+    "unknown": "#808080",
+}
+
+
+COLUMN_DISPLAY_ALIASES = {
+    "centroid_shift_raw_equal_groups": "centroid_shift_TweetyBERT_latent_equal_groups",
+    "pre_rms_radius_raw_equal_groups": "pre_rms_radius_TweetyBERT_latent_equal_groups",
+    "post_rms_radius_raw_equal_groups": "post_rms_radius_TweetyBERT_latent_equal_groups",
+    "post_over_pre_rms_radius_equal_groups": "post_over_pre_rms_radius_TweetyBERT_latent_equal_groups",
+    "pre_trace_cov_raw_equal_groups": "pre_trace_cov_TweetyBERT_latent_equal_groups",
+    "post_trace_cov_raw_equal_groups": "post_trace_cov_TweetyBERT_latent_equal_groups",
+    "post_over_pre_trace_cov_equal_groups": "post_over_pre_trace_cov_TweetyBERT_latent_equal_groups",
+}
+
+COLUMN_YLABEL_ALIASES = {
+    "bc_pre_vs_post_equal_groups": "Bhattacharyya coefficient (pre vs post, equal groups)",
+    "bc_pre_early_vs_late_equal_groups": "Bhattacharyya coefficient (pre early vs late, equal groups)",
+    "bc_post_early_vs_late_equal_groups": "Bhattacharyya coefficient (post early vs late, equal groups)",
+    "centroid_shift_raw_equal_groups": "Centroid shift (TweetyBERT latent space, equal groups)",
+    "centroid_shift_umap_equal_groups": "Centroid shift (UMAP space, equal groups)",
+    "post_over_pre_rms_radius_equal_groups": "Post / pre RMS radius (TweetyBERT latent space, equal groups)",
+    "post_over_pre_rms_radius_umap_equal_groups": "Post / pre RMS radius (UMAP space, equal groups)",
+    "pre_rms_radius_raw_equal_groups": "Pre RMS radius (TweetyBERT latent space, equal groups)",
+    "post_rms_radius_raw_equal_groups": "Post RMS radius (TweetyBERT latent space, equal groups)",
+    "pre_rms_radius_umap_equal_groups": "Pre RMS radius (UMAP space, equal groups)",
+    "post_rms_radius_umap_equal_groups": "Post RMS radius (UMAP space, equal groups)",
+}
+
+
+def _display_metric_name(metric: str) -> str:
+    return COLUMN_DISPLAY_ALIASES.get(metric, metric)
+
+
+def _display_ylabel(metric: str) -> str:
+    return COLUMN_YLABEL_ALIASES.get(metric, _display_metric_name(metric))
+
 
 def _safe_mkdir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
@@ -158,12 +201,6 @@ def _normalize_text(s: str) -> str:
 
 
 def _collapse_hit_type(raw_hit_type: str) -> str:
-    """
-    Collapse lesion hit types into:
-      - sham saline injection
-      - Area X visible (single hit)
-      - Medial/Lateral visible + large lesion
-    """
     norm = _normalize_text(raw_hit_type)
 
     if "sham" in norm:
@@ -184,12 +221,49 @@ def _collapse_hit_type(raw_hit_type: str) -> str:
     return str(raw_hit_type)
 
 
+def _canonical_color_group(raw_hit_type: str) -> str:
+    norm = _normalize_text(raw_hit_type)
+
+    if "sham" in norm:
+        return "sham saline injection"
+
+    if "medial" in norm and "lateral" in norm:
+        return "Area X visible (Medial+Lateral hit)"
+
+    if "singlehit" in norm:
+        return "Area X visible (Lateral only)"
+
+    if "lateralonly" in norm:
+        return "Area X visible (Lateral only)"
+
+    if ("lateral" in norm) and ("medial" not in norm) and ("large" not in norm) and ("notvisible" not in norm):
+        return "Area X visible (Lateral only)"
+
+    if ("large" in norm and "lesion" in norm) or ("notvisible" in norm):
+        return "large lesion Area X not visible"
+
+    return "unknown"
+
+
+def _color_for_group(group: str) -> str:
+    return COLOR_BY_GROUP.get(str(group), COLOR_BY_GROUP["unknown"])
+
+
 def _infer_hit_type_order(values: Sequence[str]) -> List[str]:
     vals = [str(v) for v in values if pd.notna(v)]
     present = list(dict.fromkeys(vals))
     ordered = [v for v in DEFAULT_HIT_TYPE_ORDER if v in present]
     remaining = [v for v in present if v not in ordered]
     return ordered + remaining
+
+
+def _target_contrast_pairs(groups: Sequence[str]) -> List[Tuple[str, str]]:
+    wanted = [
+        ("sham saline injection", "Area X visible (single hit)"),
+        ("sham saline injection", "Medial/Lateral visible + large lesion"),
+    ]
+    present = set(groups)
+    return [(a, b) for (a, b) in wanted if a in present and b in present]
 
 
 def _jitter_positions(n: int, center: float, width: float, rng: np.random.Generator) -> np.ndarray:
@@ -210,6 +284,12 @@ def _p_to_stars(p: float) -> str:
     if p < 0.05:
         return "*"
     return "n.s."
+
+
+def _format_p_label(p: float, sig_label: str) -> str:
+    if not np.isfinite(p):
+        return sig_label
+    return f"{sig_label}\np={p:.3g}"
 
 
 def _holm_bonferroni(pvals: Sequence[float]) -> np.ndarray:
@@ -299,10 +379,6 @@ def _wilcoxon_safe(a: np.ndarray, b: np.ndarray) -> Tuple[float, float, str]:
         return float("nan"), float("nan"), repr(e)
 
 
-# ----------------------------
-# Stats helpers
-# ----------------------------
-
 def _pairwise_stats_for_metric(
     df: pd.DataFrame,
     *,
@@ -310,6 +386,7 @@ def _pairwise_stats_for_metric(
     value_col: str,
     groups: Sequence[str],
     level_label: str,
+    contrast_pairs: Optional[Sequence[Tuple[str, str]]] = None,
 ) -> pd.DataFrame:
     if value_col not in df.columns:
         return pd.DataFrame()
@@ -347,29 +424,35 @@ def _pairwise_stats_for_metric(
     pair_rows = []
     raw_ps = []
 
-    for i in range(len(present_groups)):
-        for j in range(i + 1, len(present_groups)):
-            g1 = present_groups[i]
-            g2 = present_groups[j]
-            a = work.loc[work[group_col] == g1, value_col].to_numpy(dtype=float)
-            b = work.loc[work[group_col] == g2, value_col].to_numpy(dtype=float)
+    if contrast_pairs is None:
+        pairs = []
+        for i in range(len(present_groups)):
+            for j in range(i + 1, len(present_groups)):
+                pairs.append((present_groups[i], present_groups[j]))
+    else:
+        present_set = set(present_groups)
+        pairs = [(g1, g2) for (g1, g2) in contrast_pairs if g1 in present_set and g2 in present_set]
 
-            stat, p_raw = _mannwhitney_safe(a, b)
-            pair_rows.append({
-                "level": level_label,
-                "metric": value_col,
-                "omnibus_test": "kruskal" if len(group_arrays) >= 3 else "",
-                "omnibus_stat": omnibus_stat,
-                "omnibus_p": omnibus_p,
-                "pairwise_test": "mannwhitneyu",
-                "group_1": g1,
-                "group_2": g2,
-                "n_1": int(len(a)),
-                "n_2": int(len(b)),
-                "pairwise_stat": stat,
-                "p_raw": p_raw,
-            })
-            raw_ps.append(p_raw)
+    for g1, g2 in pairs:
+        a = work.loc[work[group_col] == g1, value_col].to_numpy(dtype=float)
+        b = work.loc[work[group_col] == g2, value_col].to_numpy(dtype=float)
+
+        stat, p_raw = _mannwhitney_safe(a, b)
+        pair_rows.append({
+            "level": level_label,
+            "metric": value_col,
+            "omnibus_test": "kruskal" if len(group_arrays) >= 3 else "",
+            "omnibus_stat": omnibus_stat,
+            "omnibus_p": omnibus_p,
+            "pairwise_test": "mannwhitneyu",
+            "group_1": g1,
+            "group_2": g2,
+            "n_1": int(len(a)),
+            "n_2": int(len(b)),
+            "pairwise_stat": stat,
+            "p_raw": p_raw,
+        })
+        raw_ps.append(p_raw)
 
     if len(pair_rows) == 0:
         return pd.DataFrame()
@@ -443,9 +526,74 @@ def _paired_stats_for_metric(
     return pd.DataFrame(rows)
 
 
-# ----------------------------
-# Plot helpers
-# ----------------------------
+def _paired_between_group_stats(
+    df: pd.DataFrame,
+    *,
+    group_col: str,
+    pre_col: str,
+    post_col: str,
+    groups: Sequence[str],
+    metric_name: str,
+    level_label: str,
+    contrast_pairs: Optional[Sequence[Tuple[str, str]]] = None,
+) -> pd.DataFrame:
+    rows: List[Dict[str, object]] = []
+
+    if pre_col not in df.columns or post_col not in df.columns:
+        return pd.DataFrame()
+
+    if contrast_pairs is None:
+        contrast_pairs = _target_contrast_pairs(groups)
+
+    raw_ps: List[float] = []
+    raw_idx: List[int] = []
+
+    for time_label, col in [("pre", pre_col), ("post", post_col)]:
+        work = df[[group_col, col]].copy()
+        work[col] = pd.to_numeric(work[col], errors="coerce")
+        work = work[np.isfinite(work[col])].copy()
+        if len(work) == 0:
+            continue
+
+        present = set(work[group_col].astype(str).tolist())
+        for g1, g2 in contrast_pairs:
+            if g1 not in present or g2 not in present:
+                continue
+            a = work.loc[work[group_col] == g1, col].to_numpy(dtype=float)
+            b = work.loc[work[group_col] == g2, col].to_numpy(dtype=float)
+            stat, p_raw = _mannwhitney_safe(a, b)
+            row = {
+                "level": level_label,
+                "metric": metric_name,
+                "timepoint": time_label,
+                "group_1": g1,
+                "group_2": g2,
+                "n_1": int(len(a)),
+                "n_2": int(len(b)),
+                "pairwise_test": "mannwhitneyu",
+                "pairwise_stat": stat,
+                "p_raw": p_raw,
+            }
+            rows.append(row)
+            if np.isfinite(p_raw):
+                raw_ps.append(float(p_raw))
+                raw_idx.append(len(rows) - 1)
+
+    if len(rows) == 0:
+        return pd.DataFrame()
+
+    p_adj = np.full(len(rows), np.nan, dtype=float)
+    if len(raw_ps) > 0:
+        adj_vals = _holm_bonferroni(raw_ps)
+        for idx, val in zip(raw_idx, adj_vals):
+            p_adj[idx] = float(val)
+
+    for i, row in enumerate(rows):
+        row["p_holm"] = p_adj[i]
+        row["sig_label"] = _p_to_stars(p_adj[i]) if np.isfinite(p_adj[i]) else "n/a"
+
+    return pd.DataFrame(rows)
+
 
 def _box_strip_plot(
     df: pd.DataFrame,
@@ -459,20 +607,30 @@ def _box_strip_plot(
     figsize=(10.5, 5.2),
     rng_seed: int = 0,
     stats_df: Optional[pd.DataFrame] = None,
-    annotate_only_significant: bool = True,
+    annotate_only_significant: bool = False,
+    color_group_col: Optional[str] = None,
 ) -> None:
     rng = np.random.default_rng(rng_seed)
 
     plot_groups = []
     plot_values = []
     plot_labels = []
+    plot_colors = []
     for g in groups:
-        vals = pd.to_numeric(df.loc[df[group_col] == g, value_col], errors="coerce")
-        vals = vals[np.isfinite(vals)]
-        if len(vals) > 0:
+        cols = [value_col]
+        if color_group_col is not None and color_group_col in df.columns:
+            cols.append(color_group_col)
+        sub = df.loc[df[group_col] == g, cols].copy()
+        sub[value_col] = pd.to_numeric(sub[value_col], errors="coerce")
+        sub = sub[np.isfinite(sub[value_col])].copy()
+        if len(sub) > 0:
             plot_groups.append(g)
-            plot_values.append(vals.to_numpy())
-            plot_labels.append(f"{g}\n(n={len(vals)})")
+            plot_values.append(sub[value_col].to_numpy())
+            plot_labels.append(f"{g}\n(n={len(sub)})")
+            if color_group_col is not None and color_group_col in sub.columns:
+                plot_colors.append([_color_for_group(v) for v in sub[color_group_col].astype(str).tolist()])
+            else:
+                plot_colors.append([_color_for_group(g)] * len(sub))
 
     if len(plot_values) == 0:
         return
@@ -480,13 +638,16 @@ def _box_strip_plot(
     fig, ax = plt.subplots(figsize=figsize)
 
     try:
-        ax.boxplot(plot_values, tick_labels=plot_labels, showfliers=False)
+        bp = ax.boxplot(plot_values, tick_labels=plot_labels, showfliers=False, patch_artist=True)
     except TypeError:
-        ax.boxplot(plot_values, labels=plot_labels, showfliers=False)
+        bp = ax.boxplot(plot_values, labels=plot_labels, showfliers=False, patch_artist=True)
 
-    for i, vals in enumerate(plot_values, start=1):
+    for patch in bp["boxes"]:
+        patch.set(facecolor="white", alpha=0.9)
+
+    for i, (vals, colors) in enumerate(zip(plot_values, plot_colors), start=1):
         x = _jitter_positions(len(vals), i, 0.10, rng)
-        ax.scatter(x, vals, s=20, alpha=0.7)
+        ax.scatter(x, vals, s=28, alpha=0.8, c=colors, edgecolors="none")
 
     ax.set_title(title)
     ax.set_ylabel(ylabel)
@@ -522,6 +683,7 @@ def _box_strip_plot(
 
                 p_adj = pd.to_numeric(pd.Series([row["p_holm"]]), errors="coerce").iloc[0]
                 sig_label = str(row["sig_label"])
+                bracket_label = _format_p_label(float(p_adj), sig_label)
 
                 if annotate_only_significant:
                     if (not np.isfinite(p_adj)) or (p_adj >= 0.05) or (sig_label in ("n.s.", "n/a")):
@@ -532,20 +694,20 @@ def _box_strip_plot(
                 if x1 > x2:
                     x1, x2 = x2, x1
 
-                pairs_to_draw.append((x1, x2, sig_label))
+                pairs_to_draw.append((x1, x2, bracket_label))
 
     if len(pairs_to_draw) > 0:
         pairs_to_draw = sorted(pairs_to_draw, key=lambda t: (t[1] - t[0], t[0]))
 
         base = ymax + max(0.07 * y_span, 0.07)
         h = max(0.03 * y_span, 0.03)
-        step = max(0.10 * y_span, 0.10)
+        step = max(0.16 * y_span, 0.16)
 
         for level, (x1, x2, label) in enumerate(pairs_to_draw):
             y = base + level * step
             _add_sig_bracket(ax, x1, x2, y, h, label)
 
-        top_needed = base + (len(pairs_to_draw) - 1) * step + h + max(0.08 * y_span, 0.08)
+        top_needed = base + (len(pairs_to_draw) - 1) * step + h + max(0.18 * y_span, 0.18)
         y_upper = max(y_upper, top_needed)
 
     ax.set_ylim(y_lower, y_upper)
@@ -566,14 +728,20 @@ def _paired_grouped_pre_post_boxplot(
     title: str,
     out_png: Path,
     stats_df: Optional[pd.DataFrame] = None,
+    between_stats_df: Optional[pd.DataFrame] = None,
     rng_seed: int = 0,
+    color_group_col: Optional[str] = None,
+    box_only: bool = False,
 ) -> None:
     rng = np.random.default_rng(rng_seed)
 
     plot_groups = []
     plot_subs = []
     for g in groups:
-        sub = df.loc[df[group_col] == g, [pre_col, post_col]].copy()
+        cols = [pre_col, post_col]
+        if color_group_col is not None and color_group_col in df.columns:
+            cols.append(color_group_col)
+        sub = df.loc[df[group_col] == g, cols].copy()
         sub[pre_col] = pd.to_numeric(sub[pre_col], errors="coerce")
         sub[post_col] = pd.to_numeric(sub[post_col], errors="coerce")
         sub = sub[np.isfinite(sub[pre_col]) & np.isfinite(sub[post_col])].copy()
@@ -600,6 +768,10 @@ def _paired_grouped_pre_post_boxplot(
     for sub, g in zip(plot_subs, plot_groups):
         y_pre = sub[pre_col].to_numpy(dtype=float)
         y_post = sub[post_col].to_numpy(dtype=float)
+        if color_group_col is not None and color_group_col in sub.columns:
+            row_colors = [_color_for_group(v) for v in sub[color_group_col].astype(str).tolist()]
+        else:
+            row_colors = [_color_for_group(g)] * len(sub)
 
         p_pre = current
         p_post = current + gap_within
@@ -607,17 +779,20 @@ def _paired_grouped_pre_post_boxplot(
         positions_pre.append(p_pre)
         positions_post.append(p_post)
 
-        ax.boxplot([y_pre], positions=[p_pre], widths=0.55, showfliers=False)
-        ax.boxplot([y_post], positions=[p_post], widths=0.55, showfliers=False)
+        bp_pre = ax.boxplot([y_pre], positions=[p_pre], widths=0.55, showfliers=False, patch_artist=True)
+        bp_post = ax.boxplot([y_post], positions=[p_post], widths=0.55, showfliers=False, patch_artist=True)
+        for patch in bp_pre["boxes"] + bp_post["boxes"]:
+            patch.set(facecolor="white", alpha=0.9)
 
-        for pre_v, post_v in zip(y_pre, y_post):
-            ax.plot([p_pre, p_post], [pre_v, post_v], alpha=0.7)
-            ax.scatter([p_pre, p_post], [pre_v, post_v], s=22)
+        if not box_only:
+            for pre_v, post_v, c in zip(y_pre, y_post, row_colors):
+                ax.plot([p_pre, p_post], [pre_v, post_v], alpha=0.7, color=c)
+                ax.scatter([p_pre, p_post], [pre_v, post_v], s=28, color=c, alpha=0.8, edgecolors="none")
 
-        x_pre = _jitter_positions(len(y_pre), p_pre, 0.08, rng)
-        x_post = _jitter_positions(len(y_post), p_post, 0.08, rng)
-        ax.scatter(x_pre, y_pre, s=20, alpha=0.7)
-        ax.scatter(x_post, y_post, s=20, alpha=0.7)
+            x_pre = _jitter_positions(len(y_pre), p_pre, 0.08, rng)
+            x_post = _jitter_positions(len(y_post), p_post, 0.08, rng)
+            ax.scatter(x_pre, y_pre, s=28, alpha=0.8, c=row_colors, edgecolors="none")
+            ax.scatter(x_post, y_post, s=28, alpha=0.8, c=row_colors, edgecolors="none")
 
         xticks.extend([p_pre, p_post])
         xticklabels.extend([f"Pre\n{g}", "Post"])
@@ -639,6 +814,9 @@ def _paired_grouped_pre_post_boxplot(
     if stats_df is not None and len(stats_df) > 0:
         stats_map = {str(r["group"]): r for _, r in stats_df.iterrows()}
 
+    within_base = ymax + max(0.06 * y_span, 0.05)
+    h = max(0.03 * y_span, 0.03)
+
     for g, p_pre, p_post in zip(plot_groups, positions_pre, positions_post):
         row = stats_map.get(g, None)
         label = "n/a"
@@ -646,15 +824,44 @@ def _paired_grouped_pre_post_boxplot(
             p_adj = row.get("p_holm", np.nan)
             sig = row.get("sig_label", "n/a")
             if np.isfinite(p_adj):
-                label = sig
+                label = _format_p_label(float(p_adj), str(sig))
             else:
-                label = "n/a"
+                label = str(sig)
+        _add_sig_bracket(ax, p_pre, p_post, within_base, h, label)
 
-        y = ymax + max(0.06 * y_span, 0.05)
-        h = max(0.03 * y_span, 0.03)
-        _add_sig_bracket(ax, p_pre, p_post, y, h, label)
+    between_pairs_to_draw = []
+    if between_stats_df is not None and len(between_stats_df) > 0:
+        pre_map = {g: p for g, p in zip(plot_groups, positions_pre)}
+        post_map = {g: p for g, p in zip(plot_groups, positions_post)}
+        required_cols = {"timepoint", "group_1", "group_2", "p_holm", "sig_label"}
+        if required_cols.issubset(between_stats_df.columns):
+            for _, row in between_stats_df.iterrows():
+                t = str(row["timepoint"]).lower()
+                g1 = str(row["group_1"])
+                g2 = str(row["group_2"])
+                pos_map = pre_map if t == "pre" else post_map if t == "post" else None
+                if pos_map is None or g1 not in pos_map or g2 not in pos_map:
+                    continue
+                p_adj = pd.to_numeric(pd.Series([row["p_holm"]]), errors="coerce").iloc[0]
+                sig_label = str(row["sig_label"])
+                bracket_label = _format_p_label(float(p_adj), sig_label) if np.isfinite(p_adj) else sig_label
+                x1 = float(pos_map[g1])
+                x2 = float(pos_map[g2])
+                if x1 > x2:
+                    x1, x2 = x2, x1
+                between_pairs_to_draw.append((t, x1, x2, bracket_label))
 
-    top_needed = ymax + max(0.06 * y_span, 0.05) + max(0.03 * y_span, 0.03) + max(0.08 * y_span, 0.08)
+    if len(between_pairs_to_draw) > 0:
+        between_pairs_to_draw = sorted(between_pairs_to_draw, key=lambda t: (t[0], t[2] - t[1], t[1]))
+        base = within_base + h + max(0.12 * y_span, 0.12)
+        step = max(0.16 * y_span, 0.16)
+        for level, (_, x1, x2, label) in enumerate(between_pairs_to_draw):
+            y = base + level * step
+            _add_sig_bracket(ax, x1, x2, y, h, label)
+        top_needed = base + (len(between_pairs_to_draw) - 1) * step + h + max(0.18 * y_span, 0.18)
+    else:
+        top_needed = within_base + h + max(0.18 * y_span, 0.18)
+
     y_upper = max(y_upper, top_needed)
 
     ax.set_xticks(xticks)
@@ -671,11 +878,16 @@ def _paired_grouped_pre_post_boxplot(
     plt.close(fig)
 
 
-# ----------------------------
-# Load + merge
-# ----------------------------
-
 def load_batch_summary(summary_csv: Path) -> pd.DataFrame:
+    summary_csv = Path(summary_csv)
+    if not summary_csv.exists():
+        summary_csv.parent.mkdir(parents=True, exist_ok=True)
+        raise FileNotFoundError(
+            "Batch summary CSV not found: "
+            f"{summary_csv}\n"
+            "The graphing script can create the output folder automatically, but it still needs an existing batch summary CSV as input. "
+            "Run the equal-only batch script first, or point --summary-csv to the actual summary file that was created."
+        )
     df = pd.read_csv(summary_csv)
     if "animal_id" not in df.columns:
         raise KeyError("Summary CSV must contain an 'animal_id' column.")
@@ -706,6 +918,7 @@ def load_hit_type_metadata(
     out["animal_id"] = out["animal_id"].astype(str).str.strip()
     out["lesion_hit_type_raw"] = out["lesion_hit_type_raw"].astype(str).str.strip()
     out["lesion_hit_type"] = out["lesion_hit_type_raw"].map(_collapse_hit_type)
+    out["lesion_color_group"] = out["lesion_hit_type_raw"].map(_canonical_color_group)
     out = out.drop_duplicates(subset=["animal_id"])
     return out
 
@@ -716,19 +929,16 @@ def merge_summary_with_hit_types(summary_df: pd.DataFrame, hit_df: pd.DataFrame)
     out = out.merge(hit_df, on="animal_id", how="left")
     out["lesion_hit_type"] = out["lesion_hit_type"].fillna("unknown")
     out["lesion_hit_type_raw"] = out["lesion_hit_type_raw"].fillna("unknown")
+    out["lesion_color_group"] = out["lesion_color_group"].fillna("unknown")
     return out
 
-
-# ----------------------------
-# Bird-level summaries
-# ----------------------------
 
 def make_bird_level_summary(
     df: pd.DataFrame,
     *,
     metrics: Sequence[str],
 ) -> pd.DataFrame:
-    keep_cols = ["animal_id", "lesion_hit_type"]
+    keep_cols = ["animal_id", "lesion_hit_type", "lesion_color_group"]
     use_cols = keep_cols + [m for m in metrics if m in df.columns]
 
     sub = df[use_cols].copy()
@@ -736,13 +946,9 @@ def make_bird_level_summary(
         if m in sub.columns:
             sub[m] = pd.to_numeric(sub[m], errors="coerce")
 
-    grouped = sub.groupby(["animal_id", "lesion_hit_type"], as_index=False)
+    grouped = sub.groupby(["animal_id", "lesion_hit_type", "lesion_color_group"], as_index=False)
     return grouped.mean(numeric_only=True)
 
-
-# ----------------------------
-# Main plotting routine
-# ----------------------------
 
 def graph_metrics_by_hit_type(
     summary_csv: Path,
@@ -780,11 +986,11 @@ def graph_metrics_by_hit_type(
         merged = merged[merged["lesion_hit_type"] != "unknown"].copy()
 
     hit_type_order = _infer_hit_type_order(merged["lesion_hit_type"].tolist())
+    contrast_pairs = _target_contrast_pairs(hit_type_order)
 
     merged_csv = out_dir / "merged_cluster_level_with_hit_type.csv"
     merged.to_csv(merged_csv, index=False)
 
-    # Include paired RMS columns in bird-level mean summary even if not in DEFAULT_METRICS
     bird_mean_metric_cols = list(dict.fromkeys(
         list(metrics)
         + [spec["pre_col"] for spec in PAIRED_METRIC_SPECS]
@@ -798,15 +1004,15 @@ def graph_metrics_by_hit_type(
     bird_mean_stats_all: List[pd.DataFrame] = []
     paired_cluster_stats_all: List[pd.DataFrame] = []
     paired_bird_mean_stats_all: List[pd.DataFrame] = []
+    paired_cluster_between_stats_all: List[pd.DataFrame] = []
+    paired_bird_mean_between_stats_all: List[pd.DataFrame] = []
 
-    # Standard by-hit-type plots for reduced main metrics
     for metric in metrics:
         if metric not in merged.columns:
             print(f"[skip] metric not found in CSV: {metric}")
             continue
 
-        # cluster-level plot + stats
-        df_metric = merged[["lesion_hit_type", metric]].copy()
+        df_metric = merged[["lesion_hit_type", "lesion_color_group", metric]].copy()
         df_metric[metric] = pd.to_numeric(df_metric[metric], errors="coerce")
         df_metric = df_metric[np.isfinite(df_metric[metric])].copy()
 
@@ -817,26 +1023,30 @@ def graph_metrics_by_hit_type(
                 value_col=metric,
                 groups=hit_type_order,
                 level_label="cluster_level",
+                contrast_pairs=contrast_pairs,
             )
 
-            out_png = cluster_dir / f"{_clean_filename(metric)}_cluster_level_by_hit_type.png"
+            metric_label = _display_metric_name(metric)
+            metric_ylabel = _display_ylabel(metric)
+
+            out_png = cluster_dir / f"{_clean_filename(metric_label)}_cluster_level_by_hit_type.png"
             _box_strip_plot(
                 df_metric,
                 group_col="lesion_hit_type",
                 value_col=metric,
                 groups=hit_type_order,
-                title=f"{metric} by lesion hit type (cluster level)",
-                ylabel=metric,
+                title=f"{metric_label} by lesion hit type (cluster level)",
+                ylabel=metric_ylabel,
                 out_png=out_png,
                 stats_df=stats_df,
+                color_group_col="lesion_color_group",
             )
 
             if len(stats_df) > 0:
                 cluster_stats_all.append(stats_df)
 
-        # bird mean plot + stats
         if metric in bird_mean.columns:
-            df_bm = bird_mean[["lesion_hit_type", metric]].copy()
+            df_bm = bird_mean[["lesion_hit_type", "lesion_color_group", metric]].copy()
             df_bm[metric] = pd.to_numeric(df_bm[metric], errors="coerce")
             df_bm = df_bm[np.isfinite(df_bm[metric])].copy()
 
@@ -847,31 +1057,36 @@ def graph_metrics_by_hit_type(
                     value_col=metric,
                     groups=hit_type_order,
                     level_label="bird_level_mean",
+                    contrast_pairs=contrast_pairs,
                 )
 
-                out_png = bird_mean_dir / f"{_clean_filename(metric)}_bird_mean_by_hit_type.png"
+                metric_label = _display_metric_name(metric)
+                metric_ylabel = _display_ylabel(metric)
+
+                out_png = bird_mean_dir / f"{_clean_filename(metric_label)}_bird_mean_by_hit_type.png"
+
                 _box_strip_plot(
                     df_bm,
                     group_col="lesion_hit_type",
                     value_col=metric,
                     groups=hit_type_order,
-                    title=f"{metric} by lesion hit type (bird mean)",
-                    ylabel=metric,
+                    title=f"{metric_label} by lesion hit type (bird mean)",
+                    ylabel=metric_ylabel,
                     out_png=out_png,
                     stats_df=stats_df,
+                    annotate_only_significant=False,
+                    color_group_col="lesion_color_group",
                 )
 
                 if len(stats_df) > 0:
                     bird_mean_stats_all.append(stats_df)
 
-    # Paired pre/post RMS-radius plots at cluster level and bird-mean level
     for spec in PAIRED_METRIC_SPECS:
         pre_col = spec["pre_col"]
         post_col = spec["post_col"]
         metric_name = spec["name"]
         ylabel = spec["ylabel"]
 
-        # cluster level
         if pre_col in merged.columns and post_col in merged.columns:
             stats_df_cluster = _paired_stats_for_metric(
                 merged,
@@ -897,11 +1112,29 @@ def graph_metrics_by_hit_type(
                 title=f"{metric_name}: pre vs post within lesion hit type (all clusters)",
                 out_png=out_png,
                 stats_df=stats_df_cluster,
+                between_stats_df=None,
+                color_group_col="lesion_color_group",
+                box_only=False,
+            )
+
+            out_png_box_only = paired_cluster_dir / f"paired_{_clean_filename(metric_name)}_cluster_level_pre_vs_post_grouped_by_hit_type_boxplots_only.png"
+            _paired_grouped_pre_post_boxplot(
+                merged,
+                group_col="lesion_hit_type",
+                pre_col=pre_col,
+                post_col=post_col,
+                groups=hit_type_order,
+                ylabel=ylabel,
+                title=f"{metric_name}: pre vs post within lesion hit type (all clusters, boxplots only)",
+                out_png=out_png_box_only,
+                stats_df=stats_df_cluster,
+                between_stats_df=None,
+                color_group_col="lesion_color_group",
+                box_only=True,
             )
         else:
             print(f"[skip paired cluster] missing columns for {metric_name}: {pre_col}, {post_col}")
 
-        # bird mean
         if pre_col in bird_mean.columns and post_col in bird_mean.columns:
             stats_df_bird = _paired_stats_for_metric(
                 bird_mean,
@@ -927,15 +1160,35 @@ def graph_metrics_by_hit_type(
                 title=f"{metric_name}: pre vs post within lesion hit type (bird means)",
                 out_png=out_png,
                 stats_df=stats_df_bird,
+                between_stats_df=None,
+                color_group_col="lesion_color_group",
+                box_only=False,
+            )
+
+            out_png_box_only = paired_bird_mean_dir / f"paired_{_clean_filename(metric_name)}_bird_mean_pre_vs_post_grouped_by_hit_type_boxplots_only.png"
+            _paired_grouped_pre_post_boxplot(
+                bird_mean,
+                group_col="lesion_hit_type",
+                pre_col=pre_col,
+                post_col=post_col,
+                groups=hit_type_order,
+                ylabel=ylabel,
+                title=f"{metric_name}: pre vs post within lesion hit type (bird means, boxplots only)",
+                out_png=out_png_box_only,
+                stats_df=stats_df_bird,
+                between_stats_df=None,
+                color_group_col="lesion_color_group",
+                box_only=True,
             )
         else:
             print(f"[skip paired bird mean] missing columns for {metric_name}: {pre_col}, {post_col}")
 
-    # Save stats tables
     cluster_stats_csv = stats_dir / "cluster_level_stats.csv"
     bird_mean_stats_csv = stats_dir / "bird_level_mean_stats.csv"
     paired_cluster_stats_csv = stats_dir / "paired_cluster_level_pre_post_stats.csv"
     paired_bird_mean_stats_csv = stats_dir / "paired_bird_level_mean_pre_post_stats.csv"
+    paired_cluster_between_stats_csv = stats_dir / "paired_cluster_level_between_hit_type_stats.csv"
+    paired_bird_mean_between_stats_csv = stats_dir / "paired_bird_level_mean_between_hit_type_stats.csv"
 
     if len(cluster_stats_all) > 0:
         pd.concat(cluster_stats_all, ignore_index=True).to_csv(cluster_stats_csv, index=False)
@@ -957,12 +1210,24 @@ def graph_metrics_by_hit_type(
     else:
         pd.DataFrame().to_csv(paired_bird_mean_stats_csv, index=False)
 
+    if len(paired_cluster_between_stats_all) > 0:
+        pd.concat(paired_cluster_between_stats_all, ignore_index=True).to_csv(paired_cluster_between_stats_csv, index=False)
+    else:
+        pd.DataFrame().to_csv(paired_cluster_between_stats_csv, index=False)
+
+    if len(paired_bird_mean_between_stats_all) > 0:
+        pd.concat(paired_bird_mean_between_stats_all, ignore_index=True).to_csv(paired_bird_mean_between_stats_csv, index=False)
+    else:
+        pd.DataFrame().to_csv(paired_bird_mean_between_stats_csv, index=False)
+
     print(f"Saved merged CSV: {merged_csv}")
     print(f"Saved bird mean CSV: {bird_mean_csv}")
     print(f"Saved cluster stats CSV: {cluster_stats_csv}")
     print(f"Saved bird mean stats CSV: {bird_mean_stats_csv}")
     print(f"Saved paired cluster-level pre/post stats CSV: {paired_cluster_stats_csv}")
     print(f"Saved paired bird mean pre/post stats CSV: {paired_bird_mean_stats_csv}")
+    print(f"Saved paired cluster-level between-hit-type stats CSV: {paired_cluster_between_stats_csv}")
+    print(f"Saved paired bird mean between-hit-type stats CSV: {paired_bird_mean_between_stats_csv}")
 
     return {
         "merged_csv": merged_csv,
@@ -971,13 +1236,11 @@ def graph_metrics_by_hit_type(
         "bird_mean_stats_csv": bird_mean_stats_csv,
         "paired_cluster_stats_csv": paired_cluster_stats_csv,
         "paired_bird_mean_stats_csv": paired_bird_mean_stats_csv,
+        "paired_cluster_between_stats_csv": paired_cluster_between_stats_csv,
+        "paired_bird_mean_between_stats_csv": paired_bird_mean_between_stats_csv,
         "out_dir": out_dir,
     }
 
-
-# ----------------------------
-# CLI
-# ----------------------------
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -1008,10 +1271,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = _build_arg_parser().parse_args()
 
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
     graph_metrics_by_hit_type(
         summary_csv=Path(args.summary_csv),
         metadata_xlsx=Path(args.metadata_xlsx),
-        out_dir=Path(args.out_dir),
+        out_dir=out_dir,
         metadata_sheet=args.metadata_sheet,
         metrics=args.metrics,
         cluster_filter=args.cluster_filter,
