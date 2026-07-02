@@ -45,6 +45,10 @@ Edits in this version
       - Late Pre vs Post standard deviation distributions
       - change in variance versus sham controls
       - change in standard deviation versus sham controls
+6. When both --scatter-csv and --daily-csv are provided, Panel D/E timecourse
+   rows are filtered to the same selected animal × syllable pairs used for
+   Panel C. This keeps pooled pre+post-selected Figure 3 panels internally
+   consistent. Use --no-filter-daily-to-scatter-selection to disable.
 
 Statistical design
 ------------------
@@ -121,6 +125,7 @@ import warnings
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter, MaxNLocator, NullFormatter
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 
@@ -369,6 +374,48 @@ def _pretty_axes(ax: plt.Axes, tick_label_fontsize: float = 14) -> None:
     ax.tick_params(axis="both", labelsize=tick_label_fontsize)
 
 
+def _plain_seconds_tick_formatter(x: float, pos: object = None) -> str:
+    """Readable tick labels for values already converted to seconds."""
+    try:
+        x = float(x)
+    except Exception:
+        return ""
+    if not np.isfinite(x):
+        return ""
+    if abs(x) < 1e-10:
+        return "0"
+
+    ax = abs(x)
+    if ax >= 10:
+        txt = f"{x:.0f}"
+    elif ax >= 1:
+        txt = f"{x:.1f}"
+    else:
+        txt = f"{x:.2f}"
+    return txt.rstrip("0").rstrip(".")
+
+
+def _apply_seconds_tick_formatting(
+    ax: plt.Axes,
+    *,
+    x: bool = False,
+    y: bool = True,
+    max_major_ticks: int = 5,
+) -> None:
+    """Use simple decimal seconds instead of scientific/log formatter labels."""
+    formatter = FuncFormatter(_plain_seconds_tick_formatter)
+    if x:
+        ax.xaxis.set_major_formatter(formatter)
+        ax.xaxis.set_minor_formatter(NullFormatter())
+        if ax.get_xscale() == "linear":
+            ax.xaxis.set_major_locator(MaxNLocator(nbins=max_major_ticks))
+    if y:
+        ax.yaxis.set_major_formatter(formatter)
+        ax.yaxis.set_minor_formatter(NullFormatter())
+        if ax.get_yscale() == "linear":
+            ax.yaxis.set_major_locator(MaxNLocator(nbins=max_major_ticks))
+
+
 def _tight_positive_limits(values: np.ndarray, *, padding_frac: float = 0.0) -> tuple[float, float]:
     """Return tight positive limits for log-scaled data."""
     vals = np.asarray(values, dtype=float)
@@ -478,6 +525,12 @@ def _prepare_scatter_table(
     wide["sd_ratio"] = wide["post_sd"] / wide["pre_sd"]
     wide["sd_log2_ratio"] = np.log2(wide["sd_ratio"])
 
+    # Plotting-friendly standard deviation columns in seconds.
+    # Statistical tables still retain the original millisecond columns.
+    wide["pre_sd_s"] = wide["pre_sd"] / 1000.0
+    wide["post_sd_s"] = wide["post_sd"] / 1000.0
+    wide["sd_delta_s"] = wide["sd_delta"] / 1000.0
+
     if top_percentile is not None:
         top_percentile = float(top_percentile)
         rank_on = str(rank_on).lower()
@@ -538,7 +591,7 @@ def plot_panel_c_scatter(
     axis_padding_frac: float = 0.045,
     x_label_fontsize: float = 18,
     y_label_fontsize: float = 18,
-    tick_label_fontsize: float = 14,
+    tick_label_fontsize: float = 12.5,
     show_legend: bool = False,
     show: bool = False,
     dpi: int = 300,
@@ -610,6 +663,8 @@ def plot_panel_c_scatter(
     ax.set_xlabel(x_label, fontsize=x_label_fontsize)
     ax.set_ylabel(y_label, fontsize=y_label_fontsize)
     _pretty_axes(ax, tick_label_fontsize=tick_label_fontsize)
+    if x_col.endswith("_s") or y_col.endswith("_s"):
+        _apply_seconds_tick_formatting(ax, x=x_col.endswith("_s"), y=y_col.endswith("_s"), max_major_ticks=6)
 
     if show_legend:
         legend_groups = [g for g in display_order if g in present_groups]
@@ -811,6 +866,11 @@ def _build_animal_level_change_table(
         )
         .reset_index()
     )
+    # Convenience columns for plotting in seconds. The original ms columns are
+    # retained for statistical output and backwards compatibility.
+    agg["pre_sd_s"] = agg["pre_sd"] / 1000.0
+    agg["post_sd_s"] = agg["post_sd"] / 1000.0
+    agg["sd_delta_s"] = agg["sd_delta"] / 1000.0
     return agg
 
 
@@ -1222,7 +1282,7 @@ def plot_pre_post_distribution_boxplot(
     show_points: bool = True,
     show_paired_lines: bool = True,
     tick_label_fontsize: float = 14,
-    axis_label_fontsize: float = 18,
+    axis_label_fontsize: float = 16,
     title_fontsize: float = 18,
     show: bool = False,
     dpi: int = 300,
@@ -1318,6 +1378,8 @@ def plot_pre_post_distribution_boxplot(
     # Title intentionally omitted for manuscript panel assembly.
     _apply_optional_y_scale(ax, y_scale=y_scale, values=np.asarray(all_values, dtype=float))
     _pretty_axes(ax, tick_label_fontsize=tick_label_fontsize)
+    if pre_col.endswith("_s") or post_col.endswith("_s") or "(s)" in str(y_label):
+        _apply_seconds_tick_formatting(ax, x=False, y=True, max_major_ticks=5)
 
     handles = [
         Line2D([0], [0], marker="s", linestyle="None", markerfacecolor="white", markeredgecolor="black", markersize=8, label="Late Pre"),
@@ -1436,11 +1498,12 @@ def plot_change_metric_boxplot_vs_sham(
     metric_col: str,
     y_label: str,
     stats_df: Optional[pd.DataFrame] = None,
+    stats_metric_col: Optional[str] = None,
     title: Optional[str] = None,
     group_col: str = "display_group",
     include_pooled_ml: bool = True,
     y_scale: str = "symlog",
-    figsize: tuple[float, float] = (9.3, 6.0),
+    figsize: tuple[float, float] = (11.0, 5.2),
     box_width: float = 0.42,
     point_alpha: float = 0.82,
     point_size: float = 34.0,
@@ -1456,6 +1519,7 @@ def plot_change_metric_boxplot_vs_sham(
     pooled into one combined medial+lateral group.
     """
     out_path = Path(out_path)
+    stats_metric_col = metric_col if stats_metric_col is None else str(stats_metric_col)
     required = [group_col, metric_col]
     missing = [c for c in required if c not in df.columns]
     if missing:
@@ -1475,6 +1539,11 @@ def plot_change_metric_boxplot_vs_sham(
     rng = np.random.default_rng(1)
     all_values: list[float] = []
 
+    # Spread the three lesion-group boxes farther apart to reduce overlap among
+    # multi-line x tick labels and leave clearer room for significance brackets.
+    custom_positions = [0.0, 2.1, 4.5, 6.9]
+    group_positions = {group: custom_positions[i] for i, group in enumerate(plot_order)}
+
     for i, group in enumerate(plot_order):
         g = plot_df[plot_df[group_col].astype(str) == group].copy()
         vals = g[metric_col].dropna().to_numpy(dtype=float)
@@ -1482,8 +1551,9 @@ def plot_change_metric_boxplot_vs_sham(
             continue
         all_values.extend(vals.tolist())
         color = _boxplot_group_color(group, color_config)
+        xpos = group_positions[group]
 
-        bp = ax.boxplot([vals], positions=[i], widths=box_width, patch_artist=True, showfliers=False)
+        bp = ax.boxplot([vals], positions=[xpos], widths=box_width, patch_artist=True, showfliers=False)
         for patch in bp["boxes"]:
             patch.set_facecolor(color)
             patch.set_edgecolor(color)
@@ -1494,16 +1564,33 @@ def plot_change_metric_boxplot_vs_sham(
             item.set_linewidth(1.4)
 
         jitter = rng.uniform(-0.08, 0.08, size=len(vals))
-        ax.scatter(np.full(len(vals), i) + jitter, vals, s=point_size, facecolors=color, edgecolors="none", alpha=point_alpha, zorder=3)
+        ax.scatter(np.full(len(vals), xpos) + jitter, vals, s=point_size, facecolors=color, edgecolors="none", alpha=point_alpha, zorder=3)
 
     ax.axhline(0, color="black", linestyle="--", linewidth=1.0, alpha=0.7)
-    ax.set_xticks(range(len(plot_order)))
+    xtick_positions = [group_positions[g] for g in plot_order]
+    ax.set_xticks(xtick_positions)
     ax.set_xticklabels([_format_group_label_horizontal(g) for g in plot_order], rotation=0, ha="center", fontsize=tick_label_fontsize)
-    ax.set_ylabel(y_label, fontsize=axis_label_fontsize, labelpad=8)
+    ax.set_xlim(min(xtick_positions) - 1.0, max(xtick_positions) + 1.0)
+    # Draw the delta-plot y-label as figure-level text, inside the saved canvas.
+    # This avoids repeated cropping of the rotated axes ylabel when the panel is
+    # exported with bbox_inches="tight" or assembled into Illustrator.
+    delta_ylabel_fontsize = max(axis_label_fontsize - 3.0, 11.0)
+    ax.set_ylabel("")
+    fig.text(
+        0.035,
+        0.56,
+        y_label,
+        rotation=90,
+        ha="center",
+        va="center",
+        fontsize=delta_ylabel_fontsize,
+    )
     if title:
         ax.set_title(title, fontsize=title_fontsize, pad=16)
     _apply_optional_y_scale(ax, y_scale=y_scale, values=np.asarray(all_values, dtype=float))
     _pretty_axes(ax, tick_label_fontsize=tick_label_fontsize)
+    if metric_col.endswith("_s") or "(s)" in str(y_label):
+        _apply_seconds_tick_formatting(ax, x=False, y=True, max_major_ticks=5)
 
     if stats_df is not None and not stats_df.empty:
         # Use the exact rows from the saved Welch stats table. That table already
@@ -1517,19 +1604,19 @@ def plot_change_metric_boxplot_vs_sham(
                 sham_vals_for_median = plot_df.loc[plot_df[group_col].astype(str) == group, metric_col].to_numpy(dtype=float)
                 sham_median = np.nanmedian(sham_vals_for_median) if len(sham_vals_for_median) else np.nan
                 ax.text(
-                    i,
-                    -0.30,
+                    group_positions[group],
+                    -0.29,
                     f"median Δ={_format_plot_value(sham_median)}\nreference\nn={n_sham_only}",
                     transform=ax.get_xaxis_transform(),
                     ha="center",
                     va="top",
-                    fontsize=9.0,
+                    fontsize=10.0,
                     clip_on=False,
                 )
                 continue
             row = work_stats[
                 (work_stats.get("group", pd.Series(dtype=str)).astype(str) == group)
-                & (work_stats.get("change_metric", pd.Series(dtype=str)).astype(str) == metric_col)
+                & (work_stats.get("change_metric", pd.Series(dtype=str)).astype(str) == stats_metric_col)
             ]
             if row.empty:
                 continue
@@ -1547,19 +1634,24 @@ def plot_change_metric_boxplot_vs_sham(
             group_vals_for_median = plot_df.loc[plot_df[group_col].astype(str) == str(group), metric_col].to_numpy(dtype=float)
             group_median = np.nanmedian(group_vals_for_median) if len(group_vals_for_median) else np.nan
             ax.text(
-                i,
-                -0.34,
+                group_positions[group],
+                -0.33,
                 f"median Δ={_format_plot_value(group_median)}\nt={t_txt}\np={p_txt}\n{n_txt}",
                 transform=ax.get_xaxis_transform(),
                 ha="center",
                 va="top",
-                fontsize=11.0,
+                fontsize=10.5,
                 clip_on=False,
             )
             sig_label = stars if stars else "n.s."
-            y_frac = 0.93 if i == 1 else 0.975
-            _draw_sig_bracket_axesfrac(ax, 0.0, float(i), y_frac=y_frac, h_frac=0.018, label=sig_label)
-    fig.subplots_adjust(left=0.19, right=0.985, bottom=0.50, top=0.88)
+            # Use the actual group x positions and stagger heights more strongly
+            # so the two sham-comparison brackets do not overlap.
+            x_left = group_positions[SHAM_GROUP]
+            x_right = group_positions[group]
+            y_frac = 0.885 if i == 1 else 0.975
+            _draw_sig_bracket_axesfrac(ax, x_left, x_right, y_frac=y_frac, h_frac=0.015, label=sig_label, fontsize=12.5)
+    # Extra margins keep the long y-label visible and the multi-line x labels readable.
+    fig.subplots_adjust(left=0.18, right=0.99, bottom=0.48, top=0.88)
     fig.savefig(out_path, dpi=dpi, bbox_inches="tight", pad_inches=0.12)
     if show:
         plt.show()
@@ -1606,34 +1698,18 @@ def make_panel_c_boxplots(
     pooled_plot_df.to_csv(pooled_summary_path, index=False)
     outputs["panel_C_boxplot_pooledML_summary"] = pooled_summary_path
 
-    outputs["panel_C_variance_pre_post_boxplot"] = plot_pre_post_distribution_boxplot(
-        plot_df,
-        out_dir / "panel_C_variance_pre_post_boxplot_pooledML.png",
-        color_config=color_config,
-        pre_col="pre_variance",
-        post_col="post_variance",
-        y_label="Variance of Phrase Durations (ms²)",
-        title=None,
-        y_scale="log",
-        paired_stats_df=stats_paired_df,
-        base_metric="variance",
-        pool_ml_groups=True,
-        tick_label_fontsize=boxplot_tick_label_fontsize,
-        axis_label_fontsize=boxplot_axis_label_fontsize,
-        title_fontsize=boxplot_title_fontsize,
-        figsize=(prepost_boxplot_fig_width, prepost_boxplot_fig_height),
-        show=show,
-        dpi=dpi,
-    )
+    # Only standard-deviation figures are written in this manuscript-facing
+    # version. Variance-based values remain in the source tables for reproducibility,
+    # but variance plots are intentionally skipped to avoid visual clutter.
     outputs["panel_C_sd_pre_post_boxplot"] = plot_pre_post_distribution_boxplot(
         plot_df,
         out_dir / "panel_C_sd_pre_post_boxplot_pooledML.png",
         color_config=color_config,
-        pre_col="pre_sd",
-        post_col="post_sd",
-        y_label="Standard Deviation of\nPhrase Durations (ms)",
+        pre_col="pre_sd_s",
+        post_col="post_sd_s",
+        y_label="Phrase duration SD (s)",
         title=None,
-        y_scale="log",
+        y_scale="linear",
         paired_stats_df=stats_paired_df,
         base_metric="sd",
         pool_ml_groups=True,
@@ -1645,36 +1721,15 @@ def make_panel_c_boxplots(
         dpi=dpi,
     )
 
-    outputs["panel_C_variance_pre_post_boxplot_boxesonly"] = plot_pre_post_distribution_boxplot(
-        plot_df,
-        out_dir / "panel_C_variance_pre_post_boxplot_pooledML_boxesonly.png",
-        color_config=color_config,
-        pre_col="pre_variance",
-        post_col="post_variance",
-        y_label="Variance of Phrase Durations (ms²)",
-        title=None,
-        y_scale="log",
-        paired_stats_df=stats_paired_df,
-        base_metric="variance",
-        pool_ml_groups=True,
-        show_points=False,
-        show_paired_lines=False,
-        tick_label_fontsize=boxplot_tick_label_fontsize,
-        axis_label_fontsize=boxplot_axis_label_fontsize,
-        title_fontsize=boxplot_title_fontsize,
-        figsize=(prepost_boxplot_fig_width, prepost_boxplot_fig_height),
-        show=show,
-        dpi=dpi,
-    )
     outputs["panel_C_sd_pre_post_boxplot_boxesonly"] = plot_pre_post_distribution_boxplot(
         plot_df,
         out_dir / "panel_C_sd_pre_post_boxplot_pooledML_boxesonly.png",
         color_config=color_config,
-        pre_col="pre_sd",
-        post_col="post_sd",
-        y_label="Standard Deviation of\nPhrase Durations (ms)",
+        pre_col="pre_sd_s",
+        post_col="post_sd_s",
+        y_label="Phrase duration SD (s)",
         title=None,
-        y_scale="log",
+        y_scale="linear",
         paired_stats_df=stats_paired_df,
         base_metric="sd",
         pool_ml_groups=True,
@@ -1688,37 +1743,21 @@ def make_panel_c_boxplots(
         dpi=dpi,
     )
 
-    outputs["panel_C_variance_delta_vs_sham_boxplot"] = plot_change_metric_boxplot_vs_sham(
-        plot_df,
-        out_dir / "panel_C_variance_delta_vs_sham_boxplot_pooledML.png",
-        color_config=color_config,
-        metric_col="variance_delta",
-        y_label="Δ Variance (Post − Late Pre, ms²)",
-        title="Change in variance by lesion group",
-        stats_df=stats_welch_df,
-        y_scale="symlog",
-        include_pooled_ml=True,
-        tick_label_fontsize=boxplot_tick_label_fontsize,
-        axis_label_fontsize=boxplot_axis_label_fontsize,
-        title_fontsize=boxplot_title_fontsize,
-        figsize=(delta_boxplot_fig_width, delta_boxplot_fig_height),
-        show=show,
-        dpi=dpi,
-    )
     outputs["panel_C_sd_delta_vs_sham_boxplot"] = plot_change_metric_boxplot_vs_sham(
         plot_df,
         out_dir / "panel_C_sd_delta_vs_sham_boxplot_pooledML.png",
         color_config=color_config,
-        metric_col="sd_delta",
-        y_label="Δ Standard Deviation\n(Post − Late Pre, ms)",
-        title="Change in standard deviation by lesion group",
+        metric_col="sd_delta_s",
+        stats_metric_col="sd_delta",
+        y_label="Δ phrase duration SD (s)",
+        title=None,
         stats_df=stats_welch_df,
-        y_scale="symlog",
+        y_scale="linear",
         include_pooled_ml=True,
-        tick_label_fontsize=boxplot_tick_label_fontsize,
-        axis_label_fontsize=boxplot_axis_label_fontsize,
+        tick_label_fontsize=max(boxplot_tick_label_fontsize - 0.5, 11.5),
+        axis_label_fontsize=max(boxplot_axis_label_fontsize - 2.0, 14.0),
         title_fontsize=boxplot_title_fontsize,
-        figsize=(delta_boxplot_fig_width, delta_boxplot_fig_height),
+        figsize=(delta_boxplot_fig_width, max(delta_boxplot_fig_height - 0.4, 4.6)),
         show=show,
         dpi=dpi,
     )
@@ -1996,6 +2035,7 @@ def _make_daily_unit_table_for_sd_timecourse(
 ) -> pd.DataFrame:
     work = df.copy()
     work["sd_ms"] = np.sqrt(np.clip(pd.to_numeric(work["Variance (ms^2)"], errors="coerce").to_numpy(dtype=float), 0, None))
+    work["sd_s"] = work["sd_ms"] / 1000.0
     if pool_ml_groups:
         work["display_group"] = work["display_group"].replace({COMPLETE_ML_GROUP: POOLED_ML_GROUP, PARTIAL_ML_GROUP: POOLED_ML_GROUP})
     unit_level = unit_level.lower()
@@ -2017,6 +2057,7 @@ def _make_daily_unit_table_for_sd_timecourse(
 
     if unit_level == "animal":
         out["unit_id"] = out["animal_id"].astype(str)
+    out["sd_s"] = out["sd_ms"] / 1000.0
     return out.sort_values(["display_group", "unit_id", "relative_day"]).reset_index(drop=True)
 
 
@@ -2097,7 +2138,7 @@ def plot_panel_d_sd_timecourse(
     color_config: Dict[str, Any],
     value_col: str = "sd_ms",
     title: Optional[str] = None,
-    y_label: str = "Standard deviation\nof phrase durations (ms)",
+    y_label: str = "Standard deviation of\nphrase durations (s)",
     group_order: Optional[Sequence[str]] = None,
     x_min: int = -30,
     x_max: int = 30,
@@ -2148,6 +2189,8 @@ def plot_panel_d_sd_timecourse(
         ax.set_title(_pretty_group_label_timecourse(group), fontsize=panel_title_fontsize, pad=6)
         ax.set_xlim(x_min, x_max)
         _pretty_axes(ax, tick_label_fontsize=tick_label_fontsize)
+        if value_col.endswith("_s") or "(s)" in str(y_label):
+            _apply_seconds_tick_formatting(ax, x=False, y=True, max_major_ticks=5)
 
     if common_ylim:
         _set_common_ylim_from_percentile_timecourse(axes, unit_df[value_col].to_numpy(dtype=float), lower_percentile=y_lower_percentile, upper_percentile=y_upper_percentile)
@@ -2183,7 +2226,7 @@ def plot_panel_d_sd_timecourse_overlay(
     color_config: Dict[str, Any],
     value_col: str = "sd_ms",
     title: Optional[str] = None,
-    y_label: str = "Standard deviation\nof phrase durations (ms)",
+    y_label: str = "Standard deviation of\nphrase durations (s)",
     group_order: Optional[Sequence[str]] = None,
     x_min: int = -30,
     x_max: int = 30,
@@ -2256,6 +2299,8 @@ def plot_panel_d_sd_timecourse_overlay(
         ax.set_title(title, fontsize=title_fontsize, pad=10)
     ax.set_ylabel(y_label, fontsize=axis_label_fontsize, labelpad=-2)
     ax.set_xlabel("Days relative to lesion", fontsize=axis_label_fontsize)
+    if value_col.endswith("_s") or "(s)" in str(y_label):
+        _apply_seconds_tick_formatting(ax, x=False, y=True, max_major_ticks=5)
 
     handles = []
     if show_raw_traces:
@@ -2324,6 +2369,7 @@ def make_panel_c_and_d_variance_plots(
     smooth_stat: str = "median",
     unit_level: str = "animal",
     within_unit_stat: str = "median",
+    filter_daily_to_scatter_selection: bool = True,
     timecourse_fig_width: float = 14.0,
     timecourse_fig_height: float = 8.6,
     timecourse_legend_fontsize: float = 13.5,
@@ -2348,6 +2394,13 @@ def make_panel_c_and_d_variance_plots(
 
     outputs: Dict[str, Path] = {}
 
+    # Used to keep Panel D/E timecourses matched to the exact same
+    # animal × syllable set selected for Panel C scatter/boxplots. This is
+    # especially important when the primary Figure 3 selection is
+    # --rank-on pooled, because the daily CSV may have been generated from a
+    # broader set of syllables or from an older post-selected top-30 set.
+    selected_pairs_for_daily: Optional[pd.DataFrame] = None
+
     if scatter_csv is not None:
         scatter_df = _prepare_scatter_table(
             scatter_csv,
@@ -2363,6 +2416,20 @@ def make_panel_c_and_d_variance_plots(
             color_config=color_config,
         )
 
+        # Store the exact selected animal × syllable pairs for optional
+        # filtering of the daily timecourse. This keeps Panels A/D/E
+        # internally consistent under pooled pre+post selection.
+        selected_pairs_for_daily = (
+            scatter_df[["Animal ID", "Syllable"]]
+            .drop_duplicates()
+            .rename(columns={"Animal ID": "animal_id", "Syllable": "syllable"})
+        )
+        selected_pairs_for_daily["animal_id"] = selected_pairs_for_daily["animal_id"].astype(str)
+        selected_pairs_for_daily["syllable"] = selected_pairs_for_daily["syllable"].astype(str)
+        selected_pairs_path = out_dir / "panel_C_selected_animal_syllable_pairs.csv"
+        selected_pairs_for_daily.to_csv(selected_pairs_path, index=False)
+        outputs["panel_C_selected_pairs"] = selected_pairs_path
+
         # Main scatter table. This includes both variance and SD columns.
         table_path = out_dir / "panel_C_late_pre_vs_post_variance_and_sd_scatter_table.csv"
         scatter_df.to_csv(table_path, index=False)
@@ -2373,30 +2440,16 @@ def make_panel_c_and_d_variance_plots(
         scatter_df.to_csv(variance_table_path, index=False)
         outputs["panel_C_variance_table"] = variance_table_path
 
-        # Variance scatterplot, with no internal legend and tight axes.
-        outputs["panel_C_variance_scatter"] = plot_panel_c_scatter(
-            scatter_df,
-            out_dir / "panel_C_late_pre_vs_post_variance_scatter.png",
-            color_config=color_config,
-            x_col="pre_variance",
-            y_col="post_variance",
-            x_label="Late Pre variance (ms²)",
-            y_label="Post variance (ms²)",
-            axis_padding_frac=scatter_axis_padding_frac,
-            show_legend=False,
-            show=show,
-            dpi=dpi,
-        )
-
         # Standard deviation scatterplot, with no internal legend and tight axes.
+        # Values are plotted in seconds for manuscript readability.
         outputs["panel_C_sd_scatter"] = plot_panel_c_scatter(
             scatter_df,
             out_dir / "panel_C_late_pre_vs_post_sd_scatter.png",
             color_config=color_config,
-            x_col="pre_sd",
-            y_col="post_sd",
-            x_label="Late Pre standard deviation (ms)",
-            y_label="Post standard deviation (ms)",
+            x_col="pre_sd_s",
+            y_col="post_sd_s",
+            x_label="Late pre-lesion phrase duration SD (s)",
+            y_label="Post-lesion phrase duration SD (s)",
             axis_padding_frac=scatter_axis_padding_frac,
             show_legend=False,
             show=show,
@@ -2458,6 +2511,45 @@ def make_panel_c_and_d_variance_plots(
             meta_hit_type_col=daily_meta_hit_type_col,
             color_config=color_config,
         )
+
+        # Match the daily timecourse to the same selected animal × syllable
+        # pairs used for Panel C, if those pairs are available from the
+        # scatter/boxplot selection in this same run.
+        if filter_daily_to_scatter_selection and selected_pairs_for_daily is not None:
+            before_rows = len(daily_df)
+            before_pairs = daily_df[["animal_id", "syllable"]].drop_duplicates().shape[0]
+
+            daily_df["animal_id"] = daily_df["animal_id"].astype(str)
+            daily_df["syllable"] = daily_df["syllable"].astype(str)
+
+            daily_df = daily_df.merge(
+                selected_pairs_for_daily,
+                on=["animal_id", "syllable"],
+                how="inner",
+            )
+
+            after_rows = len(daily_df)
+            after_pairs = daily_df[["animal_id", "syllable"]].drop_duplicates().shape[0]
+            print(
+                "[INFO] Filtered daily timecourse to Panel C selected syllables: "
+                f"{after_rows:,}/{before_rows:,} rows and "
+                f"{after_pairs:,}/{before_pairs:,} animal × syllable pairs retained."
+            )
+
+            if daily_df.empty:
+                raise ValueError(
+                    "After filtering the daily timecourse to Panel C selected animal × syllable "
+                    "pairs, no rows remained. This usually means the --daily-csv was already "
+                    "pre-filtered using a different selection rule or uses different animal/syllable "
+                    "IDs. Use an all-syllable daily CSV, or rerun with "
+                    "--no-filter-daily-to-scatter-selection to reproduce the old behavior."
+                )
+        elif daily_csv is not None and selected_pairs_for_daily is None:
+            print(
+                "[INFO] Daily timecourse was not filtered to selected Panel C syllables "
+                "because no --scatter-csv selection was provided in this run."
+            )
+
         daily_table_path = out_dir / "panel_D_sd_timecourse_source_table.csv"
         daily_df.to_csv(daily_table_path, index=False)
         outputs["panel_D_table"] = daily_table_path
@@ -2475,7 +2567,7 @@ def make_panel_c_and_d_variance_plots(
         group_order = _panel_d_group_order_from_config(color_config)
         smooth_df = _rolling_window_summary_for_sd_timecourse(
             unit_df,
-            value_col="sd_ms",
+            value_col="sd_s",
             window_days=smooth_window_days,
             summary_stat=smooth_stat,
             group_order=group_order,
@@ -2484,15 +2576,15 @@ def make_panel_c_and_d_variance_plots(
         smooth_df.to_csv(smooth_path, index=False)
         outputs["panel_D_rolling_summary"] = smooth_path
 
-        timecourse_title = f"Phrase-duration SD over time ({smooth_window_days}-day rolling {smooth_stat})"
+        timecourse_title = f"Phrase duration SD over time ({smooth_window_days}-day rolling {smooth_stat})"
         outputs["panel_D_sd_timecourse"] = plot_panel_d_sd_timecourse(
             unit_df,
             smooth_df,
             out_dir / "panel_D_sd_timecourse.png",
             color_config=color_config,
-            value_col="sd_ms",
+            value_col="sd_s",
             title=None,
-            y_label="Standard deviation\nof phrase durations (ms)",
+            y_label="Phrase duration SD (s)",
             group_order=group_order,
             x_min=-30 if x_min is None else int(x_min),
             x_max=30 if x_max is None else int(x_max),
@@ -2508,9 +2600,9 @@ def make_panel_c_and_d_variance_plots(
             smooth_df,
             out_dir / "panel_D_sd_timecourse_summary_only.png",
             color_config=color_config,
-            value_col="sd_ms",
+            value_col="sd_s",
             title=None,
-            y_label="Standard deviation\nof phrase durations (ms)",
+            y_label="Phrase duration SD (s)",
             group_order=group_order,
             x_min=-30 if x_min is None else int(x_min),
             x_max=30 if x_max is None else int(x_max),
@@ -2527,9 +2619,9 @@ def make_panel_c_and_d_variance_plots(
             smooth_df,
             out_dir / "panel_D_sd_timecourse_overlay.png",
             color_config=color_config,
-            value_col="sd_ms",
+            value_col="sd_s",
             title=None,
-            y_label="Standard deviation\nof phrase durations (ms)",
+            y_label="Phrase duration SD (s)",
             group_order=group_order,
             x_min=-30 if x_min is None else int(x_min),
             x_max=30 if x_max is None else int(x_max),
@@ -2547,9 +2639,9 @@ def make_panel_c_and_d_variance_plots(
             smooth_df,
             out_dir / "panel_D_sd_timecourse_overlay_summary_only.png",
             color_config=color_config,
-            value_col="sd_ms",
+            value_col="sd_s",
             title=None,
-            y_label="Standard deviation\nof phrase durations (ms)",
+            y_label="Phrase duration SD (s)",
             group_order=group_order,
             x_min=-30 if x_min is None else int(x_min),
             x_max=30 if x_max is None else int(x_max),
@@ -2578,7 +2670,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
             "Make Panel C pre/post scatterplots, boxplots, statistics, plus a cleaned Panel D "
-            "phrase-duration SD timecourse using one lesion-group color palette."
+            "phrase duration SD timecourse using one lesion-group color palette."
         )
     )
 
@@ -2656,6 +2748,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--smooth-stat", choices=["median", "mean"], default="median", help="Rolling summary statistic for the SD timecourse.")
     p.add_argument("--unit-level", choices=["animal", "animal_syllable"], default="animal", help="Unit to collapse the daily timecourse before smoothing.")
     p.add_argument("--within-unit-stat", choices=["median", "mean"], default="median", help="Statistic used to collapse multiple syllables within each unit per day.")
+    p.add_argument(
+        "--no-filter-daily-to-scatter-selection",
+        action="store_true",
+        help=(
+            "Do not restrict the daily timecourse to the animal × syllable pairs selected "
+            "for Panel C. Default behavior is to filter when both --scatter-csv and "
+            "--daily-csv are provided, so Panels A/D/E use the same selected syllables."
+        ),
+    )
     p.add_argument("--timecourse-fig-width", type=float, default=14.0, help="Width in inches for the SD timecourse panels.")
     p.add_argument("--timecourse-fig-height", type=float, default=8.6, help="Height in inches for the SD timecourse panels.")
     p.add_argument("--legend-fontsize", type=float, default=13.5, help="Legend font size for the SD timecourse panels.")
@@ -2715,6 +2816,7 @@ def main() -> None:
         smooth_stat=args.smooth_stat,
         unit_level=args.unit_level,
         within_unit_stat=args.within_unit_stat,
+        filter_daily_to_scatter_selection=not args.no_filter_daily_to_scatter_selection,
         timecourse_fig_width=args.timecourse_fig_width,
         timecourse_fig_height=args.timecourse_fig_height,
         timecourse_legend_fontsize=args.legend_fontsize,

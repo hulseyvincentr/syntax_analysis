@@ -45,6 +45,10 @@ Edits in this version
       - Late Pre vs Post standard deviation distributions
       - change in variance versus sham controls
       - change in standard deviation versus sham controls
+6. When both --scatter-csv and --daily-csv are provided, Panel D/E timecourse
+   rows are filtered to the same selected animal × syllable pairs used for
+   Panel C. This keeps pooled pre+post-selected Figure 3 panels internally
+   consistent. Use --no-filter-daily-to-scatter-selection to disable.
 
 Statistical design
 ------------------
@@ -2324,6 +2328,7 @@ def make_panel_c_and_d_variance_plots(
     smooth_stat: str = "median",
     unit_level: str = "animal",
     within_unit_stat: str = "median",
+    filter_daily_to_scatter_selection: bool = True,
     timecourse_fig_width: float = 14.0,
     timecourse_fig_height: float = 8.6,
     timecourse_legend_fontsize: float = 13.5,
@@ -2348,6 +2353,13 @@ def make_panel_c_and_d_variance_plots(
 
     outputs: Dict[str, Path] = {}
 
+    # Used to keep Panel D/E timecourses matched to the exact same
+    # animal × syllable set selected for Panel C scatter/boxplots. This is
+    # especially important when the primary Figure 3 selection is
+    # --rank-on pooled, because the daily CSV may have been generated from a
+    # broader set of syllables or from an older post-selected top-30 set.
+    selected_pairs_for_daily: Optional[pd.DataFrame] = None
+
     if scatter_csv is not None:
         scatter_df = _prepare_scatter_table(
             scatter_csv,
@@ -2362,6 +2374,20 @@ def make_panel_c_and_d_variance_plots(
             meta_hit_type_col=scatter_meta_hit_type_col,
             color_config=color_config,
         )
+
+        # Store the exact selected animal × syllable pairs for optional
+        # filtering of the daily timecourse. This keeps Panels A/D/E
+        # internally consistent under pooled pre+post selection.
+        selected_pairs_for_daily = (
+            scatter_df[["Animal ID", "Syllable"]]
+            .drop_duplicates()
+            .rename(columns={"Animal ID": "animal_id", "Syllable": "syllable"})
+        )
+        selected_pairs_for_daily["animal_id"] = selected_pairs_for_daily["animal_id"].astype(str)
+        selected_pairs_for_daily["syllable"] = selected_pairs_for_daily["syllable"].astype(str)
+        selected_pairs_path = out_dir / "panel_C_selected_animal_syllable_pairs.csv"
+        selected_pairs_for_daily.to_csv(selected_pairs_path, index=False)
+        outputs["panel_C_selected_pairs"] = selected_pairs_path
 
         # Main scatter table. This includes both variance and SD columns.
         table_path = out_dir / "panel_C_late_pre_vs_post_variance_and_sd_scatter_table.csv"
@@ -2458,6 +2484,45 @@ def make_panel_c_and_d_variance_plots(
             meta_hit_type_col=daily_meta_hit_type_col,
             color_config=color_config,
         )
+
+        # Match the daily timecourse to the same selected animal × syllable
+        # pairs used for Panel C, if those pairs are available from the
+        # scatter/boxplot selection in this same run.
+        if filter_daily_to_scatter_selection and selected_pairs_for_daily is not None:
+            before_rows = len(daily_df)
+            before_pairs = daily_df[["animal_id", "syllable"]].drop_duplicates().shape[0]
+
+            daily_df["animal_id"] = daily_df["animal_id"].astype(str)
+            daily_df["syllable"] = daily_df["syllable"].astype(str)
+
+            daily_df = daily_df.merge(
+                selected_pairs_for_daily,
+                on=["animal_id", "syllable"],
+                how="inner",
+            )
+
+            after_rows = len(daily_df)
+            after_pairs = daily_df[["animal_id", "syllable"]].drop_duplicates().shape[0]
+            print(
+                "[INFO] Filtered daily timecourse to Panel C selected syllables: "
+                f"{after_rows:,}/{before_rows:,} rows and "
+                f"{after_pairs:,}/{before_pairs:,} animal × syllable pairs retained."
+            )
+
+            if daily_df.empty:
+                raise ValueError(
+                    "After filtering the daily timecourse to Panel C selected animal × syllable "
+                    "pairs, no rows remained. This usually means the --daily-csv was already "
+                    "pre-filtered using a different selection rule or uses different animal/syllable "
+                    "IDs. Use an all-syllable daily CSV, or rerun with "
+                    "--no-filter-daily-to-scatter-selection to reproduce the old behavior."
+                )
+        elif daily_csv is not None and selected_pairs_for_daily is None:
+            print(
+                "[INFO] Daily timecourse was not filtered to selected Panel C syllables "
+                "because no --scatter-csv selection was provided in this run."
+            )
+
         daily_table_path = out_dir / "panel_D_sd_timecourse_source_table.csv"
         daily_df.to_csv(daily_table_path, index=False)
         outputs["panel_D_table"] = daily_table_path
@@ -2656,6 +2721,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--smooth-stat", choices=["median", "mean"], default="median", help="Rolling summary statistic for the SD timecourse.")
     p.add_argument("--unit-level", choices=["animal", "animal_syllable"], default="animal", help="Unit to collapse the daily timecourse before smoothing.")
     p.add_argument("--within-unit-stat", choices=["median", "mean"], default="median", help="Statistic used to collapse multiple syllables within each unit per day.")
+    p.add_argument(
+        "--no-filter-daily-to-scatter-selection",
+        action="store_true",
+        help=(
+            "Do not restrict the daily timecourse to the animal × syllable pairs selected "
+            "for Panel C. Default behavior is to filter when both --scatter-csv and "
+            "--daily-csv are provided, so Panels A/D/E use the same selected syllables."
+        ),
+    )
     p.add_argument("--timecourse-fig-width", type=float, default=14.0, help="Width in inches for the SD timecourse panels.")
     p.add_argument("--timecourse-fig-height", type=float, default=8.6, help="Height in inches for the SD timecourse panels.")
     p.add_argument("--legend-fontsize", type=float, default=13.5, help="Legend font size for the SD timecourse panels.")
@@ -2715,6 +2789,7 @@ def main() -> None:
         smooth_stat=args.smooth_stat,
         unit_level=args.unit_level,
         within_unit_stat=args.within_unit_stat,
+        filter_daily_to_scatter_selection=not args.no_filter_daily_to_scatter_selection,
         timecourse_fig_width=args.timecourse_fig_width,
         timecourse_fig_height=args.timecourse_fig_height,
         timecourse_legend_fontsize=args.legend_fontsize,

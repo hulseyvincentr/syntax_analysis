@@ -487,12 +487,8 @@ def _prepare_scatter_table(
             wide["rank_metric"] = wide["post_variance"]
         elif rank_on == "max":
             wide["rank_metric"] = wide[["pre_variance", "post_variance"]].max(axis=1)
-        elif rank_on in {"pooled", "pooled_mean", "mean"}:
-            # Symmetric robustness check: rank syllables by their average
-            # variability across Late Pre and Post rather than by Post alone.
-            wide["rank_metric"] = wide[["pre_variance", "post_variance"]].mean(axis=1)
         else:
-            raise ValueError("rank_on must be one of: pre, post, max, pooled")
+            raise ValueError("rank_on must be one of: pre, post, max")
 
         keep_parts = []
         for _, g in wide.groupby(animal_col, dropna=False):
@@ -2612,7 +2608,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=70.0,
         help="Percentile threshold within each animal. Use 70 for top 30%%. Use -1 to disable.",
     )
-    p.add_argument("--rank-on", choices=["pre", "post", "max", "pooled"], default="post")
+    p.add_argument("--rank-on", choices=["pre", "post", "max"], default="post")
     p.add_argument("--min-n-phrases", type=int, default=5)
     p.add_argument(
         "--scatter-axis-padding-frac",
