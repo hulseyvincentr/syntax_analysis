@@ -1,0 +1,344 @@
+--- /mnt/data/figure3_panelE_longevity_normalized_sd_cv_v4.py	2026-07-28 20:43:35.922036106 +0000
++++ /mnt/data/figure3_panelE_longevity_normalized_sd_cv_v5_ML_sham.py	2026-07-28 20:46:40.930029006 +0000
+@@ -1,18 +1,21 @@
+ #!/usr/bin/env python3
+ # -*- coding: utf-8 -*-
+ """
+-figure3_panelE_longevity_normalized_sd_cv_v4.py
++figure3_panelE_longevity_normalized_sd_cv_v5_ML_sham.py
+ 
+ Create medial+lateral-lesion-only longitudinal plots for the persistence of
+ phrase-duration variability. This companion script is intended to replace the
+ all-group raw-SD overlay previously used for Figure 3 Panel E.
+ 
+-Updates in v4
++Updates in v5
+ -------------
+-1. Summary-only plots use tighter y-axis limits based on the rolling median and
+-   IQR, which reduces excess white space below the curves.
+-2. The multiline y-axis labels, sparse symlog ticks, plain-number log tick
+-   labels, and summary-only timecourse versions from v3 are retained.
++1. Adds a summary-only CV fold-change panel comparing pooled medial+lateral
++   lesion birds with sham saline controls. Each group is normalized independently
++   to each bird's own late-pre baseline before equal-bird rolling summaries.
++2. Changes the pooled M+L line and shading from charcoal to the Figure 3 dark
++   purple; sham is shown in the Figure 3 teal/green.
++3. Summary-only plots retain the tighter y-axis limits, multiline y-axis labels,
++   sparse symlog ticks, and plain-number log tick labels from v4.
+ 
+ Why this version
+ ----------------
+@@ -51,14 +54,15 @@
+   panelE_ML_CV_persistence_fraction_above_pre95.png/pdf
+   panelE_ML_CV_persistence_timeline.png/pdf
+   panelE_ML_SD_fold_change_timecourse_summary_only.png/pdf   [new in v2]
+-  panelE_ML_CV_fold_change_timecourse_summary_only.png/pdf   [new in v2]
++  panelE_ML_CV_fold_change_timecourse_summary_only.png/pdf
++  panelE_ML_vs_sham_CV_fold_change_timecourse_summary_only.png/pdf [new in v5]
+ 
+ Recommended usage
+ -----------------
+ First run the existing Figure 3 script so it writes the pooled-pre/post-selected
+ animal × syllable pairs. Then run:
+ 
+-python figure3_panelE_longevity_normalized_sd_cv_v1.py \
++python figure3_panelE_longevity_normalized_sd_cv_v5_ML_sham.py \
+   --daily-variance-csv "/Volumes/my_own_SSD/updated_AreaX_outputs/phrase_duration_batch_outputs/_batch_summary/batch_aligned_phrase_duration_variance_all.csv" \
+   --selected-pairs-csv "/Volumes/my_own_SSD/updated_AreaX_outputs/Figure3_pooled_prepost_top30_ALLdaily_SDonly_seconds/panel_C_selected_animal_syllable_pairs.csv" \
+   --duration-long-csv "/Volumes/my_own_SSD/updated_AreaX_outputs/phrase_duration_batch_outputs/_batch_summary/all_birds_phrase_duration_long_latepre_post_epochs.csv" \
+@@ -107,11 +111,22 @@
+ POOLED_ML_GROUP = "Complete and partial medial and lateral lesion"
+ ML_GROUPS = {COMPLETE_ML_GROUP, PARTIAL_ML_GROUP, POOLED_ML_GROUP}
+ 
+-# Kept deliberately close to the existing Figure 3 appearance.
+-ML_LINE_COLOR = "#4D4D4D"
+-ML_INDIVIDUAL_COLOR = "#9E9E9E"
++# Figure 3 lesion-group palette.
++# Complete M+L is the dark purple used in Panel D; sham is teal/green.
++ML_LINE_COLOR = "#3F007D"
++ML_INDIVIDUAL_COLOR = "#9B7BC4"
++SHAM_LINE_COLOR = "#1B9E77"
+ LESION_COLOR = "#D62728"
+ 
++GROUP_LINE_COLORS = {
++    POOLED_ML_GROUP: ML_LINE_COLOR,
++    SHAM_GROUP: SHAM_LINE_COLOR,
++}
++GROUP_DISPLAY_LABELS = {
++    POOLED_ML_GROUP: "Complete and partial medial+lateral lesion",
++    SHAM_GROUP: "Sham saline injection",
++}
++
+ 
+ # -----------------------------------------------------------------------------
+ # General helpers
+@@ -1408,13 +1423,240 @@
+ 
+ 
+ # -----------------------------------------------------------------------------
++# M+L versus sham comparison panel
++# -----------------------------------------------------------------------------
++def plot_group_comparison_timecourse(
++    summaries: dict[str, pd.DataFrame],
++    out_base: Path,
++    *,
++    metric_col: str,
++    y_label: str,
++    reference_value: float,
++    x_min: int,
++    x_max: int,
++    band: str,
++    min_animals_for_summary: int,
++    dpi: int,
++    show: bool,
++) -> None:
++    """Plot equal-bird rolling summaries for pooled M+L and sham on one axis."""
++    fig, ax = plt.subplots(figsize=(8.4, 4.8))
++    plotted_groups: list[str] = []
++    all_values: list[np.ndarray] = []
++    band_label = "IQR across birds"
++
++    for group in [POOLED_ML_GROUP, SHAM_GROUP]:
++        summary = summaries.get(group)
++        if summary is None or summary.empty:
++            continue
++
++        s = summary.sort_values("relative_day")
++        color = GROUP_LINE_COLORS[group]
++        if (
++            band == "bootstrap_ci"
++            and s[["bootstrap_ci_low", "bootstrap_ci_high"]].notna().any().all()
++        ):
++            lower = s["bootstrap_ci_low"].to_numpy(dtype=float)
++            upper = s["bootstrap_ci_high"].to_numpy(dtype=float)
++            band_label = "95% bootstrap CI"
++        else:
++            lower = s["q25"].to_numpy(dtype=float)
++            upper = s["q75"].to_numpy(dtype=float)
++            band_label = "IQR across birds"
++
++        x = s["relative_day"].to_numpy(dtype=float)
++        ax.fill_between(
++            x,
++            lower,
++            upper,
++            color=color,
++            alpha=0.16,
++            linewidth=0,
++            zorder=2,
++        )
++        ax.plot(
++            x,
++            s["summary"],
++            color=color,
++            linewidth=3.2,
++            zorder=3,
++        )
++        plotted_groups.append(group)
++        all_values.extend(
++            [
++                pd.to_numeric(s[column], errors="coerce").dropna().to_numpy(dtype=float)
++                for column in ["summary", "q25", "q75"]
++                if column in s.columns
++            ]
++        )
++
++    if not plotted_groups:
++        plt.close(fig)
++        warnings.warn("No M+L or sham rolling summaries were available for comparison.")
++        return
++
++    ax.axhline(reference_value, color="0.35", linestyle=":", linewidth=1.1, zorder=0)
++    ax.axvline(0, color=LESION_COLOR, linestyle="--", linewidth=1.3, zorder=4)
++    ax.set_xlim(x_min, x_max)
++    ax.set_xlabel("Days relative to lesion", fontsize=17)
++    ax.set_ylabel(y_label, fontsize=17)
++    pretty_axes(ax, tick_fontsize=12.5)
++
++    values = np.concatenate([v for v in all_values if v.size]) if any(v.size for v in all_values) else np.array([])
++    positive = values[np.isfinite(values) & (values > 0)]
++    if positive.size:
++        lo = min(float(np.nanmin(positive)), reference_value)
++        hi = max(float(np.nanmax(positive)), reference_value)
++        if hi > lo > 0:
++            # Match the existing fold-change Panel E convention.
++            ax.set_yscale("log")
++            ax.set_ylim(lo * 0.97, hi * 1.06)
++            apply_plain_log_tick_labels(ax, axis="y")
++
++    handles: list[object] = []
++    for group in plotted_groups:
++        handles.append(
++            Line2D(
++                [0],
++                [0],
++                color=GROUP_LINE_COLORS[group],
++                linewidth=3.2,
++                label=(
++                    f"{GROUP_DISPLAY_LABELS[group]} rolling median "
++                    f"(n≥{min_animals_for_summary})"
++                ),
++            )
++        )
++    handles.extend(
++        [
++            Patch(facecolor="0.45", edgecolor="none", alpha=0.16, label=band_label),
++            Line2D(
++                [0],
++                [0],
++                color=LESION_COLOR,
++                linestyle="--",
++                linewidth=1.3,
++                label="lesion/injection day",
++            ),
++        ]
++    )
++    ax.legend(handles=handles, frameon=False, fontsize=9.5, loc="upper left")
++    fig.tight_layout()
++    fig.subplots_adjust(left=0.25, bottom=0.16)
++    save_figure(fig, out_base, dpi=dpi, show=show)
++
++
++def run_ml_vs_sham_cv_comparison(
++    daily: pd.DataFrame,
++    *,
++    out_dir: Path,
++    baseline_start_day: int,
++    baseline_end_day: int,
++    min_baseline_days: int,
++    x_min: int,
++    x_max: int,
++    smooth_window_days: int,
++    rolling_stat: str,
++    min_observations_per_bird_window: int,
++    min_animals_for_summary: int,
++    bootstrap_reps: int,
++    seed: int,
++    band: str,
++    dpi: int,
++    show: bool,
++) -> dict[str, Path]:
++    """Create the additional baseline-normalized CV panel for M+L versus sham."""
++    outputs: dict[str, Path] = {}
++    normalized_parts: list[pd.DataFrame] = []
++    baseline_parts: list[pd.DataFrame] = []
++    summary_parts: list[pd.DataFrame] = []
++    summaries: dict[str, pd.DataFrame] = {}
++
++    group_masks = {
++        POOLED_ML_GROUP: daily["display_group"].isin(ML_GROUPS),
++        SHAM_GROUP: daily["display_group"].eq(SHAM_GROUP),
++    }
++
++    for group_index, group in enumerate([POOLED_ML_GROUP, SHAM_GROUP]):
++        subset = daily.loc[group_masks[group]].copy()
++        if subset.empty:
++            warnings.warn(
++                f"Skipping {GROUP_DISPLAY_LABELS[group]} in the comparison panel: no CV rows."
++            )
++            continue
++        subset["display_group"] = group
++
++        normalized, baseline = add_baseline_normalization(
++            subset,
++            value_col="cv",
++            baseline_start_day=baseline_start_day,
++            baseline_end_day=baseline_end_day,
++            min_baseline_days=min_baseline_days,
++        )
++        normalized["display_group"] = group
++        baseline["display_group"] = group
++
++        summary = equal_bird_rolling_summary(
++            normalized,
++            metric_col="fold_change",
++            x_min=x_min,
++            x_max=x_max,
++            window_days=smooth_window_days,
++            rolling_stat=rolling_stat,
++            min_observations_per_bird_window=min_observations_per_bird_window,
++            min_animals_for_summary=min_animals_for_summary,
++            bootstrap_reps=bootstrap_reps,
++            seed=seed + 20000 + group_index * 1000,
++        )
++        summary["display_group"] = group
++
++        normalized_parts.append(normalized)
++        baseline_parts.append(baseline)
++        summary_parts.append(summary)
++        summaries[group] = summary
++
++    if not summaries:
++        warnings.warn("The M+L versus sham CV comparison panel was not generated.")
++        return outputs
++
++    normalized_all = pd.concat(normalized_parts, ignore_index=True)
++    baseline_all = pd.concat(baseline_parts, ignore_index=True)
++    summary_all = pd.concat(summary_parts, ignore_index=True)
++
++    normalized_path = out_dir / "panelE_ML_vs_sham_daily_CV_normalized.csv"
++    baseline_path = out_dir / "panelE_ML_vs_sham_CV_baseline_summary.csv"
++    summary_path = out_dir / "panelE_ML_vs_sham_CV_fold_change_equal_weight_rolling_summary.csv"
++    outputs["CV_ML_vs_sham_normalized_table"] = write_csv(normalized_all, normalized_path)
++    outputs["CV_ML_vs_sham_baseline_table"] = write_csv(baseline_all, baseline_path)
++    outputs["CV_ML_vs_sham_fold_change_summary"] = write_csv(summary_all, summary_path)
++
++    out_base = out_dir / "panelE_ML_vs_sham_CV_fold_change_timecourse_summary_only"
++    plot_group_comparison_timecourse(
++        summaries,
++        out_base,
++        metric_col="fold_change",
++        y_label="Phrase duration CV\n/ late-pre baseline",
++        reference_value=1.0,
++        x_min=x_min,
++        x_max=x_max,
++        band=band,
++        min_animals_for_summary=min_animals_for_summary,
++        dpi=dpi,
++        show=show,
++    )
++    outputs["CV_ML_vs_sham_fold_change_timecourse_png"] = out_base.with_suffix(".png")
++    outputs["CV_ML_vs_sham_fold_change_timecourse_pdf"] = out_base.with_suffix(".pdf")
++    return outputs
++
++
++# -----------------------------------------------------------------------------
+ # CLI
+ # -----------------------------------------------------------------------------
+ def build_parser() -> argparse.ArgumentParser:
+     parser = argparse.ArgumentParser(
+         description=(
+-            "Create M+L-only baseline-normalized SD and CV timecourses, heatmaps, "
+-            "small multiples, and persistence summaries for Figure 3 Panel E."
++            "Create baseline-normalized Figure 3 Panel E outputs, including M+L-only "
++            "SD/CV plots and an additional pooled M+L versus sham CV comparison."
+         )
+     )
+     parser.add_argument("--daily-variance-csv", required=True, type=Path)
+@@ -1606,6 +1848,26 @@
+                 dpi=args.dpi,
+                 show=show,
+             )
++        )
++        outputs.update(
++            run_ml_vs_sham_cv_comparison(
++                cv_daily,
++                out_dir=out_dir,
++                baseline_start_day=args.baseline_start_day,
++                baseline_end_day=args.baseline_end_day,
++                min_baseline_days=args.min_baseline_days,
++                x_min=args.x_min,
++                x_max=args.x_max,
++                smooth_window_days=args.smooth_window_days,
++                rolling_stat=args.rolling_stat,
++                min_observations_per_bird_window=args.min_observations_per_bird_window,
++                min_animals_for_summary=args.min_animals_for_summary,
++                bootstrap_reps=args.bootstrap_reps,
++                seed=args.seed,
++                band=args.band,
++                dpi=args.dpi,
++                show=show,
++            )
+         )
+     else:
+         print(
