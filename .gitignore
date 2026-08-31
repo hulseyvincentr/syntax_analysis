@@ -24,3 +24,14 @@ __pycache__/
 *.parquet
 *.npz
 data_inputs/
+
+# Generated analysis results
+phrase_variability_hierarchy_results*/
+simple_variance_test_results/
+
+# Local manuscript/review files
+py_files/AFP_Lesion_paper_*.docx
+py_files/AFP_Lesion_paper_*.pdf
+
+# Local reference image
+py_files/F10.large.jpg
