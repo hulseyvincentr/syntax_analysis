@@ -1,0 +1,1383 @@
+#!/usr/bin/env python3
+"""
+Batch pre/post-procedure UMAP QC for all birds in updated_AreaX_outputs.
+
+For each bird folder, this script looks for:
+
+    /Volumes/my_own_SSD/updated_AreaX_outputs/<BIRD>/<BIRD>.npz
+
+and uses the existing arrays:
+    embedding_outputs : existing 2-D UMAP coordinates
+    hdbscan_labels    : existing HDBSCAN cluster labels
+    file_indices      : point -> source file index
+    file_map          : file index -> source filename
+
+Colors are loaded from:
+    /Volumes/my_own_SSD/updated_AreaX_outputs/fixed_label_colors_50.json
+
+Because every bird has a different intervention/procedure date, dates are
+provided through a CSV with these columns:
+
+    bird,split_date,event_label
+
+Example:
+    USA5288,2024-04-09,lesion
+    USA1234,2024-03-18,sham
+
+"event_label" is optional. If blank, "procedure" is used.
+
+FIRST RUN
+---------
+Create a template listing all discovered birds:
+
+    python py_files/plot_all_birds_pre_post_umap_qc.py --make-date-template
+
+This writes:
+    ~/Desktop/bird_split_dates.csv
+
+Fill in the split_date column, save the CSV, then run:
+
+    python py_files/plot_all_birds_pre_post_umap_qc.py
+
+OUTPUTS
+-------
+All generated plots and CSVs are written outside the Git repo:
+
+    ~/Desktop/all_birds_pre_post_umap_QC/
+        all_birds_qc_run_summary.csv
+        USA5288/
+            USA5288_pre_post_side_by_side.png
+            USA5288_pre_gray_post_colored_overlay.png
+            USA5288_cluster_centroids.png
+            USA5288_cluster_shift_summary.csv
+            USA5288_recording_date_summary.csv
+        <other bird>/
+            ...
+
+The script processes birds sequentially so that only one large NPZ is loaded
+at a time. If one bird fails, that error is recorded and the script continues
+to the next bird.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+import argparse
+import gc
+import json
+import re
+import traceback
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+
+
+# ============================================================
+# DEFAULT CONFIG
+# ============================================================
+
+DEFAULT_ROOT_DIR = Path(
+    "/Volumes/my_own_SSD/updated_AreaX_outputs"
+)
+
+DEFAULT_COLOR_JSON = (
+    DEFAULT_ROOT_DIR / "fixed_label_colors_50.json"
+)
+
+DEFAULT_DATES_CSV = (
+    Path.home() / "Desktop" / "bird_split_dates.csv"
+)
+
+DEFAULT_OUTPUT_ROOT = (
+    Path.home() / "Desktop" / "all_birds_pre_post_umap_QC"
+)
+
+POINT_SIZE = 2.0
+POINT_ALPHA = 0.55
+
+PRE_GRAY = "0.72"
+PRE_ALPHA = 0.18
+POST_ALPHA = 0.65
+
+ROBUST_CROP_PERCENT = 99.0
+
+MIN_PRE_POINTS_FOR_CENTROID = 20
+MIN_POST_POINTS_FOR_CENTROID = 20
+
+NOISE_LABEL = -1
+SHOW_NOISE = True
+
+
+# ============================================================
+# NPZ discovery
+# ============================================================
+
+def discover_bird_npzs(root_dir: Path) -> dict[str, Path]:
+    """
+    Discover one bird-level NPZ per immediate subfolder.
+
+    Preferred organization:
+        root_dir/BIRD/BIRD.npz
+
+    If that exact file is absent but the folder contains exactly one .npz
+    directly inside it, that single file is used as a fallback.
+
+    This intentionally does NOT recursively search nested segment folders,
+    which avoids accidentally collecting thousands of source-segment NPZs.
+    """
+    if not root_dir.exists():
+        raise FileNotFoundError(
+            f"Root directory does not exist:\n  {root_dir}"
+        )
+
+    found: dict[str, Path] = {}
+
+    for folder in sorted(root_dir.iterdir()):
+        if not folder.is_dir():
+            continue
+
+        bird = folder.name
+        preferred = folder / f"{bird}.npz"
+
+        if preferred.exists():
+            found[bird] = preferred
+            continue
+
+        direct_npzs = sorted(folder.glob("*.npz"))
+
+        if len(direct_npzs) == 1:
+            found[bird] = direct_npzs[0]
+
+    return found
+
+
+# ============================================================
+# Split-date CSV
+# ============================================================
+
+def write_date_template(
+    discovered: dict[str, Path],
+    csv_path: Path,
+) -> None:
+    """
+    Write a template CSV containing every discovered bird.
+    """
+    rows = []
+
+    for bird, npz_path in discovered.items():
+        rows.append(
+            {
+                "bird": bird,
+                "split_date": "",
+                "event_label": "",
+                "npz_path": str(npz_path),
+            }
+        )
+
+    df = pd.DataFrame(rows)
+
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(csv_path, index=False)
+
+    print(f"\nWrote date template:\n  {csv_path}")
+    print(
+        "\nFill in split_date as YYYY-MM-DD for each bird. "
+        "Optionally set event_label to lesion or sham."
+    )
+
+
+def load_split_dates(csv_path: Path) -> pd.DataFrame:
+    """
+    Load and validate the bird split-date table.
+
+    Required columns:
+        bird
+        split_date
+
+    Optional:
+        event_label
+    """
+    if not csv_path.exists():
+        raise FileNotFoundError(
+            f"Split-date CSV was not found:\n  {csv_path}"
+        )
+
+    df = pd.read_csv(
+        csv_path,
+        dtype={"bird": str},
+    )
+
+    required = {"bird", "split_date"}
+    missing = required - set(df.columns)
+
+    if missing:
+        raise ValueError(
+            "Split-date CSV is missing required columns: "
+            + ", ".join(sorted(missing))
+        )
+
+    if "event_label" not in df.columns:
+        df["event_label"] = "procedure"
+
+    df["bird"] = df["bird"].astype(str).str.strip()
+
+    # Keep blanks as missing rather than converting them to an arbitrary date.
+    split_raw = df["split_date"].astype("string").str.strip()
+
+    df["split_date"] = pd.to_datetime(
+        split_raw.replace({"": pd.NA}),
+        errors="coerce",
+    ).dt.normalize()
+
+    df["event_label"] = (
+        df["event_label"]
+        .fillna("procedure")
+        .astype(str)
+        .str.strip()
+        .replace("", "procedure")
+    )
+
+    if df["bird"].duplicated().any():
+        dupes = (
+            df.loc[df["bird"].duplicated(keep=False), "bird"]
+            .drop_duplicates()
+            .tolist()
+        )
+        raise ValueError(
+            "Duplicate birds in split-date CSV: "
+            + ", ".join(dupes)
+        )
+
+    return df.set_index("bird", drop=False)
+
+
+# ============================================================
+# Date handling
+# ============================================================
+
+_SERIAL_RE = re.compile(
+    r"^[^_]+_([0-9]+(?:\.[0-9]+)?)_"
+)
+
+
+def serial_date_from_filename(filename: str) -> pd.Timestamp:
+    """
+    Extract Excel/MATLAB-style serial date from filenames such as:
+
+        USA5288_45382.42553504_3_31_11_49_13_segment_0.npz
+
+    Returns a normalized pandas Timestamp.
+    """
+    basename = Path(filename).name
+    match = _SERIAL_RE.search(basename)
+
+    if match is None:
+        raise ValueError(
+            "Could not extract serial date from filename:\n"
+            f"  {basename}"
+        )
+
+    serial = float(match.group(1))
+
+    dt = (
+        pd.Timestamp("1899-12-30")
+        + pd.to_timedelta(serial, unit="D")
+    )
+
+    return dt.normalize()
+
+
+def unpack_file_map_value(mapped_value) -> str:
+    """
+    file_map values are often one-element tuples, but tolerate strings or
+    NumPy containers as well.
+    """
+    if isinstance(mapped_value, str):
+        return mapped_value
+
+    if isinstance(mapped_value, np.ndarray):
+        if mapped_value.size == 0:
+            raise ValueError("Encountered empty file_map array value.")
+        return str(mapped_value.flat[0])
+
+    if isinstance(mapped_value, (tuple, list)):
+        if len(mapped_value) == 0:
+            raise ValueError("Encountered empty file_map sequence value.")
+        return str(mapped_value[0])
+
+    return str(mapped_value)
+
+
+def build_point_dates(file_indices, file_map):
+    """
+    Convert every UMAP point's source-file index into a recording date.
+    """
+    date_by_file_index = {}
+
+    for idx, mapped_value in file_map.items():
+        filename = unpack_file_map_value(mapped_value)
+
+        date_by_file_index[int(idx)] = (
+            serial_date_from_filename(filename)
+        )
+
+    try:
+        dates = [
+            date_by_file_index[int(i)]
+            for i in file_indices
+        ]
+    except KeyError as exc:
+        raise KeyError(
+            f"file_indices references index {exc.args[0]}, "
+            "but that index is absent from file_map."
+        ) from exc
+
+    return pd.DatetimeIndex(
+        pd.to_datetime(dates)
+    )
+
+
+# ============================================================
+# Figure 2 colors
+# ============================================================
+
+def load_fixed_colors(json_path: Path) -> dict:
+    if not json_path.exists():
+        raise FileNotFoundError(
+            "Figure 2 color JSON was not found:\n"
+            f"  {json_path}"
+        )
+
+    with open(json_path, "r") as f:
+        return json.load(f)
+
+
+def build_figure2_color_map(
+    labels,
+    fixed_colors: dict,
+) -> dict[int, str]:
+    """
+    Map HDBSCAN syllable labels to the fixed Figure 2 palette.
+    """
+    color_map: dict[int, str] = {}
+
+    for label in np.sort(np.unique(labels)):
+        label = int(label)
+
+        if label == NOISE_LABEL:
+            color_map[label] = "0.75"
+            continue
+
+        key = str(label)
+
+        if key not in fixed_colors:
+            raise KeyError(
+                f"Syllable label {label} is missing from "
+                "fixed_label_colors_50.json."
+            )
+
+        color_map[label] = fixed_colors[key]
+
+    return color_map
+
+
+# ============================================================
+# Plot helpers
+# ============================================================
+
+def robust_axis_limits(coords, percent=99.0):
+    if len(coords) == 0:
+        raise ValueError(
+            "No finite pre/post coordinates available for plotting."
+        )
+
+    tail = (100.0 - percent) / 2.0
+
+    x_low, x_high = np.percentile(
+        coords[:, 0],
+        [tail, 100.0 - tail],
+    )
+
+    y_low, y_high = np.percentile(
+        coords[:, 1],
+        [tail, 100.0 - tail],
+    )
+
+    x_span = max(x_high - x_low, 1e-9)
+    y_span = max(y_high - y_low, 1e-9)
+
+    x_pad = 0.04 * x_span
+    y_pad = 0.04 * y_span
+
+    return (
+        (x_low - x_pad, x_high + x_pad),
+        (y_low - y_pad, y_high + y_pad),
+    )
+
+
+def format_axis(ax, xlim, ylim, title):
+    ax.set_xlim(*xlim)
+    ax.set_ylim(*ylim)
+
+    ax.set_title(title)
+    ax.set_xlabel("UMAP 1")
+    ax.set_ylabel("UMAP 2")
+
+    ax.set_aspect("equal", adjustable="box")
+
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+
+def draw_colored_points(
+    ax,
+    coords,
+    labels,
+    mask,
+    color_map,
+    alpha=POINT_ALPHA,
+):
+    sub_coords = coords[mask]
+    sub_labels = labels[mask]
+
+    for label in np.unique(sub_labels):
+        label = int(label)
+        label_mask = sub_labels == label
+
+        if label == NOISE_LABEL:
+            if not SHOW_NOISE:
+                continue
+            alpha_this = 0.12
+        else:
+            alpha_this = alpha
+
+        ax.scatter(
+            sub_coords[label_mask, 0],
+            sub_coords[label_mask, 1],
+            s=POINT_SIZE,
+            c=[color_map[label]],
+            alpha=alpha_this,
+            linewidths=0,
+            rasterized=True,
+        )
+
+
+# ============================================================
+# Cluster statistics
+# ============================================================
+
+def cluster_shift_summary(
+    coords,
+    labels,
+    pre_mask,
+    post_mask,
+):
+    rows = []
+
+    for label in np.sort(np.unique(labels)):
+        label = int(label)
+
+        if label == NOISE_LABEL:
+            continue
+
+        pre_xy = coords[
+            pre_mask & (labels == label)
+        ]
+
+        post_xy = coords[
+            post_mask & (labels == label)
+        ]
+
+        n_pre = len(pre_xy)
+        n_post = len(post_xy)
+
+        if n_pre == 0 or n_post == 0:
+            continue
+
+        pre_centroid = pre_xy.mean(axis=0)
+        post_centroid = post_xy.mean(axis=0)
+
+        displacement = np.linalg.norm(
+            post_centroid - pre_centroid
+        )
+
+        pre_radius = np.mean(
+            np.linalg.norm(
+                pre_xy - pre_centroid,
+                axis=1,
+            )
+        )
+
+        post_radius = np.mean(
+            np.linalg.norm(
+                post_xy - post_centroid,
+                axis=1,
+            )
+        )
+
+        rows.append(
+            {
+                "cluster": label,
+                "n_pre": n_pre,
+                "n_post": n_post,
+                "pre_centroid_x": pre_centroid[0],
+                "pre_centroid_y": pre_centroid[1],
+                "post_centroid_x": post_centroid[0],
+                "post_centroid_y": post_centroid[1],
+                "centroid_displacement": displacement,
+                "pre_mean_radius": pre_radius,
+                "post_mean_radius": post_radius,
+                "spread_ratio_post_over_pre":
+                    post_radius / pre_radius
+                    if pre_radius > 0
+                    else np.nan,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+# ============================================================
+# Figures
+# ============================================================
+
+def make_side_by_side(
+    bird,
+    split_date,
+    event_label,
+    output_dir,
+    coords,
+    labels,
+    pre_mask,
+    post_mask,
+    color_map,
+    xlim,
+    ylim,
+):
+    fig, axes = plt.subplots(
+        1,
+        2,
+        figsize=(12, 6),
+        constrained_layout=True,
+    )
+
+    draw_colored_points(
+        axes[0],
+        coords,
+        labels,
+        pre_mask,
+        color_map,
+    )
+
+    draw_colored_points(
+        axes[1],
+        coords,
+        labels,
+        post_mask,
+        color_map,
+    )
+
+    format_axis(
+        axes[0],
+        xlim,
+        ylim,
+        (
+            f"{bird} pre-{event_label}\n"
+            f"n = {pre_mask.sum():,} points"
+        ),
+    )
+
+    format_axis(
+        axes[1],
+        xlim,
+        ylim,
+        (
+            f"{bird} post-{event_label}\n"
+            f"n = {post_mask.sum():,} points"
+        ),
+    )
+
+    fig.suptitle(
+        f"Split date: {split_date.date()}",
+        fontsize=10,
+    )
+
+    out = (
+        output_dir
+        / f"{bird}_pre_post_side_by_side.png"
+    )
+
+    fig.savefig(
+        out,
+        dpi=600,
+        bbox_inches="tight",
+    )
+
+    plt.close(fig)
+
+    return out
+
+
+def make_overlay(
+    bird,
+    event_label,
+    output_dir,
+    coords,
+    labels,
+    pre_mask,
+    post_mask,
+    color_map,
+    xlim,
+    ylim,
+):
+    fig, ax = plt.subplots(
+        figsize=(7.5, 7.0),
+        constrained_layout=True,
+    )
+
+    pre_xy = coords[pre_mask]
+
+    ax.scatter(
+        pre_xy[:, 0],
+        pre_xy[:, 1],
+        s=POINT_SIZE,
+        c=PRE_GRAY,
+        alpha=PRE_ALPHA,
+        linewidths=0,
+        rasterized=True,
+    )
+
+    draw_colored_points(
+        ax,
+        coords,
+        labels,
+        post_mask,
+        color_map,
+        alpha=POST_ALPHA,
+    )
+
+    format_axis(
+        ax,
+        xlim,
+        ylim,
+        (
+            f"{bird}: pre-{event_label} gray, "
+            f"post-{event_label} cluster-colored"
+        ),
+    )
+
+    legend_handles = [
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            linestyle="",
+            markerfacecolor=PRE_GRAY,
+            markeredgecolor=PRE_GRAY,
+            label=f"Pre-{event_label}",
+            markersize=7,
+        ),
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            linestyle="",
+            markerfacecolor="0.25",
+            markeredgecolor="0.25",
+            label=f"Post-{event_label} (cluster-colored)",
+            markersize=7,
+        ),
+    ]
+
+    ax.legend(
+        handles=legend_handles,
+        frameon=False,
+        loc="best",
+    )
+
+    out = (
+        output_dir
+        / f"{bird}_pre_gray_post_colored_overlay.png"
+    )
+
+    fig.savefig(
+        out,
+        dpi=600,
+        bbox_inches="tight",
+    )
+
+    plt.close(fig)
+
+    return out
+
+
+def make_centroid_plot(
+    bird,
+    event_label,
+    output_dir,
+    coords,
+    color_map,
+    summary,
+    xlim,
+    ylim,
+):
+    """
+    Pre centroid  = larger open circle.
+    Post centroid = smaller filled square.
+
+    Markers are plotted at the true centroid positions. If they coincide
+    exactly, the larger open circle remains visible around the square.
+    """
+    fig, ax = plt.subplots(
+        figsize=(7.5, 7.0),
+        constrained_layout=True,
+    )
+
+    # Faint full-UMAP context.
+    ax.scatter(
+        coords[:, 0],
+        coords[:, 1],
+        s=1.0,
+        c="0.87",
+        alpha=0.10,
+        linewidths=0,
+        rasterized=True,
+        zorder=1,
+    )
+
+    for _, row in summary.iterrows():
+        if (
+            row["n_pre"] < MIN_PRE_POINTS_FOR_CENTROID
+            or row["n_post"] < MIN_POST_POINTS_FOR_CENTROID
+        ):
+            continue
+
+        label = int(row["cluster"])
+        color = color_map[label]
+
+        x0 = row["pre_centroid_x"]
+        y0 = row["pre_centroid_y"]
+
+        x1 = row["post_centroid_x"]
+        y1 = row["post_centroid_y"]
+
+        ax.scatter(
+            x0,
+            y0,
+            s=95,
+            marker="o",
+            facecolors="white",
+            edgecolors=[color],
+            linewidths=1.8,
+            zorder=5,
+        )
+
+        ax.scatter(
+            x1,
+            y1,
+            s=42,
+            marker="s",
+            c=[color],
+            edgecolors="black",
+            linewidths=0.55,
+            zorder=6,
+        )
+
+    format_axis(
+        ax,
+        xlim,
+        ylim,
+        (
+            f"{bird} pre- and post-{event_label} "
+            "cluster centroids"
+        ),
+    )
+
+    legend_handles = [
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            linestyle="",
+            markerfacecolor="white",
+            markeredgecolor="0.25",
+            markeredgewidth=1.8,
+            label=f"Pre-{event_label} centroid",
+            markersize=9,
+        ),
+        Line2D(
+            [0],
+            [0],
+            marker="s",
+            linestyle="",
+            markerfacecolor="0.25",
+            markeredgecolor="black",
+            markeredgewidth=0.55,
+            label=f"Post-{event_label} centroid",
+            markersize=6,
+        ),
+    ]
+
+    ax.legend(
+        handles=legend_handles,
+        frameon=False,
+        loc="best",
+    )
+
+    out = (
+        output_dir
+        / f"{bird}_cluster_centroids.png"
+    )
+
+    fig.savefig(
+        out,
+        dpi=600,
+        bbox_inches="tight",
+    )
+
+    plt.close(fig)
+
+    return out
+
+
+# ============================================================
+# One bird
+# ============================================================
+
+def process_bird(
+    bird,
+    npz_path,
+    split_date,
+    event_label,
+    fixed_colors,
+    output_root,
+):
+    output_dir = output_root / bird
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    print("\n" + "=" * 72)
+    print(f"{bird}")
+    print("=" * 72)
+    print(f"NPZ:        {npz_path}")
+    print(f"Split date: {split_date.date()}")
+    print(f"Event:      {event_label}")
+
+    with np.load(
+        npz_path,
+        allow_pickle=True,
+    ) as z:
+
+        required_keys = {
+            "embedding_outputs",
+            "hdbscan_labels",
+            "file_indices",
+            "file_map",
+        }
+
+        missing = required_keys - set(z.files)
+
+        if missing:
+            raise KeyError(
+                "NPZ is missing required keys: "
+                + ", ".join(sorted(missing))
+            )
+
+        coords = np.asarray(
+            z["embedding_outputs"],
+            dtype=float,
+        )
+
+        labels = np.asarray(
+            z["hdbscan_labels"],
+            dtype=int,
+        )
+
+        file_indices = np.asarray(
+            z["file_indices"],
+            dtype=int,
+        )
+
+        file_map_obj = z["file_map"]
+
+        if file_map_obj.shape == ():
+            file_map = file_map_obj.item()
+        else:
+            raise ValueError(
+                "Expected file_map to be a scalar object array "
+                "containing a dict."
+            )
+
+    if coords.ndim != 2 or coords.shape[1] != 2:
+        raise ValueError(
+            f"embedding_outputs should be Nx2; got {coords.shape}"
+        )
+
+    n = len(coords)
+
+    for name, arr in [
+        ("hdbscan_labels", labels),
+        ("file_indices", file_indices),
+    ]:
+        if len(arr) != n:
+            raise ValueError(
+                f"{name} has {len(arr):,} rows, "
+                f"but embedding_outputs has {n:,}."
+            )
+
+    point_dates = build_point_dates(
+        file_indices,
+        file_map,
+    )
+
+    valid_coords = np.all(
+        np.isfinite(coords),
+        axis=1,
+    )
+
+    pre_mask = np.asarray(
+        point_dates < split_date
+    ) & valid_coords
+
+    post_mask = np.asarray(
+        point_dates > split_date
+    ) & valid_coords
+
+    split_day_mask = np.asarray(
+        point_dates == split_date
+    ) & valid_coords
+
+    if pre_mask.sum() == 0:
+        raise ValueError(
+            "No pre-procedure points were found."
+        )
+
+    if post_mask.sum() == 0:
+        raise ValueError(
+            "No post-procedure points were found."
+        )
+
+    print(f"Loaded:      {n:,} UMAP points")
+    print(f"Pre:         {pre_mask.sum():,}")
+    print(f"Split day:   {split_day_mask.sum():,} excluded")
+    print(f"Post:        {post_mask.sum():,}")
+
+    # Per-date QC table.
+    date_summary = (
+        pd.DataFrame(
+            {
+                "date": point_dates,
+                "period": np.where(
+                    point_dates < split_date,
+                    "pre",
+                    np.where(
+                        point_dates > split_date,
+                        "post",
+                        "split_day",
+                    ),
+                ),
+            }
+        )
+        .groupby(["date", "period"])
+        .size()
+        .reset_index(name="n_points")
+        .sort_values("date")
+    )
+
+    date_summary.to_csv(
+        output_dir
+        / f"{bird}_recording_date_summary.csv",
+        index=False,
+    )
+
+    color_map = build_figure2_color_map(
+        labels,
+        fixed_colors,
+    )
+
+    analysis_mask = pre_mask | post_mask
+
+    xlim, ylim = robust_axis_limits(
+        coords[analysis_mask],
+        ROBUST_CROP_PERCENT,
+    )
+
+    summary = cluster_shift_summary(
+        coords,
+        labels,
+        pre_mask,
+        post_mask,
+    )
+
+    if not summary.empty:
+        summary = summary.sort_values(
+            "centroid_displacement",
+            ascending=False,
+        )
+
+    summary.to_csv(
+        output_dir
+        / f"{bird}_cluster_shift_summary.csv",
+        index=False,
+    )
+
+    side_path = make_side_by_side(
+        bird,
+        split_date,
+        event_label,
+        output_dir,
+        coords,
+        labels,
+        pre_mask,
+        post_mask,
+        color_map,
+        xlim,
+        ylim,
+    )
+
+    overlay_path = make_overlay(
+        bird,
+        event_label,
+        output_dir,
+        coords,
+        labels,
+        pre_mask,
+        post_mask,
+        color_map,
+        xlim,
+        ylim,
+    )
+
+    centroid_path = make_centroid_plot(
+        bird,
+        event_label,
+        output_dir,
+        coords,
+        color_map,
+        summary,
+        xlim,
+        ylim,
+    )
+
+    print("Saved:")
+    print(f"  {side_path}")
+    print(f"  {overlay_path}")
+    print(f"  {centroid_path}")
+
+    return {
+        "bird": bird,
+        "npz_path": str(npz_path),
+        "split_date": split_date.date().isoformat(),
+        "event_label": event_label,
+        "n_total_points": int(n),
+        "n_pre_points": int(pre_mask.sum()),
+        "n_split_day_points": int(split_day_mask.sum()),
+        "n_post_points": int(post_mask.sum()),
+        "n_unique_hdbscan_labels":
+            int(len(np.unique(labels))),
+        "n_centroid_clusters":
+            int(len(summary)),
+        "status": "ok",
+        "error": "",
+        "output_dir": str(output_dir),
+    }
+
+
+# ============================================================
+# CLI / batch
+# ============================================================
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Create pre/post UMAP QC plots for every discovered bird NPZ."
+        )
+    )
+
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=DEFAULT_ROOT_DIR,
+        help=(
+            "Root updated_AreaX_outputs directory. "
+            f"Default: {DEFAULT_ROOT_DIR}"
+        ),
+    )
+
+    parser.add_argument(
+        "--dates",
+        type=Path,
+        default=DEFAULT_DATES_CSV,
+        help=(
+            "CSV containing bird, split_date, and optional event_label. "
+            f"Default: {DEFAULT_DATES_CSV}"
+        ),
+    )
+
+    parser.add_argument(
+        "--colors",
+        type=Path,
+        default=DEFAULT_COLOR_JSON,
+        help=(
+            "Figure 2 fixed label-color JSON. "
+            f"Default: {DEFAULT_COLOR_JSON}"
+        ),
+    )
+
+    parser.add_argument(
+        "--output-root",
+        type=Path,
+        default=DEFAULT_OUTPUT_ROOT,
+        help=(
+            "Desktop/output directory containing one folder per bird. "
+            f"Default: {DEFAULT_OUTPUT_ROOT}"
+        ),
+    )
+
+    parser.add_argument(
+        "--make-date-template",
+        action="store_true",
+        help=(
+            "Discover bird NPZs, write the dates CSV template, and exit."
+        ),
+    )
+
+    parser.add_argument(
+        "--birds",
+        nargs="+",
+        default=None,
+        help=(
+            "Optional subset of bird IDs to process, e.g. "
+            "--birds USA5288 USA1234"
+        ),
+    )
+
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    discovered = discover_bird_npzs(
+        args.root
+    )
+
+    if not discovered:
+        raise RuntimeError(
+            "No bird-level NPZ files were discovered under:\n"
+            f"  {args.root}"
+        )
+
+    print(
+        f"\nDiscovered {len(discovered)} bird NPZ file(s)."
+    )
+
+    if args.make_date_template:
+        write_date_template(
+            discovered,
+            args.dates,
+        )
+        return
+
+    # If dates CSV does not yet exist, create it automatically and stop.
+    if not args.dates.exists():
+        write_date_template(
+            discovered,
+            args.dates,
+        )
+
+        print(
+            "\nNo QC plots were made yet because split dates are required."
+        )
+        print(
+            "Fill in the CSV, save it, then rerun this same command."
+        )
+        return
+
+    dates_df = load_split_dates(
+        args.dates
+    )
+
+    fixed_colors = load_fixed_colors(
+        args.colors
+    )
+
+    selected = discovered
+
+    if args.birds:
+        requested = set(args.birds)
+
+        unknown = sorted(
+            requested - set(discovered)
+        )
+
+        if unknown:
+            print(
+                "\nWARNING: requested bird(s) not discovered: "
+                + ", ".join(unknown)
+            )
+
+        selected = {
+            bird: path
+            for bird, path in discovered.items()
+            if bird in requested
+        }
+
+    args.output_root.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    run_rows = []
+
+    for i, (bird, npz_path) in enumerate(
+        selected.items(),
+        start=1,
+    ):
+        print(
+            f"\nProcessing bird {i}/{len(selected)}: {bird}"
+        )
+
+        if bird not in dates_df.index:
+            msg = (
+                "Bird is missing from split-date CSV."
+            )
+
+            print(f"SKIP: {msg}")
+
+            run_rows.append(
+                {
+                    "bird": bird,
+                    "npz_path": str(npz_path),
+                    "split_date": "",
+                    "event_label": "",
+                    "n_total_points": np.nan,
+                    "n_pre_points": np.nan,
+                    "n_split_day_points": np.nan,
+                    "n_post_points": np.nan,
+                    "n_unique_hdbscan_labels": np.nan,
+                    "n_centroid_clusters": np.nan,
+                    "status": "skipped",
+                    "error": msg,
+                    "output_dir": "",
+                }
+            )
+
+            continue
+
+        row = dates_df.loc[bird]
+
+        split_date = row["split_date"]
+        event_label = row["event_label"]
+
+        if pd.isna(split_date):
+            msg = (
+                "split_date is blank or invalid in the dates CSV."
+            )
+
+            print(f"SKIP: {msg}")
+
+            run_rows.append(
+                {
+                    "bird": bird,
+                    "npz_path": str(npz_path),
+                    "split_date": "",
+                    "event_label": event_label,
+                    "n_total_points": np.nan,
+                    "n_pre_points": np.nan,
+                    "n_split_day_points": np.nan,
+                    "n_post_points": np.nan,
+                    "n_unique_hdbscan_labels": np.nan,
+                    "n_centroid_clusters": np.nan,
+                    "status": "skipped",
+                    "error": msg,
+                    "output_dir": "",
+                }
+            )
+
+            continue
+
+        try:
+            result = process_bird(
+                bird=bird,
+                npz_path=npz_path,
+                split_date=split_date,
+                event_label=event_label,
+                fixed_colors=fixed_colors,
+                output_root=args.output_root,
+            )
+
+            run_rows.append(result)
+
+        except Exception as exc:
+            print(
+                f"\nERROR while processing {bird}: {exc}"
+            )
+
+            traceback.print_exc()
+
+            run_rows.append(
+                {
+                    "bird": bird,
+                    "npz_path": str(npz_path),
+                    "split_date":
+                        split_date.date().isoformat(),
+                    "event_label": event_label,
+                    "n_total_points": np.nan,
+                    "n_pre_points": np.nan,
+                    "n_split_day_points": np.nan,
+                    "n_post_points": np.nan,
+                    "n_unique_hdbscan_labels": np.nan,
+                    "n_centroid_clusters": np.nan,
+                    "status": "error",
+                    "error": str(exc),
+                    "output_dir":
+                        str(args.output_root / bird),
+                }
+            )
+
+        finally:
+            # Release references between very large bird NPZs.
+            plt.close("all")
+            gc.collect()
+
+    run_summary = pd.DataFrame(run_rows)
+
+    summary_path = (
+        args.output_root
+        / "all_birds_qc_run_summary.csv"
+    )
+
+    run_summary.to_csv(
+        summary_path,
+        index=False,
+    )
+
+    n_ok = int(
+        (run_summary["status"] == "ok").sum()
+    ) if not run_summary.empty else 0
+
+    n_skipped = int(
+        (run_summary["status"] == "skipped").sum()
+    ) if not run_summary.empty else 0
+
+    n_error = int(
+        (run_summary["status"] == "error").sum()
+    ) if not run_summary.empty else 0
+
+    print("\n" + "=" * 72)
+    print("BATCH COMPLETE")
+    print("=" * 72)
+    print(f"Successful: {n_ok}")
+    print(f"Skipped:    {n_skipped}")
+    print(f"Errors:     {n_error}")
+    print(f"\nRun summary:\n  {summary_path}")
+    print(f"\nOutput root:\n  {args.output_root}")
+
+
+if __name__ == "__main__":
+    main()
